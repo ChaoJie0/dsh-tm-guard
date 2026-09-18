@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+
+# Build output (published to npm via the pack list, but not tracked in git)
+lib/
+
+# TM-Guard runtime data (audit logs and per-turn reports)
+.tm-guard/
+
+# OS / editor cruft
+.DS_Store
+
+# Backups and scratch
+*.bak
+*.bak-*
+*.log
+
+# Runtime logs / one-off backups (not source)
+.backup-log.jsonl
+
+# Local maintainer-only patch (binds this machine's absolute source path;
+# the distributable layer is cordis.patch.yml)
+cordis.patch.local.yml
+
+# Personal ops tooling (starts/stops local dsh web, uses local paths)
+tools/
+
+# Early loose drafts at repo root (superseded by src/*.ts) — keep locally,
+# do not track
+/*.ts — *.ts
+
+# Stray '~' directory created by shell expansion accidents
+~/
+
+# Local desktop client checkout / other local-only dirs
+desktop/
+
+# DSH handoff self-test markers
+.dsh-handoff-selftest-*
+
+# Personal maintenance scripts (hardcode /Users/<you> paths; not part of package)
+scripts/backup-before-write.sh
+scripts/writeguard.py
+
+# Superseded drafts / internal working notes (contain local paths)
+README — 新增三层兜底章节.md
+插件市场发布调研.md
+pre-push-privacy-audit.md
+
+# Companion bridges are local-only (not part of the published package)
+plugins/
