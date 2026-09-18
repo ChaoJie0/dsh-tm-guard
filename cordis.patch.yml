@@ -1,0 +1,15 @@
+# dsh-tm-guard — bundle patch (shipped inside the npm package)
+#
+# This is the composition layer contributed automatically when a profile
+# installs the bundle via:
+#   dsh plugin --profile <name> add dsh-tm-guard
+#
+# The row references the plugin BY PACKAGE NAME so Node resolution finds the
+# installed code under the profile's node_modules — never an absolute path.
+# Users override config in their own profile cordis.patch.yml (later layers
+# win per row). For direct source-load development / the maintainer's own
+# machine, use cordis.patch.local.yml with `dsh web --patch`.
+
+- insert:
+    - id: tm-guard
+      name: dsh-tm-guard
