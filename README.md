@@ -52,7 +52,7 @@ dsh plugin --profile web add dsh-tm-guard
 ```sh
 # pnpm >=10 blocks git-dependency build scripts until you allow them.
 # The package's prepare script runs its zero-dependency build (see Development).
-dsh plugin --profile web add github:bk5k27n8g8-code/dsh-tm-guard
+dsh plugin --profile web add github:ChaoJie0/dsh-tm-guard
 ```
 
 If the install fails on the build-script approval, add the key pnpm prints to the profile's `pnpm-workspace.yaml`:
@@ -62,7 +62,7 @@ allowBuilds:
   dsh-tm-guard: true
 ```
 
-and re-run the command. Treat that allowance as permission to run the package's code at install time on your machine; pin a commit when auditing supply chain: `github:bk5k27n8g8-code/dsh-tm-guard#<sha>`.
+and re-run the command. Treat that allowance as permission to run the package's code at install time on your machine; pin a commit when auditing supply chain: `github:ChaoJie0/dsh-tm-guard#<sha>`.
 
 ### Local checkout (testing)
 

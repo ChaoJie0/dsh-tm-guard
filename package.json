@@ -19,11 +19,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bk5k27n8g8-code/dsh-tm-guard.git"
+    "url": "git+https://github.com/ChaoJie0/dsh-tm-guard.git"
   },
-  "homepage": "https://github.com/bk5k27n8g8-code/dsh-tm-guard#readme",
+  "homepage": "https://github.com/ChaoJie0/dsh-tm-guard#readme",
   "bugs": {
-    "url": "https://github.com/bk5k27n8g8-code/dsh-tm-guard/issues"
+    "url": "https://github.com/ChaoJie0/dsh-tm-guard/issues"
   },
   "scripts": {
     "build": "node scripts/build/build.mjs",

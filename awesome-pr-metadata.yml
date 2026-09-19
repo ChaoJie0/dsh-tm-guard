@@ -3,10 +3,10 @@
 # After creating the public GitHub repo, submit a PR to
 # https://github.com/awesome-dsh-plugin/awesome-dsh-plugin that adds
 # ONE file:
-#   data/plugins/bk5k27n8g8-code__dsh-tm-guard.yml
+#   data/plugins/ChaoJie0__dsh-tm-guard.yml
 #
 # The YAML below is ready to paste as-is into
-#   data/plugins/bk5k27n8g8-code__dsh-tm-guard.yml
+#   data/plugins/ChaoJie0__dsh-tm-guard.yml
 # (the owner field below already matches the repo URL).
 #
 # Submission requirements already met by this repo:
@@ -19,8 +19,8 @@
 #   - package.json repository.url points back at this exact repo
 # ------------------------------------------------------------------
 
-url: https://github.com/bk5k27n8g8-code/dsh-tm-guard
-name: bk5k27n8g8-code/dsh-tm-guard
+url: https://github.com/ChaoJie0/dsh-tm-guard
+name: ChaoJie0/dsh-tm-guard
 category: security
 description:
   en: 'Zero-intervention permission gate for DSH agents on macOS: auto-allows local writes made reversible by git or Time Machine, blocks network, package installs, process control and sensitive-path reads, with full audit logs.'
