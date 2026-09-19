@@ -1,6 +1,6 @@
 {
   "name": "dsh-tm-guard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Time-Machine-backed autonomous agent permission gate for DeepSeek Harness (dsh). Allows TM-rollback-able operations, blocks everything else.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
