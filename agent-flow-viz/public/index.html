@@ -285,7 +285,8 @@
     // iterations long-poll for push-like updates and re-poll on return.
     await poll(false);
     for (;;) {
-      await poll(true);
+      const ok = await poll(true);
+      if (!ok) await new Promise((r) => setTimeout(r, 1000)); // backoff on error
     }
   }
 
