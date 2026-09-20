@@ -259,9 +259,10 @@
       `<div class="kv"><label>${label}</label><div class="val">${val}</div></div>`).join('');
   }
 
-  async function poll() {
+  async function poll(longPoll) {
     try {
-      const res = await fetch('/api/events?since=' + version);
+      const url = '/api/events' + (longPoll && version > 0 ? '?since=' + version : '');
+      const res = await fetch(url);
       if (!res.ok) throw new Error('http ' + res.status);
       const data = await res.json();
       connDot.className = 'dot live';
@@ -276,6 +277,15 @@
       }
     } catch {
       connDot.className = 'dot err';
+    }
+  }
+
+  async function pollLoop() {
+    // First fetch is non-blocking so the panel paints immediately; later
+    // iterations long-poll for push-like updates and re-poll on return.
+    await poll(false);
+    for (;;) {
+      await poll(true);
     }
   }
 
