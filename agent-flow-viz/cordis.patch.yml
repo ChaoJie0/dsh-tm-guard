@@ -1,0 +1,18 @@
+# dsh-agent-flow-viz — bundle patch (shipped inside the npm package)
+#
+# Composition layer contributed automatically when a profile installs the
+# bundle via:
+#   dsh plugin --profile <name> add dsh-agent-flow-viz
+#
+# References the plugin BY PACKAGE NAME so Node resolution finds the installed
+# code under the profile's node_modules. Override config in your own profile
+# cordis.patch.yml. For direct source-load development, point `name` at the
+# absolute src/index.ts path (see README).
+
+- insert:
+    - id: agent-flow-viz
+      name: dsh-agent-flow-viz
+      config:
+        port: 3100
+        verbose: true
+        ignoreTools: []
