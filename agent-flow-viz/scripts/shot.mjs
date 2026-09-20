@@ -11,12 +11,16 @@ execFileSync(BIN, [
   '--headless=new',
   '--disable-gpu',
   '--no-sandbox',
-  '--user-data-dir=/tmp/afv-chrome-profile',
+  '--disable-background-networking',
+  '--disable-component-update',
+  '--disable-sync',
+  '--user-data-dir=/tmp/afv-chrome-profile2',
   '--screenshot=' + out,
   '--window-size=1100,860',
   '--hide-scrollbars',
-  '--virtual-time-budget=3000',
+  '--virtual-time-budget=4000',
+  '--run-all-compositor-stages-before-draw',
   url,
-], { stdio: ['ignore', 'ignore', 'inherit'] })
+], { stdio: ['ignore', 'ignore', 'ignore'], timeout: 30000 })
 
 console.log('wrote', out)
