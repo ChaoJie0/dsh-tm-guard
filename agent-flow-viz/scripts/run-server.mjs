@@ -29,13 +29,14 @@ for (const [tool, args] of demos) {
   const id = 'demo-' + ++n
   const { preview, json } = summarizeArgs(args)
   const startedAt = clock
+  const endedAt = startedAt + 8 + Math.floor(Math.random() * 120)
   clock += 900
   store.recordStart({ id, tool, argsPreview: preview, argsJson: json, startedAt })
   const fail = tool === 'edit' // demo one failure to show the error styling
-  const dur = 8 + Math.floor(Math.random() * 120)
   store.recordEnd(id, fail
     ? { status: 'error', error: 'old_string not found in file (exit 1)' }
-    : { status: 'success', resultPreview: `[exit code 0] done (${dur}ms)` })
+    : { status: 'success', resultPreview: `[exit code 0] done (${endedAt - startedAt}ms)` },
+  endedAt)
 }
 
 const shutdown = async () => { await handle.close(); process.exit(0) }
