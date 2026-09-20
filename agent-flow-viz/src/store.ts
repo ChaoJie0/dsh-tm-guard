@@ -118,11 +118,12 @@ export class CallStore {
   recordEnd(
     id: string,
     outcome: { status: 'success' | 'error'; error?: string; resultPreview?: string },
+    endedAt?: number,
   ): void {
     const call = this.calls.find((c) => c.id === id)
     if (!call) return
     call.status = outcome.status
-    call.endedAt = Date.now()
+    call.endedAt = endedAt ?? Date.now()
     call.durationMs = call.endedAt - call.startedAt
     call.error = outcome.error
     call.resultPreview = outcome.resultPreview
