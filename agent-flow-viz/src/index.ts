@@ -60,13 +60,12 @@ export function apply(ctx: Context, rawConfig?: Partial<AgentFlowVizConfig>) {
   const ignore = new Set(config.ignoreTools)
 
   let server: VizServerHandle | null = null
-  let stopped = false
 
   // Start the panel asynchronously; a busy port must not crash plugin load.
   startServer(store, config.port)
     .then((handle) => {
-      if (stopped) {
-        // Plugin unloaded before the server finished binding.
+      // If the fiber already unloaded while binding, shut it back down.
+      if (disposed) {
         void handle.close()
         return
       }
@@ -81,6 +80,14 @@ export function apply(ctx: Context, rawConfig?: Partial<AgentFlowVizConfig>) {
           `${err instanceof Error ? err.message : String(err)}`,
       )
     })
+
+  // Close the HTTP server when the plugin fiber unloads. ctx.effect runs the
+  // returned disposer automatically on teardown (and HMR reload).
+  let disposed = false
+  ctx.effect(() => () => {
+    disposed = true
+    if (server) void server.close()
+  })
 
   /* ---------------- pre-execute: open a running node ---------------- */
 
