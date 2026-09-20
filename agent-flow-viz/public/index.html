@@ -275,8 +275,10 @@
         renderDetail();
         autoScroll();
       }
+      return true;
     } catch {
       connDot.className = 'dot err';
+      return false;
     }
   }
 
