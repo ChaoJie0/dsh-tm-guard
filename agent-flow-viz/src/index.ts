@@ -144,11 +144,6 @@ export function apply(ctx: Context, rawConfig?: Partial<AgentFlowVizConfig>) {
 
   /* ---------------- teardown ---------------------------------------- */
 
-  ctx.on('dispose', () => {
-    stopped = true
-    if (server) void server.close()
-  })
-
   if (config.verbose) {
     console.log(
       `[agent-flow-viz] Loaded. Starting visualization panel on port ${config.port}…`,
