@@ -305,12 +305,11 @@
     calls = [];
     render();
     renderDetail();
-    poll();
+    poll(false);
   });
 
   render();
-  poll();
-  setInterval(poll, 400); // catch long-poll gaps / dropped connections
+  pollLoop();
 })();
 </script>
 </body>
