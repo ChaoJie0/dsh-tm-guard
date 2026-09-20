@@ -13,6 +13,9 @@
 import { register } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
+import { writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const require = createRequire(import.meta.url)
 const dshPkg = require.resolve('@deepseek-ai/dsh/package.json', {
@@ -26,11 +29,13 @@ const map = {
   '@deepseek-ai/dsh-tools': root + '@deepseek-ai/dsh-tools/lib/index.js',
 }
 
-const hook = `
-  const map = ${JSON.stringify(map)};
-  export async function resolve(spec, ctx, next) {
-    if (map[spec]) return next(map[spec], ctx);
-    return next(spec, ctx);
-  }
+const hookSource = `
+const map = ${JSON.stringify(map)};
+export async function resolve(spec, ctx, next) {
+  if (map[spec]) return next(map[spec], ctx);
+  return next(spec, ctx);
+}
 `
-register(pathToFileURL('data:text/javascript,' + encodeURIComponent(hook)))
+const hookPath = join(tmpdir(), 'agent-flow-viz-resolve-hook.mjs')
+writeFileSync(hookPath, hookSource, 'utf8')
+register(pathToFileURL(hookPath))
