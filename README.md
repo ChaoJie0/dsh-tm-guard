@@ -39,7 +39,7 @@
 
 A DSH profile installs out-of-tree bundles via `dsh plugin --profile <name> ...` (forwarded to pnpm inside the profile directory). Choose any profile name, e.g. `web` or a throwaway `tm-lab`.
 
-### From npm (recommended, once published)
+### From npm (recommended)
 
 Prebuilt `lib/` ships in the package, so no build step or build-script approval is needed:
 
