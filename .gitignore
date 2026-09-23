@@ -49,3 +49,4 @@ pre-push-privacy-audit.md
 
 # Companion bridges are local-only (not part of the published package)
 plugins/
+DEV.md
