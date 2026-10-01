@@ -5,9 +5,9 @@ polls the v4 session file, and asserts the gate output is present.
 """
 import json, os, subprocess, sys, time, urllib.request
 
-sys.path.insert(0, "/tmp")
+_rpc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify-host-matrix-rpc.py")
 _ns = {"__name__": "tm_rpc_lib"}
-exec(open("/tmp/tm-rpc.py").read(), _ns)  # defines rpc/make_cookie without running main
+exec(open(_rpc_path).read(), _ns)  # defines rpc/make_cookie without running main
 rpc = _ns["rpc"]
 
 def read_v4(sid):
