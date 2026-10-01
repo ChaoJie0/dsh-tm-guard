@@ -50,3 +50,11 @@ pre-push-privacy-audit.md
 # Companion bridges are local-only (not part of the published package)
 plugins/
 DEV.md
+.smoke-out/
+.tm-test-020/
+
+# 本地工作文档/测试残留：含本机绝对路径，不随公开仓库推送（保留本地）
+dsh-plugin-update-guide.md
+dsh-tm-guard-020-independent-review.md
+dsh-tm-guard-v0.2.0-test-report.md
+.upgrade-smoke.txt

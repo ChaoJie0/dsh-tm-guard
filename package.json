@@ -1,11 +1,15 @@
 {
   "name": "dsh-tm-guard",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Time-Machine-backed autonomous agent permission gate for DeepSeek Harness (dsh). Allows TM-rollback-able operations, blocks everything else.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.1.0-rc.1 <0.1.0 || >=0.1.2-0 <0.2.0-0 || >=0.2.0-0 <0.3.0-0"
+  },
   "keywords": [
     "deepseek-harness",
     "dsh",
@@ -33,11 +37,12 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0",
-    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0"
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.1 <0.1.0 || >=0.1.2-0 <0.2.0-0 || >=0.2.0-0 <0.3.0-0"
   },
   "devDependencies": {},
   "dsh": {
