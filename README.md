@@ -6,6 +6,15 @@
 
 ---
 
+## Quick Start (2 minutes)
+
+1. **Install**: `dsh plugin --profile <name> add dsh-tm-guard` (see [Installation](#installation)).
+2. **Verify it loaded**: boot the profile — the console prints `[tm-guard] Loaded. Protected paths: ...` (see [Verify the install](#verify-the-install)).
+3. **Protect your workspace**: defaults already protect `process.cwd()`, deny network/system operations, and block reads of 12 sensitive credential paths. To protect more directories, add `protectedPaths` to your profile's `cordis.patch.yml` ([Configuration](#configuration)).
+4. **Unlock the tools you explicitly trust**: `subagent`, `workflow`, `web_search`, `web_fetch`, `skill`, ... are **DENIED by default** (classified `mixed`/`unknown`). Add the ones you trust to `extraAllowTools` in your profile's `cordis.patch.yml`. ⚠️ Never add `subagent` / `subagent_fork` / `workflow` / `job_output` — the allow-list short-circuits the classifier (see [Limitations](#limitations--honest-scope)).
+
+> The two fields that change the experience most: `protectedPaths` (what the agent may write) and `extraAllowTools` (which tools bypass the gate). Everything else has a safe default.
+
 ## What this is — and isn't
 
 **It is** a DSH [Cordis](https://github.com/deepseek-ai/cordis) **plugin / bundle**: an npm package (`dsh-tm-guard`) that declares `dsh.bundle.patch`, hooks DSH's `tools/pre-execute` waterfall, registers `tm_*` model tools, and injects an operating-mode system-prompt section. It installs with the official `dsh plugin add` flow and runs inside the DSH host process with the host's permissions.

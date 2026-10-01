@@ -52,6 +52,7 @@ plugins/
 DEV.md
 .smoke-out/
 .tm-test-020/
+.tm-01/
 
 # 本地工作文档/测试残留：含本机绝对路径，不随公开仓库推送（保留本地）
 dsh-plugin-update-guide.md

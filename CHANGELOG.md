@@ -2,6 +2,14 @@
 
 All notable changes to dsh-tm-guard will be documented in this file.
 
+## [0.2.1] - 2026-10-01
+
+### Changed
+- 市场体验改进（仅文档/描述/模板，无代码变更）：
+  - package.json `description` 增加配置提示：安全默认开箱生效，使用 subagent/workflow/web 需配置 `protectedPaths`/`extraAllowTools`（详见 README）
+  - README 顶部新增「Quick Start（2 分钟上手）」：安装 → 验证加载 → 配置保护路径 → 解锁信任工具（含白名单红线警示），并链接 Configuration 章节
+  - `cordis.patch.yml` 增加推荐配置模板（注释形式，不改变自动层行为）：示例 `protectedPaths`、`denyReadPaths`、`extraAllowTools` 及开关，供用户复制到 profile 层配置
+
 ## [0.2.0] - 2026-10-01
 
 ### Changed
