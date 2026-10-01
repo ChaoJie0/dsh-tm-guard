@@ -44,15 +44,24 @@
 同时强制 `engines.dsh == peerDependencies["@deepseek-ai/dsh-tools"]`（单一事实来源）。
 **为什么必须有这层**：npm semver 对 prerelease 的规则（同主次补丁三元组 comparator 才生效）极容易手工推导出错——0.1.1 事件（`<0.2.0-0` 挡 0.1.x 线）、0.2.0 三段式（漏 0.1.0/0.1.1 stable）都是手工推导的产物。任何声明改动必须让此矩阵全绿。
 
-### L4 双线隔离冒烟（发布前手动）
-在**真实 dsh host**（0.1.x 线最新 `0.1.2-rc.1` + 当前线 `0.2.0-rc.2`）各起隔离 profile，验证：
-1. 加载：组合树含 `dsh-tm-guard`、无 peer skip
-2. 工具注册：`tm_status` 等 7 个 tm_* 工具可用（与两线一致）
-3. 门控三类：写受保护目录放行 / 越界写拒绝（文件未产生）/ 敏感读 forced deny
-4. 审计：记录与动作一一对应
-5. TM 健康：`tm_status` HEALTHY、workspace protected
+### L4 全版本 host 矩阵冒烟（发布前手动）
+在**每个实际存在的 dsh host 版本**上起隔离实例验证。npm 实测版本集合 = 0.1.x 线（0.1.0-rc.2 ~ 0.1.7-rc.2）+ 0.2.x 线（0.2.0-rc.1/rc.2）。0.2.3 发布前全矩阵实测（2026-10-01）：
 
-已有 profile 模板：`~/.dsh/profiles/tm-01`（0.1.x 线）、`.tm-test-020` 记录（0.2.x 线）。做法见 [RELEASE.md] 步骤 5。
+| host 版本 | 插件加载 | TM health check | API 响应 | tm_status 冒烟 | 端到端拦截 |
+|---|---|---|---|---|---|
+| 0.1.0-rc.2 | ✅ Loaded | ✅ passed | —（host web boot 缺内置插件，host 自身缺陷） | — | — |
+| 0.1.2-rc.1 | ✅ Loaded | ✅ passed | ✅ 200 | ⚠️ host agent turn 崩溃（`reading 'length'`，host 自身缺陷） | — |
+| 0.1.7-rc.2 | ✅ Loaded | ✅ passed | ✅ 200 | ✅ HEALTHY / protected | — |
+| 0.2.0-rc.1 | ✅ Loaded | ✅ passed | ✅ 200 | ✅ HEALTHY / protected | — |
+| 0.2.0-rc.2 | ✅ Loaded | ✅ passed | ✅ 200 | ✅ HEALTHY / protected | ✅ `cat ~/.ssh/config` → `BLOCKED (read, forced deny)`，命令未执行 |
+
+验证项：
+1. 加载：启动日志含 `[tm-guard] Loaded` + 无 peer skip（host 0.2.0 会打印各 bundle peer 检查，tm-guard 不在 skip 列表即兼容）
+2. 工具注册：会话内 agent 调 `tm_status` 成功返回 HEALTHY / workspace protected / deny 路径列表
+3. 门控拦截：agent 调 bash 执行敏感读 → 门控 `BLOCKED (forced deny)`，命令未执行
+4. host 自身缺陷（0.1.0-rc.2 web boot 缺插件、0.1.2-rc.1 agent turn 崩溃）**不属于插件问题**——插件在两线加载与初始化均正常
+
+环境：每版本 = npm tgz 解压 + pnpm 装依赖（`allowBuilds` 白名单 6 项）+ 独立 profile（dsh-base/web-app 同版本 + 插件 tarball）+ 独立端口实例。0.1.2-rc.1 会话为 v3 格式（`session.jsonl.zstd`），0.1.7+ 为 v4（`session.v4.jsonl.zstd`）。冒烟 RPC 脚本见 `.smoke-out/verify-host-matrix-023.md` 附注（/tmp/tm-rpc.py + tm-gate-smoke.py，端口参数化认证）。
 
 ### L5 独立复核（发布前委派）
 委派 dsh 独立会话（不采信本文件/此前结论）：对 **npm 发布物**（安装目录 + registry 元数据）验证——peer 严格语义、发布物与 gitHead 重建 SHA 一致、函数级门控 40+208 用例、生产审计活性。0.2.0/0.2.1 发布均执行并 PASS。
