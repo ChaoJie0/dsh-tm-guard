@@ -8,7 +8,7 @@
   "license": "MIT",
   "engines": {
     "node": ">=20",
-    "dsh": ">=0.1.0-rc.1 <0.1.0 || >=0.1.2-0 <0.2.0-0 || >=0.2.0-0 <0.3.0-0"
+    "dsh": ">=0.1.0-rc.1 <0.1.0 || >=0.1.0 <0.1.2-0 || >=0.1.2-0 <0.2.0-0 || >=0.2.0-0 <0.3.0-0"
   },
   "keywords": [
     "deepseek-harness",
@@ -31,7 +31,14 @@
   },
   "scripts": {
     "build": "node scripts/build/build.mjs",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "test": "node --test test-*.mts",
+    "test:coverage": "node --test --experimental-test-coverage test-*.mts",
+    "verify:peer": "node scripts/verify-peer-matrix.mjs",
+    "verify:build": "node scripts/verify-reproducible-build.mjs",
+    "verify:pack": "node scripts/verify-pack-audit.mjs",
+    "verify:fast": "npm run test && npm run verify:peer && npm run verify:build && npm run verify:pack",
+    "release:check": "npm run verify:fast"
   },
   "files": [
     "lib",
@@ -42,9 +49,11 @@
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0",
-    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.1 <0.1.0 || >=0.1.2-0 <0.2.0-0 || >=0.2.0-0 <0.3.0-0"
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.1 <0.1.0 || >=0.1.0 <0.1.2-0 || >=0.1.2-0 <0.2.0-0 || >=0.2.0-0 <0.3.0-0"
   },
-  "devDependencies": {},
+  "devDependencies": {
+    "semver": "^7.8.5"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
