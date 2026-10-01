@@ -1,0 +1,35 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify-fast:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dev deps (semver)
+        run: npm ci || npm install --no-audit --no-fund
+
+      - name: L0 单元测试
+        run: npm test
+
+      - name: L3 peer 兼容矩阵
+        run: npm run verify:peer
+
+      - name: L1 构建可复现（git HEAD 重建比对）
+        run: npm run verify:build
+
+      - name: L2 包内容审计
+        run: npm run verify:pack
+
+  # L4 双线隔离冒烟 / L5 独立复核 / L6 隐私审查：
+  # 需要真实 macOS + Time Machine + 本地 dsh host 与会话，保持本地发布前手动执行（见 TESTING.md / RELEASE.md）。
