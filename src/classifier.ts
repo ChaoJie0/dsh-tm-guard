@@ -337,15 +337,23 @@ function extractWritePaths(command: string): string[] {
 /* ------------------------------------------------------------------ */
 
 function expandHome(p: string): string {
-  if (p === '~') return process.env.HOME ?? p
-  if (p.startsWith('~/')) return `${process.env.HOME ?? ''}${p.slice(1)}`
-  return p
+  let out = p
+  if (out === '~') out = process.env.HOME ?? out
+  else if (out.startsWith('~/')) out = `${process.env.HOME ?? ''}${out.slice(1)}`
+  // $HOME / ${HOME} — expand for sensitive-read matching. Bash expands these
+  // before opening the file, so `cat $HOME/.ssh/id_rsa` must be treated like
+  // `cat ~/.ssh/id_rsa` (adversarial GAP fixed in 0.2.3).
+  const home = process.env.HOME ?? ''
+  out = out.replace(/\$HOME(?=\/|$)/g, home)
+  out = out.replace(/\$\{HOME\}(?=\/|$)/g, home)
+  return out
 }
 
 /** Absolute-ize a possibly-relative path for deny-prefix matching. */
 function toAbsolute(path: string, baseDir: string = process.cwd()): string {
   if (path.startsWith('/')) return path
   if (path.startsWith('~')) return expandHome(path)
+  if (/^\$(?:HOME|\{HOME\})(\/|$)/.test(path)) return expandHome(path)
   return resolve(baseDir, path)
 }
 
@@ -1127,6 +1135,7 @@ export function classifyBashCommand(
   let baseDir = process.cwd()
   const resolvedReads: string[] = []
   const resolvedWrites: string[] = []
+  const denyPrefixes = denyReadPaths.map((p) => expandHome(p).replace(/\/+$/, ''))
   for (let i = 0; i < segments.length; i++) {
     const s = segments[i]
     const cd = s.match(cdPattern)
@@ -1147,6 +1156,15 @@ export function classifyBashCommand(
     }
     for (const p of extractReadPaths(s)) {
       resolvedReads.push(toAbsolute(p, dir))
+    }
+    // cd-context: a segment executed inside a denyReadPaths directory exposes
+    // that directory even with no path argument (`cd ~/.ssh && ls`) or with a
+    // bare relative name (`cd ~/.ssh && cat id_rsa` — `id_rsa` has no '/', so
+    // extractReadPaths would not collect it). Treat any non-echo/printf/cd
+    // segment running inside a sensitive dir as a sensitive read.
+    if (dir !== process.cwd() && denyPrefixes.some((pref) => dir === pref || dir.startsWith(pref + '/'))) {
+      const first = s.trim().toLowerCase().split(/\s+/)[0]
+      if (!['echo', 'printf', 'cd'].includes(first)) resolvedReads.push(dir)
     }
   }
 

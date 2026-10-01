@@ -24,19 +24,26 @@ const engineRange = (pkg.engines && pkg.engines.dsh) || null
 // [version, mustSatisfy] — true = range MUST match, false = range MUST NOT match.
 const MATRIX = [
   // 0.1.x line (legacy host)
-  ['0.1.0-rc.1', true], // earliest supported (segment 1 lower bound)
-  ['0.1.0',      true], // first shipped stable (2026-09-19, npm)
-  ['0.1.1',      true], // shipped stable on the 0.1.x line (npm latest before 0.2.0)
-  ['0.1.2-rc.1', true], // 0.1.x latest, real host used in dual-line smoke tests
+  ['0.1.0-rc.0', false], // before earliest supported
+  ['0.1.0-rc.1', true],  // earliest supported (segment 1 lower bound)
+  ['0.1.0-rc.2', true],  // 0.1.0 prerelease variant
+  ['0.1.0',      true],  // first shipped stable (2026-09-19, npm)
+  ['0.1.1',      true],  // shipped stable on the 0.1.x line (npm latest before 0.2.0)
+  ['0.1.2-rc.1', true],  // 0.1.x latest, real host used in dual-line smoke tests
+  ['0.1.3',      true],  // future 0.1.x patch
+  ['0.1.9',      true],  // upper 0.1.x boundary
   // 0.2.x line (current host)
-  ['0.2.0-0',    true], // prerelease boundary of segment 3 (must be satisfied per npm semver rules)
-  ['0.2.0-rc.2', true], // npm latest 0.2.x, production host
-  ['0.2.0',      true], // stable 0.2.0
-  ['0.2.9',      true], // upper 0.2.x boundary
+  ['0.2.0-0',    true],  // prerelease boundary of segment 4 (must be satisfied per npm semver rules)
+  ['0.2.0-rc.1', true],  // earlier 0.2.0 rc
+  ['0.2.0-rc.2', true],  // npm latest 0.2.x, production host
+  ['0.2.0',      true],  // stable 0.2.0
+  ['0.2.1',      true],  // shipped stable
+  ['0.2.9',      true],  // mid 0.2.x
+  ['0.2.99',     true],  // upper 0.2.x boundary
   // must NOT match
+  ['0.3.0-rc.1', false], // next major line even as prerelease
   ['0.3.0',      false], // next major line
   ['1.0.0',      false],
-  ['0.1.0-rc.0', false], // before earliest supported
   ['0.0.9',      false],
 ]
 

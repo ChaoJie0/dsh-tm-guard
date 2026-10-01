@@ -67,11 +67,13 @@
 
 | 历史事件 | 固化位置 |
 |---|---|
-| H1：`subagent` 白名单短路绕过 mixed 拒绝（生产 1682 条 explicit-allow 实证） | `t7-classifier-test.mjs` F 组 + README ⚠️ 警示 |
-| 敏感读经重定向渗漏（`cat ~/.ssh/id_rsa > 保护区`） | `test-classifier.mts` C 组（forceDeny 优先于路径豁免） |
+| H1：`subagent` 白名单短路绕过 mixed 拒绝（生产 1682 条 explicit-allow 实证） | `test-gate-prod.mts` F 组（t7 迁移）+ README ⚠️ 警示 |
+| 敏感读经重定向渗漏（`cat ~/.ssh/id_rsa > 保护区`） | `test-classifier.mts` C 组 + `test-gate-prod.mts` C 组（forceDeny 优先于路径豁免） |
 | 灾难模式 `rm -rf /` | `test-classifier.mts` H 组（decide 强拒） |
 | 0.1.1 声明 `<0.2.0-0` 挡掉全部 0.2.x 用户 | `verify-peer-matrix.mjs`（0.2.0-rc.2 必须 PASS） |
-| **0.2.0 三段式漏配 0.1.0/0.1.1 stable**（本次机制首跑抓出） | `verify-peer-matrix.mjs`（0.1.0/0.1.1 必须 PASS，四段式） |
+| 0.2.0 三段式漏配 0.1.0/0.1.1 stable | `verify-peer-matrix.mjs`（0.1.0/0.1.1 必须 PASS，四段式） |
+| **`$HOME` 变量展开绕过敏感读**（`cat $HOME/.ssh/id_rsa` 曾放行；0.2.3 修复：expandHome/toAbsolute 归一化 `$HOME`/`${HOME}`） | `test-adversarial.mts` GAP 组（先红后绿） |
+| **`cd` 上下文绕过**（`cd ~/.ssh && cat id_rsa` 曾放行；0.2.3 修复：cd 后敏感目录内 read 类 segment 即 deny） | `test-adversarial.mts` GAP 组（先红后绿） |
 | 发布物与提交漂移 / 未提交改动混入 | `verify-reproducible-build.mjs` |
 | 本地路径/测试残留进公开仓库 | `verify-pack-audit.mjs` + `.gitignore` 锁定 |
 
