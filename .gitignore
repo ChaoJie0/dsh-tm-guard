@@ -13,6 +13,7 @@ lib/
 # Backups and scratch
 *.bak
 *.bak-*
+*.tgz
 *.log
 
 # Runtime logs / one-off backups (not source)
