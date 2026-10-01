@@ -13,3 +13,38 @@
 - insert:
     - id: tm-guard
       name: dsh-tm-guard
+      # ------------------------------------------------------------------
+      # Recommended configuration — copy this block into YOUR profile's
+      # cordis.patch.yml (later patch layers win per row; a patch replaces
+      # the whole row `config`). This shipped layer deliberately stays bare:
+      # safe defaults apply on install (protect cwd, deny network/system,
+      # block 12 sensitive read paths) and nothing is force-configured for you.
+      #
+      # Two fields change the experience most:
+      #   1. protectedPaths  — directories your agent is allowed to write
+      #                       (default: only process.cwd()).
+      #   2. extraAllowTools — subagent / workflow / web_search / web_fetch /
+      #                       skill / job_output are DENIED by default
+      #                       (mixed/unknown). Add only tools you explicitly
+      #                       trust. ⚠️ NEVER add subagent / subagent_fork /
+      #                       workflow / job_output: the allow-list
+      #                       short-circuits classification entirely (see
+      #                       README Limitations).
+      #
+      # Example (uncomment, edit, and place in your profile patch):
+      # config:
+      #   protectedPaths:
+      #     - '/Users/you/projects'
+      #   denyReadPaths:
+      #     - '~/.ssh'
+      #     - '~/.aws'
+      #     - '~/Library/Keychains'
+      #   extraAllowTools:
+      #     - web_search
+      #     - web_fetch
+      #     - skill
+      #   denyNetwork: true
+      #   denySystem: true
+      #   failClosed: true
+      #   snapshotCooldownSeconds: 30
+      # ------------------------------------------------------------------
