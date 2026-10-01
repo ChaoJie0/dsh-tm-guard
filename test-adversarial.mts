@@ -84,3 +84,31 @@ test('GAP: cd into sensitive dir + relative read must not bypass', () => {
     assert.equal(d.allow, false, `GAP must block cd-then-read :: ${cmd.slice(0, 52)}`)
   }
 })
+
+test('GAP: command substitution $(...) and backticks must not bypass', () => {
+  for (const cmd of [
+    'echo $(cat ~/.ssh/id_rsa)',
+    'echo `cat ~/.ssh/id_rsa`',
+    'echo $(cat /Users/zero/.ssh/id_rsa)',
+    'echo $(cat $HOME/.ssh/id_rsa)',
+    'x=$(cat ~/.ssh/id_rsa); echo $x',
+    'echo $(cat ~/.ssh/config | grep Host)',
+  ]) {
+    const { d } = gate(cmd)
+    assert.equal(d.allow, false, `GAP must block cmd-subst :: ${cmd.slice(0, 52)}`)
+  }
+})
+
+test('GAP: interpreter -c/-e code strings must not smuggle sensitive reads', () => {
+  for (const cmd of [
+    'python3 -c "print(open(\'/Users/zero/.ssh/id_rsa\').read())"',
+    'python3 -c \'print(open("/Users/zero/.ssh/id_rsa").read())\'',
+    'node -e "console.log(require(\'fs\').readFileSync(\'/Users/zero/.ssh/id_rsa\'))"',
+    'ruby -e \'puts File.read("/Users/zero/.ssh/id_rsa")\'',
+    'perl -e \'print readfile("/Users/zero/.ssh/id_rsa")\'',
+    'python3 -c "import os; print(open(os.path.expanduser(\'~/.ssh/id_rsa\')).read())"',
+  ]) {
+    const { d } = gate(cmd)
+    assert.equal(d.allow, false, `GAP must block interpreter read :: ${cmd.slice(0, 52)}`)
+  }
+})

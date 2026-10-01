@@ -1096,6 +1096,84 @@ function splitCommandSegments(command: string): string[] {
 }
 
 /**
+ * Extract command-substitution bodies — `$(...)` and backtick `` `…` `` —
+ * so sensitive reads smuggled inside them (`echo $(cat ~/.ssh/id_rsa)`) are
+ * caught by re-classifying the inner command. Arithmetic `$((x << 2))` yields
+ * a harmless body; nesting is handled by the recursive re-classification.
+ */
+function extractCommandSubstitutions(s: string): string[] {
+  const out: string[] = []
+  const btRe = /`([^`]*)`/g
+  let m: RegExpExecArray | null
+  while ((m = btRe.exec(s)) !== null) {
+    out.push(m[1])
+  }
+  let i = 0
+  while (i < s.length) {
+    const start = s.indexOf('$(', i)
+    if (start === -1) break
+    let depth = 0
+    let end = -1
+    for (let j = start + 2; j < s.length; j++) {
+      const ch = s[j]
+      if (ch === '(') depth++
+      else if (ch === ')') {
+        if (depth === 0) { end = j; break }
+        depth--
+      }
+    }
+    if (end === -1) break
+    out.push(s.slice(start + 2, end))
+    i = end + 1
+  }
+  return out
+}
+
+/**
+ * Interpreters that accept inline code (-c/-e/--eval/…). The code text is a
+ * separate language space the token-level path extractor cannot see, so we
+ * scan it directly for sensitive path references (absolute, ~-prefixed and
+ * $HOME-prefixed forms) and treat a hit as a sensitive read.
+ */
+const INTERPRETER_CODE_FLAGS: Record<string, string[]> = {
+  python3: ['-c'], python: ['-c'],
+  node: ['-e', '--eval'], nodejs: ['-e', '--eval'], npx: ['-e'],
+  ruby: ['-e'], perl: ['-e', '-E'], php: ['-r', '-R'],
+  osascript: ['-e'], jsc: ['-e'], swift: ['-e'],
+}
+
+/** Substring hit for an absolute sensitive prefix, with a directory/quote/
+ *  paren/space boundary so `/Users/zero/.ssh` does not false-positive on
+ *  `/Users/zero/.ssh-evil` appearing as a literal string. */
+function codeContainsPath(code: string, absPrefix: string): boolean {
+  const idx = code.indexOf(absPrefix)
+  if (idx === -1) return false
+  const after = code[idx + absPrefix.length] ?? ''
+  return after === '' || after === '/' || after === '"' || after === "'" ||
+    after === ')' || after === ' '
+}
+
+/** Scan interpreter code text for sensitive path references in every form a
+ *  script would use: absolute (`/Users/zero/.ssh/…`), `~`-prefixed, $HOME. */
+function scanCodeForSensitivePaths(
+  code: string,
+  denyReadPaths: string[],
+): string[] {
+  const hits: string[] = []
+  for (const raw of denyReadPaths) {
+    const abs = expandHome(raw).replace(/\/+$/, '')
+    const homeRel = raw.replace(/^~\//, '') // e.g. .ssh / Library/Keychains
+    if (codeContainsPath(code, abs)) hits.push(abs)
+    if (code.includes(`~/${homeRel}`) || code.includes(`"~/${homeRel}`) ||
+        code.includes(`'~/${homeRel}`)) hits.push(raw)
+    if (code.includes(`$HOME/${homeRel}`) || code.includes(`\${HOME}/${homeRel}`)) {
+      hits.push(raw)
+    }
+  }
+  return hits
+}
+
+/**
  * Classify a full shell command string (may contain pipes, &&, ||, ;).
  * Returns the MOST RESTRICTIVE classification among all segments.
  *
@@ -1156,6 +1234,30 @@ export function classifyBashCommand(
     }
     for (const p of extractReadPaths(s)) {
       resolvedReads.push(toAbsolute(p, dir))
+    }
+    // Command substitution bodies ($(...) / `…`) are re-classified as their
+    // own commands: `echo $(cat ~/.ssh/id_rsa)` must be denied even though
+    // the outer segment is just echo + a token.
+    for (const body of extractCommandSubstitutions(s)) {
+      const inner = classifyBashCommand(body, denyReadPaths)
+      if (inner.forceDeny) {
+        resolvedReads.push(...(inner.targetPaths.length > 0 ? inner.targetPaths : [dir]))
+      }
+    }
+    // Interpreter -c/-e code strings: scan for sensitive path references the
+    // token extractor cannot see (python3 -c "print(open('/Users/zero/.ssh/id_rsa').read())").
+    const firstWordCode = s.trim().split(/\s+/)[0]?.toLowerCase().split('/').pop() ?? ''
+    const codeFlags = INTERPRETER_CODE_FLAGS[firstWordCode]
+    if (codeFlags) {
+      for (const flag of codeFlags) {
+        const fm = new RegExp(`\\s${flag}(?:=|\\s)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(s)
+        if (fm) {
+          const codeText = fm[1] ?? fm[2] ?? fm[3]
+          for (const hit of scanCodeForSensitivePaths(codeText, denyReadPaths)) {
+            resolvedReads.push(hit)
+          }
+        }
+      }
     }
     // cd-context: a segment executed inside a denyReadPaths directory exposes
     // that directory even with no path argument (`cd ~/.ssh && ls`) or with a
