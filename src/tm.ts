@@ -14,6 +14,31 @@ import { promisify } from 'node:util'
 const execFileAsync = promisify(execFile)
 const TMUTIL = '/usr/bin/tmutil'
 
+// Test seam: unit tests replace this to inject tmutil/df/mount/cp outcomes
+// (failures, empty output, malformed data) without touching the real system.
+// Default null = real execution; behaviour is unchanged when not set.
+type ExecOverride = (file: string, args: string[]) => Promise<{ stdout: string }>
+let __execOverride: ExecOverride | null = null
+export function __setExecOverride(fn: ExecOverride | null): void {
+  __execOverride = fn
+}
+
+/** Run an external command, capturing stdout (honours the test seam). */
+async function execCapture(
+  file: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<string> {
+  if (__execOverride) {
+    return (await __execOverride(file, args)).stdout
+  }
+  const { stdout } = await execFileAsync(file, args, {
+    timeout: timeoutMs,
+    maxBuffer: 1024 * 1024,
+  })
+  return stdout
+}
+
 // `tmutil destinationinfo` prints "Name : <x>" / "ID   : <x>" (colon) on
 // modern macOS; older builds used "Name = <x>". Accept both.
 const DEST_CONFIGURED_RE = /^\s*(Name|ID)\s*[:=]/m
@@ -43,11 +68,7 @@ export interface TmStatus {
 /* ------------------------------------------------------------------ */
 
 async function run(args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync(TMUTIL, args, {
-    timeout: 30_000,
-    maxBuffer: 1024 * 1024,
-  })
-  return stdout.trim()
+  return (await execCapture(TMUTIL, args, 30_000)).trim()
 }
 
 function parseSnapshotName(line: string): SnapshotInfo | null {
@@ -227,9 +248,7 @@ export async function getBackupStatus(): Promise<BackupStatus> {
 export async function startBackup(block: boolean): Promise<void> {
   const args = ['startbackup', '--auto']
   if (block) args.push('--block')
-  await execFileAsync(TMUTIL, args, {
-    timeout: block ? 900_000 : 60_000,
-  })
+  await execCapture(TMUTIL, args, block ? 900_000 : 60_000)
 }
 
 /* ------------------------------------------------------------------ */
@@ -333,7 +352,7 @@ export function listBrowsableBackups(): TmBackup[] {
 }
 
 /** Pick a browsable backup: exact date, latest before a date, or latest. */
-function pickBackup(
+export function pickBackup(
   backups: TmBackup[],
   snapshotDate?: string,
   beforeDate?: Date,
@@ -362,9 +381,7 @@ function pickBackup(
  */
 async function getDiskDeviceForPath(path: string): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync('/bin/df', ['-P', path], {
-      timeout: 10_000,
-    })
+    const stdout = await execCapture('/bin/df', ['-P', path], 10_000)
     const lines = stdout.trim().split('\n')
     if (lines.length < 2) return null
     // First column is the device, e.g. /dev/disk3s5
@@ -386,10 +403,10 @@ async function mountSnapshot(
   const mountPath = `/tmp/tm-guard-snap-${Date.now()}`
   try {
     mkdirSync(mountPath, { recursive: true })
-    await execFileAsync(
+    await execCapture(
       '/sbin/mount_apfs',
       ['-o', 'ro,nobrowse,noowners', '-s', snapshotName, device, mountPath],
-      { timeout: 15_000 },
+      15_000,
     )
     return mountPath
   } catch {
@@ -401,7 +418,7 @@ async function mountSnapshot(
 /** Unmount a previously mounted snapshot. */
 async function unmountSnapshot(mountPath: string): Promise<void> {
   try {
-    await execFileAsync('/sbin/umount', [mountPath], { timeout: 10_000 })
+    await execCapture('/sbin/umount', [mountPath], 10_000)
   } catch {
     // ignore — best effort
   }
@@ -461,9 +478,7 @@ export async function rollbackPath(
     const src = `${chosen.dataRoot}${normalizedTarget}`
     if (existsSync(src)) {
       try {
-        await execFileAsync('/bin/cp', ['-R', src, normalizedTarget], {
-          timeout: 60_000,
-        })
+        await execCapture('/bin/cp', ['-R', src, normalizedTarget], 60_000)
         if (verifyRestore(normalizedTarget)) {
           return {
             success: true,
@@ -507,9 +522,7 @@ export async function rollbackPath(
         ]) {
           if (existsSync(cand)) {
             try {
-              await execFileAsync('/bin/cp', ['-R', cand, normalizedTarget], {
-                timeout: 60_000,
-              })
+              await execCapture('/bin/cp', ['-R', cand, normalizedTarget], 60_000)
               if (verifyRestore(normalizedTarget)) {
                 return {
                   success: true,
