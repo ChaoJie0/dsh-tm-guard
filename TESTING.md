@@ -45,9 +45,7 @@
 **为什么必须有这层**：npm semver 对 prerelease 的规则（同主次补丁三元组 comparator 才生效）极容易手工推导出错——0.1.1 事件（`<0.2.0-0` 挡 0.1.x 线）、0.2.0 三段式（漏 0.1.0/0.1.1 stable）都是手工推导的产物。任何声明改动必须让此矩阵全绿。
 
 ### L4 全版本 host 矩阵冒烟（发布前手动）
-在**每个实际存在的 dsh host 版本**上起隔离实例验证。npm 实测版本集合 = 0.1.x 线（0.1.0-rc.2 ~ 0.1.7-rc.2）+ 0.2.x 线（0.2.0-rc.1/rc.2）。0.2.3 发布前全矩阵实测（2026-10-01）：
-
-| host 版本 | 插件加载 | TM health check | API 响应 | tm_status 冒烟 | 端到端拦截 |
+在**每个实际存在的 dsh host 版本**上起隔离实例验证。npm 实测版本集合 = 0.1.x 线（0.1.0-rc.2 ~ 0.1.7-rc.2）+ 0.2.x 线（0.2.0-rc.1/rc.2）。0.2.3 发布前全矩阵实测（2026-10-01）：| host 版本 | 插件加载 | TM health check | API 响应 | tm_status 冒烟 | 端到端拦截 |
 |---|---|---|---|---|---|
 | 0.1.0-rc.2 | ✅ Loaded | ✅ passed | —（host web boot 缺内置插件，host 自身缺陷） | — | — |
 | 0.1.2-rc.1 | ✅ Loaded | ✅ passed | ✅ 200 | ⚠️ host agent turn 崩溃（`reading 'length'`，host 自身缺陷） | — |
@@ -62,6 +60,8 @@
 4. host 自身缺陷（0.1.0-rc.2 web boot 缺插件、0.1.2-rc.1 agent turn 崩溃）**不属于插件问题**——插件在两线加载与初始化均正常
 
 环境：每版本 = npm tgz 解压 + pnpm 装依赖（`allowBuilds` 白名单 6 项）+ 独立 profile（dsh-base/web-app 同版本 + 插件 tarball）+ 独立端口实例。0.1.2-rc.1 会话为 v3 格式（`session.jsonl.zstd`），0.1.7+ 为 v4（`session.v4.jsonl.zstd`）。冒烟 RPC 脚本见 `.smoke-out/verify-host-matrix-023.md` 附注（/tmp/tm-rpc.py + tm-gate-smoke.py，端口参数化认证）。
+
+**写门控端到端补测（2026-10-02）**：3 个可端到端 host（0.1.7-rc.2/0.2.0-rc.1/0.2.0-rc.2）全部通过受保护内写放行、越界写拒（非临时路径）、敏感路径写拒三场景，行为一致。驱动脚本 `scripts/verify-host-matrix-write.py`，报告 `.smoke-out/verify-host-matrix-write-023.md`。注意：`/tmp`/`/var/tmp`/`/var/folders` 是设计内一次性临时区放行（classifier.ts），越界写测试须用非临时路径。
 
 ### L5 独立复核（发布前委派）
 委派 dsh 独立会话（不采信本文件/此前结论）：对 **npm 发布物**（安装目录 + registry 元数据）验证——peer 严格语义、发布物与 gitHead 重建 SHA 一致、函数级门控 40+208 用例、生产审计活性。0.2.0/0.2.1 发布均执行并 PASS。
