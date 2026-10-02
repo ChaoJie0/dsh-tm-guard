@@ -232,8 +232,42 @@ async function maybeSnapshot(cooldownSeconds: number): Promise<string | null> {
 export const name = 'tm-guard'
 export const inject = ['tools']
 
+/**
+ * Normalize raw cordis.patch.yml values: a hand-edited config can pass a
+ * string where an array belongs, a number where a boolean belongs, etc.
+ * Plugins must degrade to defaults instead of crashing or silently flipping
+ * policy (e.g. denyNetwork: 0 treated as false).
+ */
+function normalizeArray(v: unknown, fallback: string[]): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : fallback
+}
+function normalizeBool(v: unknown, fallback: boolean): boolean {
+  return typeof v === 'boolean' ? v : fallback
+}
+function normalizeNumber(v: unknown, fallback: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback
+}
+
 export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
-  const config: TmGuardConfig = { ...DEFAULT_CONFIG, ...rawConfig }
+  const config: TmGuardConfig = {
+    ...DEFAULT_CONFIG,
+    ...rawConfig,
+    protectedPaths: normalizeArray(rawConfig?.protectedPaths, DEFAULT_CONFIG.protectedPaths),
+    denyReadPaths: normalizeArray(rawConfig?.denyReadPaths, DEFAULT_CONFIG.denyReadPaths),
+    extraAllowTools: normalizeArray(rawConfig?.extraAllowTools, DEFAULT_CONFIG.extraAllowTools),
+    extraDenyTools: normalizeArray(rawConfig?.extraDenyTools, DEFAULT_CONFIG.extraDenyTools),
+    denyNetwork: normalizeBool(rawConfig?.denyNetwork, DEFAULT_CONFIG.denyNetwork),
+    denySystem: normalizeBool(rawConfig?.denySystem, DEFAULT_CONFIG.denySystem),
+    failClosed: normalizeBool(rawConfig?.failClosed, DEFAULT_CONFIG.failClosed),
+    failClosedBlockReads: normalizeBool(rawConfig?.failClosedBlockReads, DEFAULT_CONFIG.failClosedBlockReads),
+    verbose: normalizeBool(rawConfig?.verbose, DEFAULT_CONFIG.verbose),
+    requireTaskSnapshot: normalizeBool(rawConfig?.requireTaskSnapshot, DEFAULT_CONFIG.requireTaskSnapshot),
+    requireGitBaseline: normalizeBool(rawConfig?.requireGitBaseline, DEFAULT_CONFIG.requireGitBaseline),
+    autoApprove: normalizeBool(rawConfig?.autoApprove, DEFAULT_CONFIG.autoApprove),
+    turnReports: normalizeBool(rawConfig?.turnReports, DEFAULT_CONFIG.turnReports),
+    blockingBackupBeforeWrite: normalizeBool(rawConfig?.blockingBackupBeforeWrite, DEFAULT_CONFIG.blockingBackupBeforeWrite),
+    snapshotCooldownSeconds: normalizeNumber(rawConfig?.snapshotCooldownSeconds, DEFAULT_CONFIG.snapshotCooldownSeconds),
+  }
   const audit = new AuditLog(process.cwd())
 
   /* -------------------------------------------------------------- */
