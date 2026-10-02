@@ -169,8 +169,14 @@ export async function isPathProtected(
 
   // Must be under a protected prefix (directory-boundary match, so that
   // prefix "/Users/you/work" does not also cover "/Users/you/work-evil").
+  // Relative prefixes ("." , "src") are resolved against cwd BEFORE
+  // normalization: normalizeForMatch(".") collapses to "/" — matching every
+  // path and silently widening the writable scope to the whole disk.
   const underPrefix = protectedPrefixes.some((p) => {
-    const pref = normalizeForMatch(expandHome(p)).replace(/\/+$/, '')
+    const expanded = expandHome(p)
+    const pref = normalizeForMatch(expanded.startsWith('/')
+      ? expanded
+      : join(process.cwd(), expanded)).replace(/\/+$/, '')
     return normAbs === pref || normAbs.startsWith(pref + '/')
   })
   if (!underPrefix) return false
