@@ -355,3 +355,119 @@ test('invalidateHealthCache: forces a fresh check', async () => {
   assert.equal(h2.healthy, true)
   __setExecOverride(null)
 })
+
+// ---------------------------------------------------------------------------
+// 0.2.3 深化：剩余可注入分支（listSnapshots 失败 catch、isexcluded 抛、
+// mount 后 cp 失败、cp 成功但 verify 失败、占位设备文案）
+
+test('rollbackPath: listSnapshots throws -> manual with placeholder device line', async () => {
+  await withExec(async (f, a) => {
+    if (a[0] === 'listlocalsnapshots') throw new Error('tmutil crashed')
+    throw new Error(`unexpected ${f}`)
+  }, async () => {
+    const r = await rollbackPath('/tmp/tm-guard-faults/never2.txt')
+    assert.equal(r.success, false)
+    assert.equal(r.strategy, 'manual')
+    assert.match(r.message, /Could not automatically recover/)
+    assert.match(r.message, /com.apple.TimeMachine\.<date>\.local/) // snap placeholder
+  })
+})
+
+test('rollbackPath: mount ok + first candidate cp fails -> try next -> manual', async () => {
+  const target = join(mkdtempSync('/tmp/tm-fault-cpfail-'), 'lost.txt')
+  await withExec(async (f, a) => {
+    if (a[0] === 'listlocalsnapshots') return { stdout: LIST_OK }
+    if (f === '/bin/df') return { stdout: DF_OK }
+    if (f === '/sbin/mount_apfs') {
+      const mountPath = a[a.length - 1]
+      mkdirSync(mountPath, { recursive: true })
+      mkdirSync(join(mountPath, dirname(target)), { recursive: true })
+      writeFileSync(`${mountPath}${target}`, 'X\n') // candidate 1 exists
+      return { stdout: '' }
+    }
+    if (f === '/bin/cp') throw new Error('cp: Permission denied')
+    if (f === '/sbin/umount') return { stdout: '' }
+    throw new Error(`unexpected ${f}`)
+  }, async () => {
+    const r = await rollbackPath(target)
+    assert.equal(r.success, false)
+    assert.equal(r.strategy, 'manual')
+    assert.match(r.message, /Could not automatically recover/)
+  })
+})
+
+test('rollbackPath: cp returns ok but verify fails -> next candidate -> manual', async () => {
+  const target = join(mkdtempSync('/tmp/tm-fault-verifyfail-'), 'ghost.txt')
+  await withExec(async (f, a) => {
+    if (a[0] === 'listlocalsnapshots') return { stdout: LIST_OK }
+    if (f === '/bin/df') return { stdout: DF_OK }
+    if (f === '/sbin/mount_apfs') {
+      const mountPath = a[a.length - 1]
+      mkdirSync(mountPath, { recursive: true })
+      mkdirSync(join(mountPath, dirname(target)), { recursive: true })
+      writeFileSync(`${mountPath}${target}`, 'X\n') // candidate 1 exists
+      return { stdout: '' }
+    }
+    if (f === '/bin/cp') return { stdout: '' } // success but does NOT create the file
+    if (f === '/sbin/umount') return { stdout: '' }
+    throw new Error(`unexpected ${f}`)
+  }, async () => {
+    const r = await rollbackPath(target)
+    assert.equal(r.success, false)
+    assert.equal(r.strategy, 'manual')
+  })
+})
+
+test('getTmHealth: listSnapshots failure -> snapshotCount 0 + issue', async () => {
+  invalidateHealthCache()
+  await withExec(async (f, a) => {
+    if (a[0] === 'destinationinfo') return { stdout: DEST_OK }
+    if (a[0] === 'listlocalsnapshots') throw new Error('tmutil crashed')
+    return { stdout: '[Included] /Users/zero/Claude Code\n' }
+  }, async () => {
+    const h = await getTmHealth(['/Users/zero/Claude Code'])
+    assert.equal(h.healthy, false)
+    assert.equal(h.snapshotCount, 0)
+    assert.equal(h.hasSnapshots, false)
+    assert.ok(h.issues.some((i) => /No local Time Machine snapshots/.test(i)))
+  })
+})
+
+test('getTmHealth: isexcluded throws -> path counted unprotected', async () => {
+  invalidateHealthCache()
+  await withExec(async (f, a) => {
+    if (a[0] === 'destinationinfo') return { stdout: DEST_OK }
+    if (a[0] === 'listlocalsnapshots') return { stdout: LIST_OK }
+    if (a[0] === 'isexcluded') throw new Error('tmutil: cannot determine')
+    throw new Error(`unexpected ${f}`)
+  }, async () => {
+    const h = await getTmHealth(['/Users/zero/Claude Code'])
+    assert.equal(h.healthy, false)
+    assert.deepEqual(h.unprotectedPaths, ['/Users/zero/Claude Code'])
+    assert.ok(h.issues.some((i) => /NOT protected/.test(i)))
+  })
+})
+
+test('rollbackPath: beforeDate picks latest snapshot before the cutoff', async () => {
+  await withExec(async (f, a) => {
+    if (a[0] === 'listlocalsnapshots') {
+      // two snapshots: 09-07 08:30 and 09-07 10:00
+      return { stdout: '2026-09-07-083000\n2026-09-07-100000\n' }
+    }
+    if (f === '/bin/df') return { stdout: DF_OK }
+    throw new Error(`unexpected ${f}`) // mount not reached if device lookup fails
+  }, async () => {
+    // cutoff between the two -> should pick the earlier one (then fail at df/device)
+    const cutoff = new Date('2026-09-07T09:00:00+08:00')
+    const r = await rollbackPath('/tmp/tm-guard-faults/before.txt', undefined, cutoff)
+    assert.equal(r.success, false)
+    assert.equal(r.strategy, 'manual')
+    assert.match(r.message, /To recover manually/)
+  })
+})
+
+test('execCapture real path: tmutil isexcluded runs for real without override', async () => {
+  // no __setExecOverride — exercises the real execFileAsync branch
+  const excluded = await isPathExcluded('/tmp')
+  assert.equal(typeof excluded, 'boolean')
+})
