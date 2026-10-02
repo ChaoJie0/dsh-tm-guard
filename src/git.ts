@@ -82,7 +82,7 @@ export async function hasCommit(root: string): Promise<boolean> {
 }
 
 // Dirs we've already brought to a committed baseline (avoid re-running git).
-const ensuredDirs = new Set<string>()
+const ensuredDirs = new Map<string, string>() // dir -> real repo root
 
 export interface BaselineResult {
   ok: boolean
@@ -96,7 +96,8 @@ export interface BaselineResult {
  * identity so it works without any global git config.
  */
 export async function ensureGitBaseline(dir: string): Promise<BaselineResult> {
-  if (ensuredDirs.has(dir)) return { ok: true, root: dir }
+  const cached = ensuredDirs.get(dir)
+  if (cached) return { ok: true, root: cached }
 
   let root = await repoRoot(dir)
   if (!root) {
@@ -136,7 +137,7 @@ export async function ensureGitBaseline(dir: string): Promise<BaselineResult> {
     }
   }
 
-  ensuredDirs.add(dir)
+  ensuredDirs.set(dir, root)
   return { ok: true, root }
 }
 

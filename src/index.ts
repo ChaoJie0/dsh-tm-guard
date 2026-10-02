@@ -268,6 +268,16 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     blockingBackupBeforeWrite: normalizeBool(rawConfig?.blockingBackupBeforeWrite, DEFAULT_CONFIG.blockingBackupBeforeWrite),
     snapshotCooldownSeconds: normalizeNumber(rawConfig?.snapshotCooldownSeconds, DEFAULT_CONFIG.snapshotCooldownSeconds),
   }
+  // Empty writable scope is a silent footgun: `protectedPaths: []` means the
+  // agent can never write anywhere (every write is denied), which most users
+  // read as "no protection". Warn once at apply time; unlike denyReadPaths: []
+  // (a documented disable switch), protectedPaths has no "disable" meaning.
+  if (config.protectedPaths.length === 0) {
+    console.warn(
+      '[tm-guard] protectedPaths is empty — no path is writable, every write will be denied. ' +
+      'If this is unintended, add your workspace prefix(es).',
+    )
+  }
   const audit = new AuditLog(process.cwd())
 
   /* -------------------------------------------------------------- */
