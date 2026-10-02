@@ -5,6 +5,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyBashCommand, classifyToolCall, decide } from './src/classifier.ts'
+import os from 'node:os'
+
+const HOME = os.homedir()
+
 
 const DENY_READ = [
   '~/.ssh', '~/.aws', '~/.gnupg', '~/.kube', '~/.docker', '~/.netrc',
@@ -33,9 +37,9 @@ const FLAGS = [
 ]
 const PATHS = [
   '/tmp/x', './x', '../x', '~/x', '$HOME/x', '${HOME}/x',
-  '/Users/zero/.ssh/id_rsa', '/Users/zero/.ssh/config',
-  '/Users/zero/.aws/credentials', '/Users/zero/.config/x',
-  '/Users/zero/Claude Code/x.txt', '/Users/zero/DSH_Work/x.md',
+  `${HOME}/.ssh/id_rsa`, `${HOME}/.ssh/config`,
+  `${HOME}/.aws/credentials`, `${HOME}/.config/x`,
+  `${HOME}/Claude Code/x.txt`, `${HOME}/DSH_Work/x.md`,
   'https://example.com/x', 'http://127.0.0.1:8080/x', 'localhost:3000/x',
 ]
 const TOKEN_SEP = [' ', ' ', ' ', ' ', ' && ', ' || ', '; ', ' | ', ' & ']
@@ -150,7 +154,7 @@ test('fuzz: sensitive-read invariants hold across random composition', () => {
     const wrap = ['', '"', "'", '$(', '`'][Math.floor(rnd() * 5)]!
     const end = wrap === '"' ? '"' : wrap === "'" ? "'" : wrap === '$(' ? ')' : wrap === '`' ? '`' : ''
     const cat = ['cat', 'head', 'tail', 'sed', 'grep', 'strings', 'openssl x509 -in'][Math.floor(rnd() * 7)]!
-    const path = ['/Users/zero/.ssh/id_rsa', '/Users/zero/.ssh/config', '/Users/zero/.aws/credentials'][Math.floor(rnd() * 3)]!
+    const path = [`${HOME}/.ssh/id_rsa`, `${HOME}/.ssh/config`, `${HOME}/.aws/credentials`][Math.floor(rnd() * 3)]!
     probes.push([`${wrap}${cat} ${path}${end}`, `sensitive read :: ${cat} ${path} :: wrap=${wrap}`])
   }
   for (const [cmd, label] of probes) {

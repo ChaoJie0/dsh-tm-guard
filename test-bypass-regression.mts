@@ -3,16 +3,18 @@
 // bypass) plus the S1 tool-arg key-name gap. Red before the fix, green after.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import os from 'node:os'
 import { classifyBashCommand, classifyToolCall, normalizeForMatch } from './src/classifier.ts'
 import { isPathProtected, __setExecOverride } from './src/tm.ts'
 
+const HOME = os.homedir()
 const DENY_READ = ['~/.ssh', '~/.aws', '~/Library/Keychains']
 
 // ---------- M1: dd if= is a read path ----------
 test('M1: dd if=<sensitive> is denied (read side extracted)', () => {
   const c = classifyBashCommand('dd if=~/.ssh/id_rsa of=/tmp/stolen.key', DENY_READ)
   assert.equal(c.forceDeny, true, 'dd if=~/.ssh must be force-denied')
-  const c2 = classifyBashCommand('dd if=/Users/zero/.aws/credentials of=/tmp/k', DENY_READ)
+  const c2 = classifyBashCommand(`dd if=${HOME}/.aws/credentials of=/tmp/k`, DENY_READ)
   assert.equal(c2.forceDeny, true)
 })
 
@@ -51,15 +53,15 @@ test('M3: --flag=<non-sensitive> does not false-positive', () => {
 test('M2: isPathProtected resolves `..` escapes to false', async () => {
   __setExecOverride(async () => ({ stdout: '[Included]\n' }))
   try {
-    const prefixes = ['/Users/zero/projects/myapp']
-    assert.equal(await isPathProtected('/Users/zero/projects/myapp/a.ts', prefixes), true)
-    assert.equal(await isPathProtected('/Users/zero/projects/myapp/../secrets.txt', prefixes), false)
-    assert.equal(await isPathProtected('/Users/zero/projects/myapp/../../.zshrc', prefixes), false)
+    const prefixes = [`${HOME}/projects/myapp`]
+    assert.equal(await isPathProtected(`${HOME}/projects/myapp/a.ts`, prefixes), true)
+    assert.equal(await isPathProtected(`${HOME}/projects/myapp/../secrets.txt`, prefixes), false)
+    assert.equal(await isPathProtected(`${HOME}/projects/myapp/../../.zshrc`, prefixes), false)
     // // and case normalize to a protected prefix
-    assert.equal(await isPathProtected('//Users//zero//projects//myapp//a.ts', prefixes), true)
-    assert.equal(await isPathProtected('/Users/ZERO/Projects/MyApp/A.TS', prefixes), true)
+    assert.equal(await isPathProtected(`//${HOME}//projects//myapp//a.ts`, prefixes), true)
+    assert.equal(await isPathProtected(`${HOME.toUpperCase()}/Projects/MyApp/A.TS`, prefixes), true)
     // sibling prefix must NOT match
-    assert.equal(await isPathProtected('/Users/zero/projects/myapp-evil/a.ts', prefixes), false)
+    assert.equal(await isPathProtected(`${HOME}/projects/myapp-evil/a.ts`, prefixes), false)
   } finally { __setExecOverride(null) }
 })
 
@@ -72,10 +74,10 @@ test('M2: normalizeForMatch resolves segments deterministically', () => {
 // ---------- S1: tool arg key names ----------
 test('S1: classifyToolCall sees filePath / paths[] / pattern keys', () => {
   for (const [name, args] of [
-    ['fs_read_file', { filePath: '/Users/zero/.ssh/id_rsa' }],
-    ['read_multiple_files', { paths: ['/Users/zero/.ssh/id_rsa'] }],
-    ['read_files', { paths: ['/a.txt', '/Users/zero/.aws/credentials'] }],
-    ['glob', { pattern: '/Users/zero/.ssh/*' }],
+    ['fs_read_file', { filePath: `${HOME}/.ssh/id_rsa` }],
+    ['read_multiple_files', { paths: [`${HOME}/.ssh/id_rsa`] }],
+    ['read_files', { paths: ['/a.txt', `${HOME}/.aws/credentials`] }],
+    ['glob', { pattern: `${HOME}/.ssh/*` }],
   ] as const) {
     const c = classifyToolCall(name, args, DENY_READ)
     assert.equal(c.forceDeny, true, `${name} ${JSON.stringify(args)} must be denied`)
@@ -101,7 +103,7 @@ test('R1: read-typed glued flags do NOT become write targets (no in-scope false 
 })
 
 test('R1: write-typed glued flags still caught', () => {
-  for (const cmd of ['sort --output=~/.ssh/x /tmp/a', 'sort -o=/Users/zero/.ssh/x /tmp/a']) {
+  for (const cmd of [`sort --output=~/.ssh/x /tmp/a`, `sort -o=${HOME}/.ssh/x /tmp/a`]) {
     const c = classifyBashCommand(cmd, DENY_READ)
     assert.ok(c.forceDeny || c.targetPaths.some((p) => p.includes('/.ssh/')), `${cmd} must keep write path visible`)
   }
@@ -124,9 +126,9 @@ test('R1b: write-typed glued flag variants keep out-of-scope writes caught', () 
   // dsh review round 3: the whitelist over-narrowed and dropped --outfile /
   // --target-directory, silently re-allowing out-of-workspace writes.
   const cases = [
-    'gzip --outfile=/Users/zero/outside/a.gz /tmp/a',
+    `gzip --outfile=${HOME}/outside/a.gz /tmp/a`,
     'tar --outfile=~/outside/a.tar -cf x.tar /tmp',
-    'cp /tmp/a --target-directory=/Users/zero/outside/',
+    `cp /tmp/a --target-directory=${HOME}/outside/`,
   ]
   for (const cmd of cases) {
     const c = classifyBashCommand(cmd, DENY_READ)

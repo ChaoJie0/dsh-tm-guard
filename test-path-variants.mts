@@ -4,6 +4,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyBashCommand, classifyToolCall } from './src/classifier.ts'
+import os from 'node:os'
+
+const HOME = os.homedir()
+
 
 const DENY_READ = [
   '~/.ssh', '~/.aws', '~/.gnupg', '~/.kube', '~/.docker', '~/.netrc',
@@ -26,15 +30,15 @@ function mustAllow(cmd: string, label: string) {
 // macOS default filesystem is case-insensitive: `.SSH` == `.ssh`.
 test('case variants of sensitive dirs are denied (macOS semantics)', () => {
   for (const cmd of [
-    'cat /Users/zero/.SSH/id_rsa',
-    'cat /Users/zero/.ssh/ID_RSA',
+    `cat ${HOME}/.SSH/id_rsa`,
+    `cat ${HOME}/.ssh/ID_RSA`,
     'cat ~/.AWS/credentials',
     'cat ~/.aws/CREDENTIALS',
     'cat ~/.CONFIG/x',
     'cat ~/.GIT-CREDENTIALS',
     'cat ~/Library/keychains/x',
     'cat ~/library/Cookies/x',
-    'head /Users/Zero/.Ssh/id_rsa',
+    `head ${HOME}/.Ssh/id_rsa`,
   ]) {
     mustDeny(cmd, 'case variant')
   }
@@ -44,11 +48,11 @@ test('double-slash variants resolve to the same sensitive path', () => {
   for (const cmd of [
     // NOTE: a leading `//` collapses to `/` (POSIX), so `//Users//.ssh`
     // is /Users/.ssh — NOT the user's .ssh. Use interior double slashes:
-    'cat /Users//zero//.ssh//id_rsa',
-    'cat /Users/zero//.ssh//id_rsa',
+    'cat ${HOME}//.ssh//id_rsa',
+    `cat ${HOME}//.ssh//id_rsa`,
     'cat ~//.ssh/id_rsa',
     'cat $HOME//.ssh/id_rsa',
-    'cat /Users/zero/.ssh//config',
+    `cat ${HOME}/.ssh//config`,
   ]) {
     mustDeny(cmd, 'double slash')
   }
@@ -56,10 +60,10 @@ test('double-slash variants resolve to the same sensitive path', () => {
 
 test('dot-segment variants resolve into the sensitive path', () => {
   for (const cmd of [
-    'cat /Users/zero/.ssh/../.ssh/id_rsa',
+    `cat ${HOME}/.ssh/../.ssh/id_rsa`,
     'cat $HOME/.ssh/./id_rsa',
     'cat ~/.ssh/./config',
-    'cat /Users/zero/.//.ssh/id_rsa',
+    `cat ${HOME}/.//.ssh/id_rsa`,
   ]) {
     mustDeny(cmd, 'dot segment')
   }
@@ -71,7 +75,7 @@ test('prefix-boundary neighbors are NOT denied (no false positives)', () => {
     'cat ~/.ssh_backup/x',
     'cat ~/.ssh.bak/x',
     'cat ~/.awsome/x',
-    'cat /Users/zero/.sshconfig/x',
+    `cat ${HOME}/.sshconfig/x`,
   ]) {
     mustAllow(cmd, 'prefix neighbor')
   }
@@ -79,9 +83,9 @@ test('prefix-boundary neighbors are NOT denied (no false positives)', () => {
 
 test('tool-level path variants force-deny too', () => {
   for (const p of [
-    '/Users/zero/.SSH/id_rsa',
-    '/Users/zero/.ssh/../.ssh/id_rsa',
-    '/Users//zero//.ssh//id_rsa',
+    `${HOME}/.SSH/id_rsa`,
+    `${HOME}/.ssh/../.ssh/id_rsa`,
+    `${HOME}//.ssh//id_rsa`,
   ]) {
     const c = classifyToolCall('read_file', { path: p }, DENY_READ)
     assert.equal(c.forceDeny, true, `tool variant allowed :: ${p} :: ${JSON.stringify(c)}`)
@@ -95,24 +99,24 @@ test('sensitive-file suffix inside an allowed dir still denies', () => {
 
 test('quoted space-path redirection → allowed (full path extracted)', () => {
   const c = classifyBashCommand(
-    'echo x > "/Users/zero/Claude Code/自治/out.txt"', DENY_READ,
+    `echo x > "${HOME}/Claude Code/自治/out.txt"`, DENY_READ,
   )
   assert.equal(c.category, 'file_write')
-  assert.deepEqual(c.targetPaths, ['/Users/zero/Claude Code/自治/out.txt'])
+  assert.deepEqual(c.targetPaths, [`${HOME}/Claude Code/自治/out.txt`])
 })
 
 test('unquoted space-path redirection → conservative deny (shell splits args)', () => {
-  // Real bash: `echo x > /Users/zero/Claude Code/自治/out.txt` redirects to
-  // /Users/zero/Claude and passes "Code/自治/out.txt" as an argument — the
+  // Real bash: `echo x > ${HOME}/Claude Code/自治/out.txt` redirects to
+  // ${HOME}/Claude and passes "Code/自治/out.txt" as an argument — the
   // extracted write path is the first segment, outside protected prefixes.
   const c = classifyBashCommand(
-    'echo x > /Users/zero/Claude Code/自治/out.txt', DENY_READ,
+    `echo x > ${HOME}/Claude Code/自治/out.txt`, DENY_READ,
   )
   assert.equal(c.category, 'file_write')
-  assert.deepEqual(c.targetPaths, ['/Users/zero/Claude'])
+  assert.deepEqual(c.targetPaths, [`${HOME}/Claude`])
   // path protection check (isPathProtected on prefix) → not under protected → deny
-  const under = (['/Users/zero/Claude Code', '/Users/zero/Claude'].some(
-    (p) => '/Users/zero/Claude'.startsWith(p.replace(/\/+$/, '') + '/'),
+  const under = ([`${HOME}/Claude Code`, `${HOME}/Claude`].some(
+    (p) => `${HOME}/Claude`.startsWith(p.replace(/\/+$/, '') + '/'),
   ))
   assert.equal(under, false) // not protected → decide() denies
 })
