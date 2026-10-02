@@ -17,6 +17,15 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
+// Test seam: unit tests replace this to inject git outcomes (missing binary,
+// failed init/commit, dirty status) without touching the real system.
+// Default null = real execution; behaviour is unchanged when not set.
+type GitOverride = (args: string[], cwd: string) => Promise<string>
+let __gitOverride: GitOverride | null = null
+export function __setGitOverride(fn: GitOverride | null): void {
+  __gitOverride = fn
+}
+
 /** Sensible ignores so an auto-baseline doesn't swallow dependencies/build output. */
 const GITIGNORE_LINES = [
   'node_modules/',
@@ -42,6 +51,9 @@ function errMsg(err: unknown): string {
 }
 
 async function git(args: string[], cwd: string): Promise<string> {
+  if (__gitOverride) {
+    return (await __gitOverride(args, cwd)).trim()
+  }
   const { stdout } = await execFileAsync('git', args, {
     cwd,
     timeout: 60_000,
@@ -60,7 +72,7 @@ export async function repoRoot(dir: string): Promise<string | null> {
   }
 }
 
-async function hasCommit(root: string): Promise<boolean> {
+export async function hasCommit(root: string): Promise<boolean> {
   try {
     await git(['rev-parse', 'HEAD'], root)
     return true
