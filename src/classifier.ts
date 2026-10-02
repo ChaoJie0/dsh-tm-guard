@@ -1059,6 +1059,13 @@ function splitCommandSegments(command: string): string[] {
     }
 
     if (!inSingleQuote && !inDoubleQuote && !inBacktick) {
+      // Escaped char: `\;` in `find -exec … {} \;` is the -exec terminator,
+      // NOT a shell segment separator; `\(`, `\&`, `\|` likewise stay literal.
+      if (ch === '\\' && next !== undefined) {
+        current += ch + next
+        i++
+        continue
+      }
       if (ch === '(') { parenDepth++; current += ch; continue }
       if (ch === ')') { parenDepth--; current += ch; continue }
 
@@ -1173,6 +1180,44 @@ function scanCodeForSensitivePaths(
   return hits
 }
 
+/** Private-key / credential file names that -name may carry (precise, no wildcards). */
+const SENSITIVE_FIND_NAMES = new Set([
+  'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'id_ed25519_sk', 'id_ecdsa_sk',
+  'credentials', 'token', 'secret', '.netrc', '.npmrc', '.pypirc',
+])
+
+/** Content-reading commands that -exec may run on found files. */
+const FIND_READ_EXEC = new Set([
+  'cat', 'head', 'tail', 'sed', 'strings', 'od', 'xxd', 'base64', 'openssl',
+  'nl', 'more', 'less', 'grep', 'awk', 'cut', 'sort', 'dd', 'cp',
+])
+
+/**
+ * Detect `find … -name <sensitive-name> -exec <read-cmd> {}` — a read channel
+ * whose sensitive path only appears as a pattern + `{}` placeholder, invisible
+ * to the literal-path scan. Returns a synthetic sensitive path (or null).
+ */
+function scanFindExecForSensitiveRead(
+  s: string,
+  denyReadPaths: string[],
+): string | null {
+  if (!/(?:^|[;&|]\s*)find\s+/.test(s)) return null
+  const nm = /-name\s+(?:"([^"]+)"|'([^']+)'|(\S+))/.exec(s)
+  if (!nm) return null
+  const name = (nm[1] ?? nm[2] ?? nm[3]).trim()
+  if (!SENSITIVE_FIND_NAMES.has(name)) return null
+  const em = /-exec\s+(\S+)(?:\s+.*)?\{\}\s*\\?[;+]/.exec(s)
+  if (!em) return null
+  const exe = em[1].split('/').pop()?.toLowerCase() ?? ''
+  if (!FIND_READ_EXEC.has(exe)) return null
+  // Synthesize a path under the ssh-style deny prefix so the deny layer
+  // rejects it; falls back to the first configured prefix.
+  const sshLike = denyReadPaths.find((p) =>
+    /(?:^|\/)(?:\.ssh|\.aws|\.gnupg|\.kube|\.docker|\.config)$/.test(expandHome(p).replace(/\/+$/, '')),
+  )
+  return sshLike ? `${sshLike.replace(/\/+$/, '')}/${name}` : null
+}
+
 /**
  * Classify a full shell command string (may contain pipes, &&, ||, ;).
  * Returns the MOST RESTRICTIVE classification among all segments.
@@ -1268,6 +1313,13 @@ export function classifyBashCommand(
       const first = s.trim().toLowerCase().split(/\s+/)[0]
       if (!['echo', 'printf', 'cd'].includes(first)) resolvedReads.push(dir)
     }
+    // find -exec: `find / -name id_rsa -exec cat {} \;` carries no literal
+    // sensitive path — the name is a `-name` pattern and `{}` a placeholder —
+    // but find resolves real sensitive files and -exec reads their content.
+    // Precise private-key / credential file names only, so generic
+    // `find -name "*.ts" -exec cat` and name-only listings stay allowed.
+    const findHit = scanFindExecForSensitiveRead(s, denyReadPaths)
+    if (findHit) resolvedReads.push(findHit)
   }
 
   // Priority order for "most restrictive"

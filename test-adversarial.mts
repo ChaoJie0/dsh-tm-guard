@@ -112,3 +112,35 @@ test('GAP: interpreter -c/-e code strings must not smuggle sensitive reads', () 
     assert.equal(d.allow, false, `GAP must block interpreter read :: ${cmd.slice(0, 52)}`)
   }
 })
+
+// GAP5 (probed 2026-10-02): `find / -name id_rsa -exec cat {} \;` was allow=true —
+// the sensitive path only appears as `-name id_rsa` + `{}` placeholder, so the
+// literal-path scan misses it, while find resolves the real ~/.ssh/id_rsa.
+test('GAP: find -exec private-key name + content-read pair must not bypass', () => {
+  const cmds = [
+    'find / -name id_rsa -exec cat {} \\;',
+    'find / -name id_ed25519 -exec cat {} \\;',
+    'find / -name id_rsa -exec head -n 5 {} \\;',
+    'find / -name id_rsa -exec sed -n p {} \\;',
+    'find / -name id_rsa -exec strings {} \\;',
+    'find / -name id_rsa -exec od -c {} \\;',
+  ]
+  for (const cmd of cmds) {
+    const { d } = gate(cmd)
+    assert.equal(d.allow, false, `GAP must block find-exec sensitive read :: ${cmd.slice(0, 52)}`)
+  }
+})
+
+test('REG: find -exec generic names / name-only listing stay allowed', () => {
+  const allowed = [
+    'find / -name "*.ts" -exec cat {} \\;',
+    'find / -name "*.log" -exec tail -n 5 {} \\;',
+    'find . -name "*.json" -exec cat {} \\;',
+    'find / -name id_rsa -print', // lists names only, never reads content
+    'find / -name id_rsa -exec ls -la {} \\;',
+  ]
+  for (const cmd of allowed) {
+    const { d } = gate(cmd)
+    assert.equal(d.allow, true, `REG must not over-block :: ${cmd.slice(0, 52)}`)
+  }
+})
