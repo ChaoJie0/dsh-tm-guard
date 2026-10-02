@@ -66,7 +66,7 @@ async function git(args: string[], cwd: string): Promise<string> {
 export async function repoRoot(dir: string): Promise<string | null> {
   try {
     const root = await git(['rev-parse', '--show-toplevel'], dir)
-    return root || null
+    return root ? root.trim() : null
   } catch {
     return null
   }
