@@ -116,6 +116,12 @@ test('paren-wrapped single command is unwrapped and read-only', () => {
   assert.equal(d.allow, true)
 })
 
+test('empty parens collapse to Empty command', () => {
+  const { c } = gate('()')
+  assert.equal(c.category, 'read')
+  assert.match(c.reason, /Empty/)
+})
+
 test('multi-word system commands match fullCmd and force-deny', () => {
   const { d } = gate('diskutil eraseDisk JHFS+ Vol /dev/disk2')
   assert.equal(d.allow, false)
