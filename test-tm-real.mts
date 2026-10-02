@@ -6,10 +6,14 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, readdirSync } from 'node:fs'
 import { rollbackPath, getTmHealth, __setExecOverride } from './src/tm.ts'
+import os from 'node:os'
+
+const HOME = os.homedir()
+
 
 const MANIFEST = '/Volumes/SD/backup_manifest.plist'
 const HOST = '/Volumes/SD'
-const TARGET = '/Users/zero/Claude Code/自治/README.md' // exists in backup AND locally
+const TARGET = `${HOME}/Claude Code/自治/README.md` // exists in backup AND locally
 
 function haveRealBackup(): boolean {
   // The guard must check what the tests actually depend on: the manifest
@@ -82,7 +86,7 @@ test('real TM: backup exists but target absent from backup → "does not exist" 
 
 test('real TM: getTmHealth reports the mounted backup', async (t) => {
   if (!haveRealBackup()) return t.skip('no browsable TM backup on this machine')
-  const h = await getTmHealth(['/Users/zero/Claude Code/自治'])
+  const h = await getTmHealth([`${HOME}/Claude Code/自治`])
   assert.equal(typeof h.healthy, 'boolean')
   assert.equal(typeof h.destinationConfigured, 'boolean')
   assert.equal(typeof h.hasSnapshots, 'boolean')

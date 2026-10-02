@@ -15,6 +15,10 @@ import {
 } from './src/git.ts'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
+import os from 'node:os'
+
+const HOME = os.homedir()
+
 
 const realTmp = mkdtempSync('/tmp/git-faults-')
 
@@ -25,9 +29,9 @@ test('repoRoot: returns root / null on failure / null on empty output', async ()
   __setGitOverride(async (args, cwd) => {
     assert.deepEqual(args, ['rev-parse', '--show-toplevel'])
     assert.equal(cwd, '/x')
-    return '/Users/zero/proj'
+    return `${HOME}/proj`
   })
-  assert.equal(await repoRoot('/x'), '/Users/zero/proj')
+  assert.equal(await repoRoot('/x'), `${HOME}/proj`)
   __setGitOverride(null)
 
   __setGitOverride(async () => { throw new Error('fatal: not a git repository') })
