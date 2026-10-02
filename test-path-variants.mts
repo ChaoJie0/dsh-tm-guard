@@ -92,3 +92,27 @@ test('sensitive-file suffix inside an allowed dir still denies', () => {
   // .ssh/config.bak is still under .ssh — must deny (directory-prefix semantics)
   mustDeny('cat ~/.ssh/config.bak', 'suffix inside sensitive dir')
 })
+
+test('quoted space-path redirection → allowed (full path extracted)', () => {
+  const c = classifyBashCommand(
+    'echo x > "/Users/zero/Claude Code/自治/out.txt"', DENY_READ,
+  )
+  assert.equal(c.category, 'file_write')
+  assert.deepEqual(c.targetPaths, ['/Users/zero/Claude Code/自治/out.txt'])
+})
+
+test('unquoted space-path redirection → conservative deny (shell splits args)', () => {
+  // Real bash: `echo x > /Users/zero/Claude Code/自治/out.txt` redirects to
+  // /Users/zero/Claude and passes "Code/自治/out.txt" as an argument — the
+  // extracted write path is the first segment, outside protected prefixes.
+  const c = classifyBashCommand(
+    'echo x > /Users/zero/Claude Code/自治/out.txt', DENY_READ,
+  )
+  assert.equal(c.category, 'file_write')
+  assert.deepEqual(c.targetPaths, ['/Users/zero/Claude'])
+  // path protection check (isPathProtected on prefix) → not under protected → deny
+  const under = (['/Users/zero/Claude Code', '/Users/zero/Claude'].some(
+    (p) => '/Users/zero/Claude'.startsWith(p.replace(/\/+$/, '') + '/'),
+  ))
+  assert.equal(under, false) // not protected → decide() denies
+})
