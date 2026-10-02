@@ -471,3 +471,40 @@ test('execCapture real path: tmutil isexcluded runs for real without override', 
   const excluded = await isPathExcluded('/tmp')
   assert.equal(typeof excluded, 'boolean')
 })
+
+test('rollbackPath: manual-mount umount failure is ignored (catch)', async () => {
+  const target = join(mkdtempSync('/tmp/tm-fault-umount-'), 'restored.txt')
+  await withExec(async (f, a) => {
+    if (a[0] === 'listlocalsnapshots') return { stdout: LIST_OK }
+    if (f === '/bin/df') return { stdout: DF_OK }
+    if (f === '/sbin/mount_apfs') {
+      const mountPath = a[a.length - 1]
+      mkdirSync(mountPath, { recursive: true })
+      mkdirSync(join(mountPath, dirname(target)), { recursive: true })
+      writeFileSync(`${mountPath}${target}`, 'FROM-SNAPSHOT\n')
+      return { stdout: '' }
+    }
+    if (f === '/bin/cp') {
+      writeFileSync(a[2], 'FROM-SNAPSHOT\n')
+      return { stdout: '' }
+    }
+    if (f === '/sbin/umount') throw new Error('umount: Resource busy')
+    throw new Error(`unexpected ${f}`)
+  }, async () => {
+    const r = await rollbackPath(target)
+    assert.equal(r.success, true) // umount failure must not sink the restore
+    assert.equal(r.strategy, 'manual-mount')
+  })
+})
+
+test('getTmHealth: isexcluded failure pushes unprotected path (catch)', async () => {
+  await withExec(async (f, a) => {
+    if (a[0] === 'destinationinfo') return { stdout: 'Name : SD\n' }
+    if (a[0] === 'listlocalsnapshots') return { stdout: LIST_OK }
+    if (a[0] === 'isexcluded') throw new Error('tmutil: Full Disk Access required')
+    throw new Error(`unexpected ${f}`)
+  }, async () => {
+    const h = await getTmHealth(['/Users/zero/Claude Code/自治'])
+    assert.equal(h.workspaceProtected, false) // isexcluded failed → treated as unprotected
+  })
+})
