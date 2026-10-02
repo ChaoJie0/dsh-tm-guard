@@ -488,7 +488,9 @@ async function scanFileRecursive(
     if (state.visited.has(cand)) continue
     const r = await readScript(cand, state.cdDirs)
     if (!r) continue
-    await scanFileRecursive(r.abs, r.code, language, state)
+    // Carry depth down so MAX_DEPTH actually limits local-import recursion
+    // (shared arrays/sets stay by reference; depth is copied).
+    await scanFileRecursive(r.abs, r.code, language, { ...state, depth: state.depth + 1 })
   }
 }
 

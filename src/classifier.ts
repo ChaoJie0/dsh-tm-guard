@@ -463,11 +463,32 @@ function extractReadPaths(command: string): string[] {
 }
 
 /** Return the first path that falls under a denyReadPaths prefix, or null. */
+/**
+ * Normalize a path for sensitive-prefix matching:
+ * - collapse `//` runs (shell/FS treat them as `/`)
+ * - resolve `.` and `..` segments (shell resolves them before opening)
+ * - lowercase (macOS default APFS is case-insensitive; `.SSH` == `.ssh`)
+ * Keeps a leading `/`. Non-sensitive callers should not use this.
+ */
+function normalizeForMatch(p: string): string {
+  const collapsed = p.replace(/\/{2,}/g, '/')
+  const out: string[] = []
+  for (const part of collapsed.split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') {
+      out.pop()
+      continue
+    }
+    out.push(part)
+  }
+  return '/' + out.join('/').toLowerCase()
+}
+
 function denyHitFor(paths: string[], denyReadPaths: string[]): string | null {
   if (denyReadPaths.length === 0) return null
-  const prefixes = denyReadPaths.map((p) => expandHome(p).replace(/\/+$/, ''))
+  const prefixes = denyReadPaths.map((p) => normalizeForMatch(expandHome(p)))
   for (const p of paths) {
-    const abs = toAbsolute(p)
+    const abs = normalizeForMatch(toAbsolute(p))
     for (const pref of prefixes) {
       if (abs === pref || abs.startsWith(pref + '/')) return p
     }
