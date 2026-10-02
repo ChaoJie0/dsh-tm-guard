@@ -2,6 +2,13 @@
 
 All notable changes to dsh-tm-guard will be documented in this file.
 
+## [0.2.4] - 2026-10-03
+
+### Changed
+- **发布物隐私净化**：清除包内所有本机用户名路径——源码注释与 README
+  文档示例路径统一中性化为 \`/Users/alice\`；测试文件改用 os.homedir()
+  动态构造（无本机用户名硬编码）。无代码逻辑变更。
+
 ## [0.2.3] - 2026-10-02
 
 ### Security (important)

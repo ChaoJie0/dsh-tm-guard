@@ -1,6 +1,6 @@
 {
   "name": "dsh-tm-guard",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Time-Machine-backed autonomous agent permission gate for DeepSeek Harness (dsh). Safe defaults on install (protect cwd, deny network/system, block sensitive reads). Configure protectedPaths/extraAllowTools to unlock subagent/workflow/web — see README.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
