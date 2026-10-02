@@ -2,6 +2,65 @@
 
 All notable changes to dsh-tm-guard will be documented in this file.
 
+## [0.2.3] - 2026-10-02
+
+### Security (important)
+- **Sensitive-read bypass closed** — `dd` input operands (`if=`) were never
+  extracted as read paths (mistaken for env assignments), so `dd if=~/.ssh/id_rsa
+  of=<writable>/stolen.key` exfiltrated keys/credentials in one command. `if=`
+  now feeds the read-side denyReadPaths check; `of=` (previously never
+  extracted either) now feeds write-path protection. Found by independent
+  review; regression-covered.
+- **Write-side `..` escape closed** — `isPathProtected` used raw prefix
+  matching, so `<protected>/../secrets.txt` was treated as protected and the
+  write was allowed (no rollback coverage, outside the writable scope). The
+  write side now shares the same normalization as the read side (`..`, `//`,
+  case folding). Relative `protectedPaths` (e.g. `"."`) are resolved against
+  cwd first — previously they collapsed to `/` and silently widened the
+  writable scope to the whole disk.
+- **Glued-flag bypass closed** — `--flag=value` tokens were dropped whole, so
+  `grep --file=~/.ssh/id_rsa` / `sort --output=~/.ssh/x` bypassed both read and
+  write checks. Path-like glued values are now extracted on the read side
+  (generic) and on the write side (write-typed flags: `--output/--out/-o/
+  --target/--dest/--destination/--outfile/--output-file/--target-directory/
+  --dest-dir/--destination-directory/--output-directory`). Read-typed flags
+  (`--files-from`, `--from-file`) deliberately stay read-side only, so
+  legitimate in-scope writes are not false-denied.
+- **Tool-arg key-name gap closed** — `classifyToolCall` only recognized a
+  single `path`-family key, so `filePath`, `paths[]`/`files[]` arrays, and
+  `pattern`/`glob` fields bypassed sensitive-path checks. All plausible
+  path/pattern keys (including arrays) are now collected and checked.
+
+### Changed
+- Config hardening: array/bool/number fields tolerate wrong types instead of
+  crashing or silently flipping policy (`normalizeArray/Bool/Number`); empty
+  `protectedPaths` now emits an explicit warning (it means *every* write is
+  denied).
+- `export DEFAULT_CONFIG` for programmatic consumers and tests.
+- `ensureGitBaseline` cache now maps dir → real repo root (first-call and
+  cache-hit results agree).
+- Scan-scripts recursion depth quota fixed (depth now increments; MAX_DEPTH /
+  MAX_HITS / MAX_FILES_TOTAL enforced).
+- README peer range corrected to the four-segment range matching
+  package.json; `test-readme.mts` now asserts README↔package.json verbatim
+  consistency.
+
+### Added
+- Test suite grown to 205 tests (97.9% coverage): classifier fuzz (400 random
+  commands), decide truth table (104 combos), sensitive-path variant matrix,
+  scan-scripts quota + egress fuzz, real Time Machine integration, real-git
+  rollback drill, config-fault/concurrency, perf storm (sub-millisecond),
+  README consistency, and bypass-regression suites (M1/M2/M3/S1/R1/R2/R1b).
+- 3-host end-to-end matrix (dsh 0.1.7-rc.2 / 0.2.0-rc.1 / 0.2.0-rc.2) and
+  production-profile real-environment install verification.
+
+### Known limitations (honest)
+- Write-typed flag handling is a curated allow-list; new write flags (or
+  exotic variants) must be reviewed and added. Read-side path extraction is
+  heuristic, not a parser. Static analysis can still miss runtime-constructed
+  paths inside interpreter `-c/-e` code; `denyNetwork` egress blocking is the
+  backstop.
+
 ## [0.2.2] - 2026-10-01
 
 ### Fixed
