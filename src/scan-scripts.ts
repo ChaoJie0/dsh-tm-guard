@@ -417,7 +417,8 @@ function extractLocalImports(code: string, language: Lang, fileDir: string): str
         out.push(base + ext)
       }
     } else if (language === 'python') {
-      const asPath = raw.replace(/\//g, '.').split('.').join('/')
+      const rel = raw.startsWith('.') ? raw.slice(1) : raw
+      const asPath = rel.replace(/\//g, '.').split('.').join('/')
       out.push(resolve(fileDir, asPath + '.py'))
       out.push(resolve(fileDir, asPath, '__init__.py'))
     } else if (language === 'ruby') {
@@ -431,18 +432,28 @@ function extractLocalImports(code: string, language: Lang, fileDir: string): str
 
   if (language === 'python') {
     for (const m of code.matchAll(/^\s*import\s+([\w.]+)/gm)) pushCandidates(m[1])
-    for (const m of code.matchAll(/^\s*from\s+(\.?[\w.]*)\s+import\b/gm)) {
+    // `from utils import send` → module is `utils`; `from . import sub` →
+    // module is the symbol after `import` (sub). Capture BOTH so `.`-relative
+    // imports resolve to the sibling module file.
+    for (const m of code.matchAll(/^\s*from\s+(\.?[\w.]*)\s+import\s+([\w.]+)/gm)) {
       const mod = m[1]
       if (mod === '.') {
-        const sub = m[0].match(/import\s+([\w.]+)/)
-        if (sub) pushCandidates('.' + sub[1])
+        pushCandidates('.' + m[2])
       } else {
         pushCandidates(mod)
       }
     }
   } else if (language === 'node') {
-    const re = /(?:require\s*\(|import\s*(?:[\s\S]{0,120}?from\s+)?|import\s*)\(\s*['"]([^'"]+)['"]/g
-    for (const m of code.matchAll(re)) {
+    // require('./x') — single paren, then the string
+    for (const m of code.matchAll(/require\s*\(\s*['"]([^'"]+)['"]/g)) {
+      if (m[1].startsWith('.') || m[1].startsWith('/')) pushCandidates(m[1])
+    }
+    // static esm: `import x from './x'` and `import './x'`
+    for (const m of code.matchAll(/import\s+(?:[^'"\n]*?\s+from\s+)?['"]([^'"]+)['"]/g)) {
+      if (m[1].startsWith('.') || m[1].startsWith('/')) pushCandidates(m[1])
+    }
+    // dynamic import('./x')
+    for (const m of code.matchAll(/import\s*\(\s*['"]([^'"]+)['"]/g)) {
       if (m[1].startsWith('.') || m[1].startsWith('/')) pushCandidates(m[1])
     }
   } else if (language === 'shell') {
