@@ -388,21 +388,21 @@ function isReadonlyCurlDownload(rest: string): boolean {
   if (!/https?:\/\/[^\s"'`]+/.test(s)) return false
   // Must write output to a local file (not stdout, not piped).
   const hasOutput =
-    /\s-o\s+\S+/.test(s) || /\s--output\s+\S+/.test(s) ||
-    /\s--output=\S+/.test(s) || /\s-o\S+/.test(s) ||
-    /\s-O\b/.test(s) || /\s--remote-name\b/.test(s)
+    /(?:^|\s)-o\s+\S+/.test(s) || /(?:^|\s)--output\s+\S+/.test(s) ||
+    /(?:^|\s)--output=\S+/.test(s) || /(?:^|\s)-o\S+/.test(s) ||
+    /(?:^|\s)-O\b/.test(s) || /(?:^|\s)--remote-name\b/.test(s)
   if (!hasOutput) return false
   // Any of these flags makes it not a read-only download.
   const blocked: RegExp[] = [
-    /\s-X\s*\S?/, /\s--request\b/,
-    /\s-d\b/, /\s--data\b/, /\s--data-raw\b/, /\s--data-binary\b/, /\s--data-urlencode\b/,
-    /\s-T\b/, /\s--upload-file\b/,
-    /\s-F\b/, /\s--form\b/,
-    /\s-H\b/, /\s--header\b/,
-    /\s-u\b/, /\s--user\b/, /\s--basic\b/, /\s--digest\b/, /\s--anyauth\b/, /\s--bearer\b/,
-    /\s-k\b/, /\s--insecure\b/,
-    /\s--proxy\b/, /\s-e\b/, /\s--referer\b/,
-    /\s--post\d*\b/, /\s--head\b/,
+    /(?:^|\s)-X\s*\S?/, /(?:^|\s)--request\b/,
+    /(?:^|\s)-d\b/, /(?:^|\s)--data\b/, /(?:^|\s)--data-raw\b/, /(?:^|\s)--data-binary\b/, /(?:^|\s)--data-urlencode\b/,
+    /(?:^|\s)-T\b/, /(?:^|\s)--upload-file\b/,
+    /(?:^|\s)-F\b/, /(?:^|\s)--form\b/,
+    /(?:^|\s)-H\b/, /(?:^|\s)--header\b/,
+    /(?:^|\s)-u\b/, /(?:^|\s)--user\b/, /(?:^|\s)--basic\b/, /(?:^|\s)--digest\b/, /(?:^|\s)--anyauth\b/, /(?:^|\s)--bearer\b/,
+    /(?:^|\s)-k\b/, /(?:^|\s)--insecure\b/,
+    /(?:^|\s)--proxy\b/, /(?:^|\s)-e\b/, /(?:^|\s)--referer\b/,
+    /(?:^|\s)--post\d*\b/, /(?:^|\s)--head\b/,
   ]
   for (const re of blocked) if (re.test(s)) return false
   return true
@@ -611,8 +611,13 @@ function classifySingleCommand(command: string): ClassifyResult {
   // Check subcommands (git, svn, brew, npm, etc.)
   const fullCmd = `${firstWord} ${rest.split(/\s+/)[0]?.toLowerCase() ?? ''}`.trim()
 
-  // System commands check
-  if (SYSTEM_COMMANDS.has(firstWord) || SYSTEM_COMMANDS.has(fullCmd)) {
+  // System commands check.
+  // `fullCmd` only captures the first two words (lowercased), so multi-word
+  // entries like 'diskutil eraseDisk', 'chown -R' or 'defaults write
+  // NSGlobalDomain' would never match — also prefix-match against the raw
+  // command (entries with a space are complete command patterns).
+  if (SYSTEM_COMMANDS.has(firstWord) || SYSTEM_COMMANDS.has(fullCmd) ||
+      [...SYSTEM_COMMANDS].some((c) => c.includes(' ') && trimmed.startsWith(c))) {
     return {
       category: 'system',
       reason: `System-level command: ${fullCmd}`,
@@ -675,6 +680,13 @@ function classifySingleCommand(command: string): ClassifyResult {
   if (firstWord === 'open') {
     const target = rest.replace(/^-a\s+\S+\s*/i, '').trim()
     if (/:\/\//.test(target)) {
+      if (isLoopbackOnly(target)) {
+        return {
+          category: 'local_network',
+          reason: `open local network (loopback): ${target.slice(0, 80)}`,
+          targetPaths: [],
+        }
+      }
       return {
         category: 'network',
         reason: `open URL: ${target.slice(0, 80)}`,
@@ -1407,6 +1419,51 @@ export function classifyToolCall(
     (args.destination as string) ??
     ''
 
+  // --- Semantically independent tool classes checked BEFORE the generic
+  // write/read name table: a tool like `tm_snapshot_create`, `subagent_create`
+  // or `todo_create` contains write/create words but is NOT a filesystem write.
+  // --- Subagent tools (highest risk: child operations can't be verified)
+  if (name.includes('subagent') || name.includes('delegate') ||
+      name.includes('spawn') || name.includes('fork')) {
+    return {
+      category: 'mixed',
+      reason: `Subagent tool: ${toolName} (cannot verify child operations)`,
+      targetPaths: [],
+    }
+  }
+
+  // --- Our own TM tools (always allowed)
+  if (name.startsWith('tm_')) {
+    return {
+      category: 'read',
+      reason: `TM-Guard internal tool: ${toolName}`,
+      targetPaths: [],
+    }
+  }
+
+  // --- Interactive tools (asking the user a question / confirmation) ---
+  // No filesystem or network side effects; dsh's autoApprove already gates
+  // the approval waterfall, so blocking these only prevents the agent from
+  // surfacing a question it is allowed to ask.
+  if (name.includes('ask_user') || name.includes('user_question') ||
+      name.includes('prompt_user') || name === 'confirm') {
+    return {
+      category: 'read',
+      reason: `Interactive tool: ${toolName}`,
+      targetPaths: [],
+    }
+  }
+
+  // --- Todo / planning tools (no side effects outside session) ---
+  if (name.includes('todo') || name.includes('task') ||
+      name.includes('plan') || name.includes('goal')) {
+    return {
+      category: 'read',
+      reason: `Session-internal tool: ${toolName}`,
+      targetPaths: [],
+    }
+  }
+
   // --- Filesystem tools ---
   if (name.includes('write') || name.includes('edit') ||
       name.includes('delete') || name.includes('remove') ||
@@ -1463,48 +1520,6 @@ export function classifyToolCall(
     return {
       category: 'network',
       reason: `Network tool: ${toolName}`,
-      targetPaths: [],
-    }
-  }
-
-  // --- Subagent tools ---
-  if (name.includes('subagent') || name.includes('delegate') ||
-      name.includes('spawn') || name.includes('fork')) {
-    return {
-      category: 'mixed',
-      reason: `Subagent tool: ${toolName} (cannot verify child operations)`,
-      targetPaths: [],
-    }
-  }
-
-  // --- Todo / planning tools (no side effects outside session) ---
-  if (name.includes('todo') || name.includes('task') ||
-      name.includes('plan') || name.includes('goal')) {
-    return {
-      category: 'read',
-      reason: `Session-internal tool: ${toolName}`,
-      targetPaths: [],
-    }
-  }
-
-  // --- Interactive tools (asking the user a question / confirmation) ---
-  // No filesystem or network side effects; dsh's autoApprove already gates
-  // the approval waterfall, so blocking these only prevents the agent from
-  // surfacing a question it is allowed to ask.
-  if (name.includes('ask_user') || name.includes('user_question') ||
-      name.includes('prompt_user') || name === 'confirm') {
-    return {
-      category: 'read',
-      reason: `Interactive tool: ${toolName}`,
-      targetPaths: [],
-    }
-  }
-
-  // --- Our own TM tools (always allowed) ---
-  if (name.startsWith('tm_')) {
-    return {
-      category: 'read',
-      reason: `TM-Guard internal tool: ${toolName}`,
       targetPaths: [],
     }
   }
