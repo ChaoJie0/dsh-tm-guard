@@ -119,3 +119,20 @@ test('R2: relative protectedPrefix "." resolves to cwd, not the whole disk', asy
     assert.equal(rel, false)
   } finally { __setExecOverride(null) }
 })
+
+test('R1b: write-typed glued flag variants keep out-of-scope writes caught', () => {
+  // dsh review round 3: the whitelist over-narrowed and dropped --outfile /
+  // --target-directory, silently re-allowing out-of-workspace writes.
+  const cases = [
+    'gzip --outfile=/Users/zero/outside/a.gz /tmp/a',
+    'tar --outfile=~/outside/a.tar -cf x.tar /tmp',
+    'cp /tmp/a --target-directory=/Users/zero/outside/',
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.ok(
+      c.targetPaths.some((p) => p.includes('outside') || p.includes('outside/')),
+      `${cmd} must surface the out-of-scope write path (got ${JSON.stringify(c.targetPaths)})`,
+    )
+  }
+})
