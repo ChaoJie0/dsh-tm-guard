@@ -422,3 +422,37 @@ test('tm_backup_status: running / idle / failure paths', async () => {
     assert.match(fail, /Could not read backup status/)
   } finally { __setExecOverride(null) }
 })
+
+test('turn report: no real decisions → no report written (early return)', async () => {
+  tmHealthy()
+  try {
+    execSync(`rm -rf ${join(ROOT, '.tm-guard')}`)
+    apply(mockCtx() as any, { protectedPaths: [ROOT] })
+    // plugin self-test/boot records (explicit-allow) are not "real" decisions
+    await hooks['agent/turn-stopping'][0]({ agent: {}, turn: 1 })
+    const reportsDir = join(ROOT, '.tm-guard', 'reports')
+    const files = existsSync(reportsDir) ? readdirSync(reportsDir) : []
+    assert.equal(files.length, 0, `unexpected report: ${files.join(',')}`)
+  } finally { __setExecOverride(null) }
+})
+
+test('auto-approve: verbose mode logs and answers allowed-once', () => {
+  tmHealthy()
+  try {
+    apply(mockCtx() as any, { protectedPaths: [ROOT], autoApprove: true, verbose: true })
+    const ans = hooks['approval/request'][0]({ toolName: 'Read', reason: 'read file' })
+    assert.equal(ans, 'allowed-once')
+  } finally { __setExecOverride(null) }
+})
+
+test('tm_rollback: last_operation record without target paths → guidance', async () => {
+  tmHealthy()
+  try {
+    execSync(`rm -rf ${join(ROOT, '.tm-guard')}`)
+    apply(mockCtx() as any, { protectedPaths: [ROOT] })
+    // tm_backup writes an audit record with empty targetPaths
+    await findTool('tm_backup').execute({})
+    const out = await findTool('tm_rollback').execute({ last_operation: true })
+    assert.match(out, /had no target paths recorded|No file-modification/)
+  } finally { __setExecOverride(null) }
+})
