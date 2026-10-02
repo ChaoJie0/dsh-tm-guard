@@ -86,3 +86,36 @@ test('S1: non-sensitive multi-path args stay allowed', () => {
   const c = classifyToolCall('read_multiple_files', { paths: ['/tmp/a', '/tmp/b'] }, DENY_READ)
   assert.ok(!c.forceDeny)
 })
+
+// ---------- R1/R2: regressions introduced by the fix batch ----------
+test('R1: read-typed glued flags do NOT become write targets (no in-scope false deny)', () => {
+  // tar --files-from is a READ input; with the generic write-side glue
+  // extraction it landed in targetPaths and denied legitimate in-scope writes
+  // whenever the input list lives outside the protected prefix.
+  const c = classifyBashCommand('tar --files-from=/etc/list -C /tmp/out .', DENY_READ)
+  // The essential regression: a read-typed input outside the protected scope
+  // must NOT turn an in-scope write into a deny.
+  assert.ok(!c.forceDeny, 'tar --files-from (read input) must not force-deny the write')
+  const c2 = classifyBashCommand('diff --from-file=/etc/hosts /tmp/a', DENY_READ)
+  assert.ok(!c2.forceDeny, 'diff --from-file (read-typed) must not be force-denied')
+})
+
+test('R1: write-typed glued flags still caught', () => {
+  for (const cmd of ['sort --output=~/.ssh/x /tmp/a', 'sort -o=/Users/zero/.ssh/x /tmp/a']) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.ok(c.forceDeny || c.targetPaths.some((p) => p.includes('/.ssh/')), `${cmd} must keep write path visible`)
+  }
+})
+
+test('R2: relative protectedPrefix "." resolves to cwd, not the whole disk', async () => {
+  __setExecOverride(async () => ({ stdout: '[Included]\n' }))
+  try {
+    // With the raw normalizeForMatch(".") → "/" bug, every absolute path was
+    // "protected" — the writable scope silently became the whole disk.
+    const dot = await isPathProtected('/etc/passwd', ['.'])
+    assert.equal(dot, false)
+    const rel = await isPathProtected('a.txt', ['src']) // "src" relative → cwd/src
+    // cwd is the project dir; ./src may not exist as prefix for 'a.txt'
+    assert.equal(rel, false)
+  } finally { __setExecOverride(null) }
+})

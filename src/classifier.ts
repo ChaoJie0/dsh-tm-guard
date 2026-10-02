@@ -287,18 +287,25 @@ function extractWritePaths(command: string): string[] {
     if (glued && glued[1]) paths.push(glued[1])
   }
 
-  // Glued option values: `--output=~/.ssh/x`, `--file=…` — the value after
-  // `=` is a write target even for otherwise-read commands (sort --output=,
-  // tar --files-from=, diff --from-file=). Extract path-like values so the
-  // write-protection check sees them.
+  // Glued WRITE-typed option values: `--output=…`, `--out=…`, `-o=…`,
+  // `--target=…`, `--dest=…`, `--destination=…` — the value is a write
+  // target even for otherwise-read commands (sort --output=). Deliberately
+  // NOT a generic path-like extraction: `--files-from=…` / `--from-file=…`
+  // are READ inputs (their values belong in the read-side extraction) and
+  // feeding them into the write path list would deny legitimate in-scope
+  // writes whenever the input list lives outside the protected prefix.
+  const WRITE_VALUE_FLAGS = new Set([
+    '--output', '--out', '-o', '--target', '--dest', '--destination',
+  ])
   for (const t of tokens) {
     if (!t.startsWith('-')) continue
     const eq = t.indexOf('=')
-    if (eq > 1) {
-      const val = t.slice(eq + 1)
-      if (val && (val.startsWith('/') || val.startsWith('~') || val.includes('/'))) {
-        paths.push(val)
-      }
+    if (eq <= 1) continue
+    const flag = t.slice(0, eq)
+    if (!WRITE_VALUE_FLAGS.has(flag)) continue
+    const val = t.slice(eq + 1)
+    if (val && (val.startsWith('/') || val.startsWith('~') || val.includes('/'))) {
+      paths.push(val)
     }
   }
 
