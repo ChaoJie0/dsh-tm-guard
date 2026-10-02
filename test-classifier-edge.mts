@@ -5,6 +5,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyBashCommand, classifyToolCall, decide } from './src/classifier.ts'
+import os from 'node:os'
+
+const HOME = os.homedir()
+
 
 const DENY_READ = [
   '~/.ssh', '~/.aws', '~/.gnupg', '~/.kube', '~/.docker', '~/.netrc',
@@ -99,12 +103,12 @@ test('tool-level classification tables', () => {
 })
 
 test('tool-level: read tool hitting a sensitive path force-denies', () => {
-  const c = classifyToolCall('read_file', { path: '/Users/zero/.ssh/id_rsa' }, DENY_READ)
+  const c = classifyToolCall('read_file', { path: `${HOME}/.ssh/id_rsa` }, DENY_READ)
   assert.equal(c.forceDeny, true)
 })
 
 test('tool-level: write tool reports file_write with target path', () => {
-  const c = classifyToolCall('fs_write_file', { path: '/Users/zero/Claude Code/x.txt' }, DENY_READ)
+  const c = classifyToolCall('fs_write_file', { path: `${HOME}/Claude Code/x.txt` }, DENY_READ)
   assert.equal(c.category, 'file_write')
   assert.ok(c.targetPaths.some((p) => p.includes('x.txt')))
 })

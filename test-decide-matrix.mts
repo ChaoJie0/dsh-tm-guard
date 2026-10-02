@@ -6,6 +6,10 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyBashCommand, classifyToolCall, decide } from './src/classifier.ts'
 import type { ClassifyResult } from './src/classifier.ts'
+import os from 'node:os'
+
+const HOME = os.homedir()
+
 
 const DENY_READ = [
   '~/.ssh', '~/.aws', '~/.gnupg', '~/.kube', '~/.docker', '~/.netrc',
@@ -62,7 +66,7 @@ function mkResult(
   return {
     category: category as ClassifyResult['category'],
     reason: `synthetic ${category}`,
-    targetPaths: tempOnly ? ['/tmp/x'] : category === 'file_write' ? ['/Users/zero/Claude Code/x'] : [],
+    targetPaths: tempOnly ? ['/tmp/x'] : category === 'file_write' ? [`${HOME}/Claude Code/x`] : [],
     forceDeny,
   }
 }

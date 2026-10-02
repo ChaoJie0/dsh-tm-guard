@@ -10,6 +10,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyBashCommand, classifyToolCall, decide } from './src/classifier.ts'
+import os from 'node:os'
+
+const HOME = os.homedir()
+
 
 // Production-equivalent denyReadPaths (from a typical cordis.patch.yml)
 const DENY_READ = [
@@ -19,8 +23,8 @@ const DENY_READ = [
 ]
 // Production-equivalent protectedPaths
 const PROTECTED = [
-  '/Users/zero/Claude Code', '/Applications/Study',
-  '/Users/zero/DSH_Work', '/Users/zero/.dsh/skills/quarkclouddrive',
+  `${HOME}/Claude Code`, '/Applications/Study',
+  `${HOME}/DSH_Work`, `${HOME}/.dsh/skills/quarkclouddrive`,
 ]
 
 function decideBash(cmd, { denyRead = DENY_READ, protectedPaths = PROTECTED } = {}) {
@@ -35,9 +39,9 @@ function decideBash(cmd, { denyRead = DENY_READ, protectedPaths = PROTECTED } = 
 
 test('A. write inside protected dir -> ALLOW', () => {
   for (const cmd of [
-    'echo hello > "/Users/zero/Claude Code/自治/.smoke-out/probe.txt"',
-    'touch "/Users/zero/DSH_Work/note.md"',
-    'mkdir -p "/Users/zero/Claude Code/自治/.smoke-out/sub"',
+    `echo hello > "${HOME}/Claude Code/自治/.smoke-out/probe.txt"`,
+    `touch "${HOME}/DSH_Work/note.md"`,
+    `mkdir -p "${HOME}/Claude Code/自治/.smoke-out/sub"`,
   ]) {
     const { d } = decideBash(cmd)
     assert.equal(d.allow, true, `protected write allowed :: ${cmd.slice(0, 58)}`)
@@ -46,9 +50,9 @@ test('A. write inside protected dir -> ALLOW', () => {
 
 test('B. write outside protected paths -> DENY', () => {
   for (const cmd of [
-    'echo x > /Users/zero/Desktop/evil.txt',
+    `echo x > ${HOME}/Desktop/evil.txt`,
     'touch /etc/hosts',
-    'echo x > /Users/zero/Documents/out.txt',
+    `echo x > ${HOME}/Documents/out.txt`,
   ]) {
     const { d } = decideBash(cmd)
     assert.equal(d.allow, false, `out-of-bounds write denied :: ${cmd.slice(0, 52)}`)
@@ -64,7 +68,7 @@ test('C. sensitive read interception (~/.ssh etc) -> DENY (forceDeny)', () => {
     'cat ~/.git-credentials',
     'cat ~/Library/Keychains/login.keychain-db',
     'grep -r secret ~/.gnupg',
-    'cat ~/.ssh/id_rsa > "/Users/zero/Claude Code/自治/.smoke-out/leak.txt"',
+    `cat ~/.ssh/id_rsa > "${HOME}/Claude Code/自治/.smoke-out/leak.txt"`,
   ]) {
     const { c, d } = decideBash(cmd)
     assert.equal(d.allow, false, `sensitive read denied :: ${cmd.slice(0, 46)}`)
@@ -94,8 +98,8 @@ test('D. network / system commands -> DENY', () => {
 
 test('E. read-only / local commands -> ALLOW (no over-blocking)', () => {
   for (const cmd of [
-    'cat "/Users/zero/Claude Code/自治/package.json"',
-    'ls -la "/Users/zero/Claude Code/自治"',
+    `cat "${HOME}/Claude Code/自治/package.json"`,
+    `ls -la "${HOME}/Claude Code/自治"`,
     'git status',
     'git log --oneline -5',
     'git diff HEAD',
@@ -106,11 +110,11 @@ test('E. read-only / local commands -> ALLOW (no over-blocking)', () => {
 })
 
 test('F. classifyToolCall on tool layer (fs_write_file)', () => {
-  const inb = classifyToolCall('fs_write_file', { path: '/Users/zero/Claude Code/自治/ok.txt' }, DENY_READ)
+  const inb = classifyToolCall('fs_write_file', { path: `${HOME}/Claude Code/自治/ok.txt` }, DENY_READ)
   assert.equal(inb.category, 'file_write')
   assert.equal(inb.forceDeny === true, false)
 
-  const outb = classifyToolCall('fs_write_file', { path: '/Users/zero/Desktop/evil.txt' }, DENY_READ)
+  const outb = classifyToolCall('fs_write_file', { path: `${HOME}/Desktop/evil.txt` }, DENY_READ)
   assert.equal(decide(outb, false).allow, false)
 
   const sens = classifyToolCall('fs_write_file', { path: '~/.ssh/authorized_keys' }, DENY_READ)
