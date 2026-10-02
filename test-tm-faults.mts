@@ -30,6 +30,10 @@ import {
 } from './src/tm.ts'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import os from 'node:os'
+
+const HOME = os.homedir()
+
 
 after(() => __setExecOverride(null))
 
@@ -124,11 +128,11 @@ test('isPathExcluded: [Excluded]/[Included]/tmutil failure', async () => {
   await withExec(async (f, a) => {
     assert.equal(f, '/usr/bin/tmutil')
     assert.equal(a[0], 'isexcluded')
-    if (a[1] === '/Users/zero/work') return { stdout: '[Excluded] /Users/zero/work\n' }
-    return { stdout: '[Included] /Users/zero/other\n' }
+    if (a[1] === `${HOME}/work`) return { stdout: `[Excluded] ${HOME}/work\n` }
+    return { stdout: `[Included] ${HOME}/other\n` }
   }, async () => {
-    assert.equal(await isPathExcluded('/Users/zero/work'), true)
-    assert.equal(await isPathExcluded('/Users/zero/other'), false)
+    assert.equal(await isPathExcluded(`${HOME}/work`), true)
+    assert.equal(await isPathExcluded(`${HOME}/other`), false)
   })
   // tmutil failure -> conservatively excluded (true)
   await withExec(async () => { throw new Error('denied') }, async () => {
@@ -137,17 +141,17 @@ test('isPathExcluded: [Excluded]/[Included]/tmutil failure', async () => {
 })
 
 test('isPathProtected: prefix boundary + exclusion + ~ expansion', async () => {
-  const prefixes = ['/Users/zero/Claude Code']
+  const prefixes = [`${HOME}/Claude Code`]
   // under prefix + included -> protected
-  __setExecOverride(async () => ({ stdout: '[Included] /Users/zero/Claude Code/x\n' }))
-  assert.equal(await isPathProtected('/Users/zero/Claude Code/x', prefixes), true)
+  __setExecOverride(async () => ({ stdout: `[Included] ${HOME}/Claude Code/x\n` }))
+  assert.equal(await isPathProtected(`${HOME}/Claude Code/x`, prefixes), true)
   __setExecOverride(null)
   // excluded -> not protected
-  await withExec(async () => ({ stdout: '[Excluded] /Users/zero/Claude Code/x\n' }), async () => {
-    assert.equal(await isPathProtected('/Users/zero/Claude Code/x', prefixes), false)
+  await withExec(async () => ({ stdout: `[Excluded] ${HOME}/Claude Code/x\n` }), async () => {
+    assert.equal(await isPathProtected(`${HOME}/Claude Code/x`, prefixes), false)
   })
   // outside prefix -> not protected (no tmutil call)
-  assert.equal(await isPathProtected('/Users/zero/elsewhere', prefixes), false)
+  assert.equal(await isPathProtected(`${HOME}/elsewhere`, prefixes), false)
 })
 
 // ---------------------------------------------------------------------------
@@ -276,9 +280,9 @@ test('getTmHealth: healthy when all checks pass', async () => {
   await withExec(async (f, a) => {
     if (a[0] === 'destinationinfo') return { stdout: DEST_OK }
     if (a[0] === 'listlocalsnapshots') return { stdout: LIST_OK }
-    return { stdout: '[Included] /Users/zero/Claude Code\n' } // isexcluded
+    return { stdout: `[Included] ${HOME}/Claude Code\n` } // isexcluded
   }, async () => {
-    const h = await getTmHealth(['/Users/zero/Claude Code'])
+    const h = await getTmHealth([`${HOME}/Claude Code`])
     assert.equal(h.healthy, true)
     assert.equal(h.destinationConfigured, true)
     assert.equal(h.hasSnapshots, true)
@@ -294,14 +298,14 @@ test('getTmHealth: all three failures reported', async () => {
   await withExec(async (f, a) => {
     if (a[0] === 'destinationinfo') return { stdout: DEST_EMPTY }
     if (a[0] === 'listlocalsnapshots') return { stdout: LIST_EMPTY }
-    return { stdout: '[Excluded] /Users/zero/Claude Code\n' }
+    return { stdout: `[Excluded] ${HOME}/Claude Code\n` }
   }, async () => {
-    const h = await getTmHealth(['/Users/zero/Claude Code'])
+    const h = await getTmHealth([`${HOME}/Claude Code`])
     assert.equal(h.healthy, false)
     assert.equal(h.destinationConfigured, false)
     assert.equal(h.hasSnapshots, false)
     assert.equal(h.workspaceProtected, false)
-    assert.deepEqual(h.unprotectedPaths, ['/Users/zero/Claude Code'])
+    assert.deepEqual(h.unprotectedPaths, [`${HOME}/Claude Code`])
     assert.equal(h.issues.length, 3)
   })
 })
@@ -311,9 +315,9 @@ test('getTmHealth: destinationinfo failure counts as not configured', async () =
   await withExec(async (f, a) => {
     if (a[0] === 'destinationinfo') throw new Error('TM disabled')
     if (a[0] === 'listlocalsnapshots') return { stdout: LIST_OK }
-    return { stdout: '[Included] /Users/zero/Claude Code\n' }
+    return { stdout: `[Included] ${HOME}/Claude Code\n` }
   }, async () => {
-    const h = await getTmHealth(['/Users/zero/Claude Code'])
+    const h = await getTmHealth([`${HOME}/Claude Code`])
     assert.equal(h.healthy, false)
     assert.match(h.issues[0], /destination is NOT configured/)
   })
@@ -329,13 +333,13 @@ test('getTmHealth: cache hit skips tmutil; forceRefresh re-runs', async () => {
   __setExecOverride(async (f, a) => {
     if (a[0] === 'destinationinfo') return healthFn()
     if (a[0] === 'listlocalsnapshots') return { stdout: LIST_OK }
-    return { stdout: '[Included] /Users/zero/Claude Code\n' }
+    return { stdout: `[Included] ${HOME}/Claude Code\n` }
   })
-  const h1 = await getTmHealth(['/Users/zero/Claude Code'])
-  const h2 = await getTmHealth(['/Users/zero/Claude Code']) // cache
+  const h1 = await getTmHealth([`${HOME}/Claude Code`])
+  const h2 = await getTmHealth([`${HOME}/Claude Code`]) // cache
   assert.equal(h1.checkedAt.getTime(), h2.checkedAt.getTime())
   const c1 = calls
-  await getTmHealth(['/Users/zero/Claude Code'], true) // force refresh
+  await getTmHealth([`${HOME}/Claude Code`], true) // force refresh
   assert.ok(calls > c1, 'forceRefresh must re-run checks')
   __setExecOverride(null)
 })
@@ -346,12 +350,12 @@ test('invalidateHealthCache: forces a fresh check', async () => {
   __setExecOverride(async (f, a) => {
     if (a[0] === 'destinationinfo') return { stdout: n++ === 0 ? DEST_EMPTY : DEST_OK }
     if (a[0] === 'listlocalsnapshots') return { stdout: LIST_OK }
-    return { stdout: '[Included] /Users/zero/Claude Code\n' }
+    return { stdout: `[Included] ${HOME}/Claude Code\n` }
   })
-  const h1 = await getTmHealth(['/Users/zero/Claude Code'])
+  const h1 = await getTmHealth([`${HOME}/Claude Code`])
   assert.equal(h1.healthy, false)
   invalidateHealthCache()
-  const h2 = await getTmHealth(['/Users/zero/Claude Code'])
+  const h2 = await getTmHealth([`${HOME}/Claude Code`])
   assert.equal(h2.healthy, true)
   __setExecOverride(null)
 })
@@ -423,9 +427,9 @@ test('getTmHealth: listSnapshots failure -> snapshotCount 0 + issue', async () =
   await withExec(async (f, a) => {
     if (a[0] === 'destinationinfo') return { stdout: DEST_OK }
     if (a[0] === 'listlocalsnapshots') throw new Error('tmutil crashed')
-    return { stdout: '[Included] /Users/zero/Claude Code\n' }
+    return { stdout: `[Included] ${HOME}/Claude Code\n` }
   }, async () => {
-    const h = await getTmHealth(['/Users/zero/Claude Code'])
+    const h = await getTmHealth([`${HOME}/Claude Code`])
     assert.equal(h.healthy, false)
     assert.equal(h.snapshotCount, 0)
     assert.equal(h.hasSnapshots, false)
@@ -441,9 +445,9 @@ test('getTmHealth: isexcluded throws -> path counted unprotected', async () => {
     if (a[0] === 'isexcluded') throw new Error('tmutil: cannot determine')
     throw new Error(`unexpected ${f}`)
   }, async () => {
-    const h = await getTmHealth(['/Users/zero/Claude Code'])
+    const h = await getTmHealth([`${HOME}/Claude Code`])
     assert.equal(h.healthy, false)
-    assert.deepEqual(h.unprotectedPaths, ['/Users/zero/Claude Code'])
+    assert.deepEqual(h.unprotectedPaths, [`${HOME}/Claude Code`])
     assert.ok(h.issues.some((i) => /NOT protected/.test(i)))
   })
 })
@@ -504,7 +508,7 @@ test('getTmHealth: isexcluded failure pushes unprotected path (catch)', async ()
     if (a[0] === 'isexcluded') throw new Error('tmutil: Full Disk Access required')
     throw new Error(`unexpected ${f}`)
   }, async () => {
-    const h = await getTmHealth(['/Users/zero/Claude Code/自治'])
+    const h = await getTmHealth([`${HOME}/Claude Code/自治`])
     assert.equal(h.workspaceProtected, false) // isexcluded failed → treated as unprotected
   })
 })

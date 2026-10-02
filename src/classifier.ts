@@ -1236,8 +1236,8 @@ const INTERPRETER_CODE_FLAGS: Record<string, string[]> = {
 }
 
 /** Substring hit for an absolute sensitive prefix, with a directory/quote/
- *  paren/space boundary so `/Users/zero/.ssh` does not false-positive on
- *  `/Users/zero/.ssh-evil` appearing as a literal string. */
+ *  paren/space boundary so `/Users/alice/.ssh` does not false-positive on
+ *  `/Users/alice/.ssh-evil` appearing as a literal string. */
 function codeContainsPath(code: string, absPrefix: string): boolean {
   const idx = code.indexOf(absPrefix)
   if (idx === -1) return false
@@ -1247,7 +1247,7 @@ function codeContainsPath(code: string, absPrefix: string): boolean {
 }
 
 /** Scan interpreter code text for sensitive path references in every form a
- *  script would use: absolute (`/Users/zero/.ssh/…`), `~`-prefixed, $HOME. */
+ *  script would use: absolute (`/Users/alice/.ssh/…`), `~`-prefixed, $HOME. */
 function scanCodeForSensitivePaths(
   code: string,
   denyReadPaths: string[],
@@ -1376,7 +1376,7 @@ export function classifyBashCommand(
       }
     }
     // Interpreter -c/-e code strings: scan for sensitive path references the
-    // token extractor cannot see (python3 -c "print(open('/Users/zero/.ssh/id_rsa').read())").
+    // token extractor cannot see (python3 -c "print(open('/Users/alice/.ssh/id_rsa').read())").
     const firstWordCode = s.trim().split(/\s+/)[0]?.toLowerCase().split('/').pop() ?? ''
     const codeFlags = INTERPRETER_CODE_FLAGS[firstWordCode]
     if (codeFlags) {
