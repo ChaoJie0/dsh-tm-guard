@@ -105,5 +105,25 @@ check('空活动可构建', empty.md.length > 0)
 check('空活动无写表', !empty.md.includes('## 放行的写操作'))
 check('空活动 summary 计数为 0', empty.summary[0].includes('tools=0'))
 
+// Label coverage: every blockLabel branch (sensitive-path write, plain write,
+// read, fail-closed, unknown category) must render its Chinese label.
+const labelCase = buildTurnReport({
+  turn: 9,
+  now: '2026-09-06T12:00:00.000Z',
+  cwd: '/tmp/tm-guard-label',
+  records: [
+    { ts: 't', tool: 't1', category: 'file_write', decision: 'deny', reason: 'Sensitive path access blocked (denyReadPaths): /x', targetPaths: ['/x'] },
+    { ts: 't', tool: 't2', category: 'file_write', decision: 'deny', reason: 'not a protected path', targetPaths: ['/y'] },
+    { ts: 't', tool: 't3', category: 'read', decision: 'deny', reason: 'r', targetPaths: [] },
+    { ts: 't', tool: 't4', category: 'fail-closed', decision: 'deny', reason: 'f', targetPaths: [] },
+    { ts: 't', tool: 't5', category: 'weird', decision: 'deny', reason: 'w', targetPaths: [] },
+  ],
+})
+check('label 敏感路径写', labelCase.md.includes('| 敏感路径 |'))
+check('label 普通写', labelCase.md.includes('| 写操作 |'))
+check('label 读', labelCase.md.includes('| 读操作 |'))
+check('label fail-closed', labelCase.md.includes('| fail-closed |'))
+check('label 未知分类原样', labelCase.md.includes('| weird |'))
+
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail > 0 ? 1 : 0)

