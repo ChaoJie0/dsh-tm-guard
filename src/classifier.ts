@@ -296,6 +296,8 @@ function extractWritePaths(command: string): string[] {
   // writes whenever the input list lives outside the protected prefix.
   const WRITE_VALUE_FLAGS = new Set([
     '--output', '--out', '-o', '--target', '--dest', '--destination',
+    '--outfile', '--output-file', '--target-directory', '--dest-dir',
+    '--destination-directory', '--output-directory',
   ])
   for (const t of tokens) {
     if (!t.startsWith('-')) continue
