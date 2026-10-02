@@ -4,7 +4,7 @@
 // cp step is injected so nothing is actually copied (zero side effects).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync } from 'node:fs'
 import { rollbackPath, getTmHealth, __setExecOverride } from './src/tm.ts'
 
 const MANIFEST = '/Volumes/SD/backup_manifest.plist'
@@ -12,7 +12,17 @@ const HOST = '/Volumes/SD'
 const TARGET = '/Users/zero/Claude Code/自治/README.md' // exists in backup AND locally
 
 function haveRealBackup(): boolean {
-  return existsSync(MANIFEST)
+  // The guard must check what the tests actually depend on: the manifest
+  // existing AND the backup tree being readable. Without FDA, /Volumes/SD
+  // stats fine but readdirSync throws EPERM — manifest-exists alone then
+  // turns these tests into failures instead of skips.
+  if (!existsSync(MANIFEST)) return false
+  try {
+    readdirSync(HOST)
+    return true
+  } catch {
+    return false
+  }
 }
 
 test('real TM: browse finds the SD backup and rollback succeeds via tm-backup', async (t) => {

@@ -10,6 +10,7 @@ import { execFile } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
+import { expandHome, normalizeForMatch } from './classifier.ts'
 
 const execFileAsync = promisify(execFile)
 const TMUTIL = '/usr/bin/tmutil'
@@ -159,11 +160,18 @@ export async function isPathProtected(
     ? normalized
     : `${process.cwd()}/${normalized}`
 
+  // Normalize BOTH sides (collapse //, resolve . / .., lowercase) so the write
+  // side applies the same semantics the read side already has: a path like
+  // `<protected>/../secrets.txt` must NOT be treated as inside the prefix —
+  // `..` escapes it, and escaping the writable prefix means the write has no
+  // rollback coverage and bypasses the writable-scope guarantee.
+  const normAbs = normalizeForMatch(absolute)
+
   // Must be under a protected prefix (directory-boundary match, so that
   // prefix "/Users/you/work" does not also cover "/Users/you/work-evil").
   const underPrefix = protectedPrefixes.some((p) => {
-    const pref = p.replace(/\/+$/, '')
-    return absolute === pref || absolute.startsWith(pref + '/')
+    const pref = normalizeForMatch(expandHome(p)).replace(/\/+$/, '')
+    return normAbs === pref || normAbs.startsWith(pref + '/')
   })
   if (!underPrefix) return false
 

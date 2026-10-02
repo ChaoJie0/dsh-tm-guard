@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { execSync } from 'node:child_process'
 import { apply } from './src/index.ts'
 import { __setExecOverride } from './src/tm.ts'
+import { __setGitOverride } from './src/git.ts'
 
 let ORIG_CWD = process.cwd()
 let ROOT = '' // temp root = protected path
@@ -135,15 +136,21 @@ test('gate: write outside protected paths denied', async () => {
 
 test('gate: fail-closed — TM unhealthy + git baseline impossible → write denied', async () => {
   tmUnhealthy()
+  // Simulate an unusable git (no repo, init fails) by overriding the git
+  // exec layer — do NOT rely on a chmod-500 dir: on machines where the
+  // system temp dir sits inside a git repo, repoRoot() finds that parent
+  // repo and the premise silently stops holding.
+  __setGitOverride(async () => { throw new Error('git unavailable (simulated)') })
   try {
-    // Read-only dir: ensureGitBaseline cannot git init → no git net, and TM
-    // is unhealthy → fail-closed denies the write.
     const ro = join(ROOT, 'ro')
     execSync(`mkdir -p ${ro} && chmod 500 ${ro}`)
     const r = await gate({ name: 'Write', arguments: { file_path: join(ro, 'x.txt'), content: 'x' } })
     assert.equal(r.kind, 'deny')
     assert.match(r.reason, /FAIL-CLOSED|no rollback net/)
-  } finally { __setExecOverride(null) }
+  } finally {
+    __setGitOverride(null)
+    __setExecOverride(null)
+  }
 })
 
 test('gate: static script egress — python file calling out → force denied', async () => {

@@ -40,7 +40,7 @@
 
 - **Full Disk Access** granted to the terminal/app that runs `dsh` (needed for browsable-backup restore and some `tmutil` operations), if you want automated rollback from completed backups. Local snapshot creation itself needs no sudo on normal user volumes.
 - **`git` on PATH** for the primary instant rollback net (a local baseline is auto-created per writable directory; all git operations are local/offline).
-- **DSH CLI installed**, matching the peer range in `package.json` — currently `@deepseek-ai/cordis >=4.0.0` and `@deepseek-ai/dsh-tools >=0.1.0-rc.1 <0.1.0 || >=0.1.2-0 <0.2.0-0 || >=0.2.0-0 <0.3.0-0` (covers dsh 0.1.x including `0.1.2-rc.1` and dsh 0.2.x including `0.2.0-rc.2`).
+- **DSH CLI installed**, matching the peer range in `package.json` — currently `@deepseek-ai/cordis >=4.0.0` and `@deepseek-ai/dsh-tools >=0.1.0-rc.1 <0.1.0 || >=0.1.0 <0.1.2-0 || >=0.1.2-0 <0.2.0-0 || >=0.2.0-0 <0.3.0-0` (covers dsh 0.1.x including `0.1.2-rc.1` and dsh 0.2.x including `0.2.0-rc.2`).
 
 ---
 

@@ -287,12 +287,34 @@ function extractWritePaths(command: string): string[] {
     if (glued && glued[1]) paths.push(glued[1])
   }
 
+  // Glued option values: `--output=~/.ssh/x`, `--file=…` — the value after
+  // `=` is a write target even for otherwise-read commands (sort --output=,
+  // tar --files-from=, diff --from-file=). Extract path-like values so the
+  // write-protection check sees them.
+  for (const t of tokens) {
+    if (!t.startsWith('-')) continue
+    const eq = t.indexOf('=')
+    if (eq > 1) {
+      const val = t.slice(eq + 1)
+      if (val && (val.startsWith('/') || val.startsWith('~') || val.includes('/'))) {
+        paths.push(val)
+      }
+    }
+  }
+
   if (['rm', 'mv', 'cp', 'touch', 'mkdir', 'rmdir', 'chmod', 'chown',
        'truncate', 'dd', 'install', 'ln', 'unlink', 'trash'].includes(cmd)) {
     for (let i = 1; i < tokens.length; i++) {
       const tok = tokens[i]
+      // dd key=value operands: `of=` is the write target (and `if=` is the
+      // read input, handled in extractReadPaths). These are NOT env
+      // assignments — without this, `dd of=/tmp/x` was never extracted at all
+      // (the generic skip treats `of=…` as FOO=bar).
+      if (cmd === 'dd') {
+        if (tok.startsWith('of=')) { paths.push(tok.slice(3)); continue }
+        if (tok.startsWith('if=')) continue // read side, handled there
+      }
       if (tok.startsWith('-')) {
-        if (tok.startsWith('of=')) paths.push(tok.slice(3)) // dd of=path
         continue
       }
       // Skip leading env assignments (FOO=bar); the rest are paths.
@@ -336,7 +358,7 @@ function extractWritePaths(command: string): string[] {
 /* Sensitive-path read restriction (denyReadPaths)                     */
 /* ------------------------------------------------------------------ */
 
-function expandHome(p: string): string {
+export function expandHome(p: string): string {
   let out = p
   if (out === '~') out = process.env.HOME ?? out
   else if (out.startsWith('~/')) out = `${process.env.HOME ?? ''}${out.slice(1)}`
@@ -442,7 +464,26 @@ function extractReadPaths(command: string): string[] {
   for (let i = 1; i < tokens.length; i++) {
     const tok = tokens[i]
     if (!tok) continue
-    if (tok.startsWith('-')) continue
+    // dd input file: `dd if=~/.ssh/id_rsa of=x` READS the key even though dd
+    // is classified as a write command. `if=` is not an env assignment (which
+    // the next check would otherwise skip): extract it as a read path.
+    if (cmd === 'dd' && tok.startsWith('if=')) {
+      paths.push(tok.slice(3))
+      continue
+    }
+    if (tok.startsWith('-')) {
+      // Glued long/short option: `--file=~/.ssh/id_rsa` / `-f=/x`. The value
+      // after `=` may carry a path (grep -f, sort --output=, tar --files-from,
+      // diff --from-file, …). Extract it when it looks path-like.
+      const eq = tok.indexOf('=')
+      if (eq > 1) {
+        const val = tok.slice(eq + 1)
+        if (val && (val.startsWith('/') || val.startsWith('~') || val.includes('/'))) {
+          paths.push(val)
+        }
+      }
+      continue
+    }
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) continue
     // Glued input redirect: cat <~/.ssh/config
     const lt = tok.match(/^(?:\d?<)(.+)$/)
@@ -469,8 +510,11 @@ function extractReadPaths(command: string): string[] {
  * - resolve `.` and `..` segments (shell resolves them before opening)
  * - lowercase (macOS default APFS is case-insensitive; `.SSH` == `.ssh`)
  * Keeps a leading `/`. Non-sensitive callers should not use this.
+ *
+ * Exported so the write-side protection (tm.isPathProtected) applies the same
+ * normalization as the read side (denyHitFor).
  */
-function normalizeForMatch(p: string): string {
+export function normalizeForMatch(p: string): string {
   const collapsed = p.replace(/\/{2,}/g, '/')
   const out: string[] = []
   for (const part of collapsed.split('/')) {
@@ -1432,13 +1476,20 @@ export function classifyToolCall(
     return classifyBashCommand(cmd, denyReadPaths)
   }
 
-  const pathArg =
-    (args.path as string) ??
-    (args.file_path as string) ??
-    (args.file as string) ??
-    (args.target as string) ??
-    (args.destination as string) ??
-    ''
+  // Collect every plausible path/pattern value across the common host
+  // conventions: single-string keys AND arrays AND pattern/glob fields.
+  // A whitelist of one key name misses `filePath`, `paths[]`, `files[]`,
+  // `pattern`, `glob` — each is a working read/write channel on some host.
+  const pathArgs: string[] = []
+  for (const key of ['path', 'file_path', 'file', 'filePath', 'target',
+                     'destination', 'src', 'source', 'pattern', 'glob',
+                     'paths', 'files', 'inputs']) {
+    const v = args[key]
+    if (typeof v === 'string' && v) pathArgs.push(v)
+    else if (Array.isArray(v)) {
+      for (const item of v) if (typeof item === 'string' && item) pathArgs.push(item)
+    }
+  }
 
   // --- Semantically independent tool classes checked BEFORE the generic
   // write/read name table: a tool like `tm_snapshot_create`, `subagent_create`
@@ -1493,7 +1544,7 @@ export function classifyToolCall(
       name.includes('copy') || name.includes('chmod') ||
       name.includes('chown') || name.includes('touch') ||
       name.includes('append') || name.includes('overwrite')) {
-    const hit = denyHitFor(pathArg ? [pathArg] : [], denyReadPaths)
+    const hit = denyHitFor(pathArgs, denyReadPaths)
     if (hit) {
       return {
         category: 'file_write',
@@ -1505,7 +1556,7 @@ export function classifyToolCall(
     return {
       category: 'file_write',
       reason: `Filesystem write tool: ${toolName}`,
-      targetPaths: pathArg ? [pathArg] : [],
+      targetPaths: pathArgs,
     }
   }
 
@@ -1516,7 +1567,7 @@ export function classifyToolCall(
       name.includes('search') || name.includes('glob') ||
       name.includes('head') || name.includes('tail') ||
       name.includes('diff')) {
-    const hit = denyHitFor(pathArg ? [pathArg] : [], denyReadPaths)
+    const hit = denyHitFor(pathArgs, denyReadPaths)
     if (hit) {
       return {
         category: 'read',
@@ -1528,7 +1579,7 @@ export function classifyToolCall(
     return {
       category: 'read',
       reason: `Filesystem read tool: ${toolName}`,
-      targetPaths: pathArg ? [pathArg] : [],
+      targetPaths: pathArgs,
     }
   }
 

@@ -99,3 +99,14 @@ test('README example commands behave as documented (curl blocked, git allowed)',
     assert.equal(git.kind, 'allow', 'README says local git is allowed')
   } finally { __setExecOverride(null) }
 })
+
+test('README peer range matches package.json verbatim', () => {
+  const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+  const range = pkg.peerDependencies['@deepseek-ai/dsh-tools']
+  // README line 43 embeds the dsh-tools range inside backticks
+  const m = README.match(/dsh-tools ([^`]+)`/u)
+  assert.ok(m, 'README dsh-tools range not found')
+  assert.equal(m[1].trim(), range, 'README peer range drifted from package.json')
+  // engines.dsh must stay in sync too
+  assert.equal(pkg.engines?.dsh, range)
+})
