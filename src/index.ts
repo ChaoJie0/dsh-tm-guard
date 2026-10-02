@@ -153,7 +153,7 @@ export interface TmGuardConfig {
   autoApprove: boolean
 }
 
-const DEFAULT_CONFIG: TmGuardConfig = {
+export const DEFAULT_CONFIG: TmGuardConfig = {
   protectedPaths: [process.cwd()],
   snapshotCooldownSeconds: 30,
   denyNetwork: true,
