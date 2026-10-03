@@ -80,7 +80,7 @@ git clone <repo> dsh-tm-guard
 cd dsh-tm-guard
 npm install        # no runtime deps; runs prepare → builds lib/
 dsh plugin --profile tm-lab add .
-# or a packed tarball: npm pack → dsh plugin --profile tm-lab add ./dsh-tm-guard-0.1.0.tgz
+# or a packed tarball: npm pack → dsh plugin --profile tm-lab add ./dsh-tm-guard-<version>.tgz
 ```
 
 ### Direct source overlay (development only)
