@@ -250,8 +250,8 @@ test('U-03: state.json round-trips and survives a plugin restart', async () => {
 test('U-03: corrupt state.json degrades to defaults instead of throwing', async () => {
   tmHealthy()
   try {
-    writeFileSync(statePath(), '{ this is not json', 'utf8')
     writeAudit([rec({ tool: 'bash', decision: 'deny', reason: 'BLOCKED (network)' })])
+    writeFileSync(statePath(), '{ this is not json', 'utf8')
     apply(mockCtx() as any, { protectedPaths: [ROOT] })
     await runTurn(1) // must not throw
     assert.ok(turnFiles().length >= 1, 'a report is still written')
