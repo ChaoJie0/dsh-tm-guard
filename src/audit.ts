@@ -61,6 +61,24 @@ export const DEFAULT_ROTATION: RotationConfig = {
 /** Stall clock: lets recover the stale-lock timeout on waiters. */
 const START_TIME = Date.now()
 
+/**
+ * Re-entrancy discriminator for the rotation lock.
+ *
+ * The lock payload carries `pid`, and a lock written by *this* pid is
+ * ambiguous: it is either (a) a genuine re-entrant attempt from this very
+ * process, or (b) another holder — or a test/foreign writer — that happens to
+ * record our pid. Treating `pid === process.pid` as unconditionally stale (the
+ * previous rule) resolves the ambiguity the wrong way: it makes every
+ * self-pid lock reclaimable, so `acquireLock()` can never report contention
+ * and the cross-process guarantee silently degrades to "always win".
+ *
+ * This flag removes the ambiguity at the source. It is set only while *we*
+ * hold the lock, so `pid === process.pid && ROTATION_IN_FLIGHT` is a real
+ * re-entrant call, whereas `pid === process.pid && !ROTATION_IN_FLIGHT` is an
+ * unrelated holder using our pid and must block like any other.
+ */
+let ROTATION_IN_FLIGHT = false
+
 /** Liveness probe for a lock holder, without signalling it (EPERM ⇒ alive). */
 function isProcessAlive(pid: number): boolean {
   try {
