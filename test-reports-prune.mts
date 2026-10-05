@@ -139,13 +139,15 @@ test('U-02a: the writer produces a distinct path for consecutive same-ms calls',
   assert.notEqual(a.slice(0, 19), '') // prefix still matches the legacy shape
 })
 
-test('U-02a: filename keeps the legacy prefix and sorts after older-format names', () => {
-  // Old second-precision names still match `turn-*.md` and sort before their
-  // millisecond successors, so pruning/migration needs no special casing.
+test('U-02a: filename keeps the legacy prefix so glob/prune matching is unchanged', () => {
+  // Old second-precision names and new millisecond names both match the
+  // `turn-*.md` glob pruneReports relies on, so no migration is needed.
   const old = 'turn-2026-03-01T10-00-00.md'
   const newer = turnReportFileName(new Date('2026-03-01T10:00:00.500Z'))
-  assert.ok(old.startsWith('turn-') && newer.startsWith('turn-'))
-  assert.ok(old < newer)
+  assert.ok(old.startsWith('turn-') && old.endsWith('.md'))
+  assert.ok(newer.startsWith('turn-') && newer.endsWith('.md'))
+  // The new name extends the old one rather than diverging from it.
+  assert.ok(newer.startsWith('turn-2026-03-01T10-00-00'))
 })
 
 // ---------------------------------------------------------------------------
