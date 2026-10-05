@@ -315,9 +315,11 @@ test('U-08: formatBytes is deterministic and unit-correct', () => {
 /* ------------------------------------------------------------------ */
 
 test('U-08: Recent shows ts + tool + category + decision, newest first', () => {
+  // `recentDecisions` is supplied newest-first (index.ts reverses the audit
+  // tail before handing it over); the renderer preserves that order.
   const records = [
-    { ts: '2026-10-06T05:00:01.000Z', tool: 'Write', category: 'file_write', decision: 'allow' as const, reason: '', targetPaths: [] },
     { ts: '2026-10-06T05:00:02.000Z', tool: 'bash', category: 'network', decision: 'deny' as const, reason: '', targetPaths: [] },
+    { ts: '2026-10-06T05:00:01.000Z', tool: 'Write', category: 'file_write', decision: 'allow' as const, reason: '', targetPaths: [] },
   ]
   const out = renderStatusReport(healthyInput({ recentDecisions: records }))
   const recent = out.slice(out.indexOf('【Recent】'))
