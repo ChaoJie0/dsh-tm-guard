@@ -204,20 +204,23 @@ test('U-03: successive turns partition records — no overlap, no gap', async ()
 
     // Denied records render their `reason` verbatim in the report, which makes
     // them a precise marker for "was this record included in this turn?".
-    writeAudit([
+    // The turn-1 records are built ONCE and reused verbatim: identity is
+    // (ts, tool), so regenerating timestamps would move the watermark's target
+    // and (correctly) trigger the "watermark lost" fallback.
+    const t1 = [
       rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-a' }),
       rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-b' }),
       rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-c' }),
-    ])
+    ]
+    writeAudit(t1)
     const r1 = await runTurn(1)
     assert.match(r1, /turn1-a/)
     assert.match(r1, /turn1-c/)
 
-    // Turn 2: two more, appended. Must contain ONLY the new two.
+    // Turn 2: two more appended to the SAME turn-1 records. Must contain ONLY
+    // the new two — not a single re-reported turn-1 line.
     writeAudit([
-      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-a' }),
-      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-b' }),
-      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-c' }),
+      ...t1,
       rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn2-a' }),
       rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn2-b' }),
     ])
@@ -227,6 +230,11 @@ test('U-03: successive turns partition records — no overlap, no gap', async ()
     assert.match(r2, /turn2-b/)
     assert.doesNotMatch(r2, /turn1-a/, 'turn 2 must NOT re-report turn 1 records')
     assert.doesNotMatch(r2, /turn1-c/)
+
+    // And a third turn with nothing new must add no report at all.
+    const before = turnFiles().length
+    await runTurn(3)
+    assert.equal(turnFiles().length, before, 'a no-op turn must not write a report')
   } finally { __setExecOverride(null) }
 })
 
