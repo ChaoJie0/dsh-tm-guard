@@ -198,15 +198,23 @@ export function renderBaselineReport(input: BaselineReportInput): string {
       `  TM 不适用：当前平台 \`${cell(platform)}\` 没有 \`/usr/bin/tmutil\`，` +
       '无法配置 Time Machine 备份目的地。这一项是**能力限制**，不是故障。',
     )
-  } else {
+  } else if (!input.tm.probed) {
     out.push('')
-    out.push(`  TM 已配置（tmutil destinationinfo）：${yesNo(input.status.destinationConfigured, 'YES ✅', 'NO ⚠️')}`)
-    out.push(`  Workspace 受 TM 保护          ：${yesNo(input.health.workspaceProtected)}`)
-    out.push(`  TM 整体健康（fail-closed 依据）：${yesNo(input.health.healthy, 'HEALTHY ✅', 'UNHEALTHY 🚫 — 写入会被拦截')}`)
-    if (input.health.unprotectedPaths.length > 0) {
-      out.push(`  未受保护的路径                ：${cell(input.health.unprotectedPaths.join(', '))}`)
+    out.push(
+      '  TM 探测未完成：加载时 tmutil 未在超时内响应。' +
+      '这一项**未知**，不能读作「已配置」——用 `tm_status` 重新确认。',
+    )
+    out.push('  → 下一步：手动运行 `tmutil destinationinfo` 与 `tmutil listlocalsnapshots /`。')
+  } else {
+    const { tm } = input
+    out.push('')
+    out.push(`  TM 已配置（tmutil destinationinfo）：${yesNo(tm.destinationConfigured, 'YES ✅', 'NO ⚠️')}`)
+    out.push(`  Workspace 受 TM 保护          ：${yesNo(tm.workspaceProtected)}`)
+    out.push(`  TM 整体健康（fail-closed 依据）：${yesNo(tm.healthy, 'HEALTHY ✅', 'UNHEALTHY 🚫 — 写入会被拦截')}`)
+    if (tm.unprotectedPaths.length > 0) {
+      out.push(`  未受保护的路径                ：${cell(tm.unprotectedPaths.join(', '))}`)
     }
-    if (!input.status.destinationConfigured) {
+    if (!tm.destinationConfigured) {
       out.push('')
       out.push('  → 下一步：系统设置 → 通用 → 时间机器，选择备份磁盘，然后重开一个会话。')
     }
@@ -221,12 +229,16 @@ export function renderBaselineReport(input: BaselineReportInput): string {
   }
   out.push(
     `  TM 层面已保护               ：${
-      platformSupported ? yesNo(input.health.workspaceProtected) : 'N/A（无 TM，见第 5 节）'
+      !platformSupported
+        ? 'N/A（无 TM，见第 5 节）'
+        : input.tm.probed
+          ? yesNo(input.tm.workspaceProtected)
+          : '未知（TM 探测未完成）'
     }`,
   )
-  if (platformSupported && input.health.unprotectedPaths.length > 0) {
+  if (platformSupported && input.tm.probed && input.tm.unprotectedPaths.length > 0) {
     out.push(
-      `  ⚠️  TM 排除列表命中的路径：${cell(input.health.unprotectedPaths.join(', '))}——` +
+      `  ⚠️  TM 排除列表命中的路径：${cell(input.tm.unprotectedPaths.join(', '))}——` +
       '这些路径上的写入没有被 Time Machine 覆盖，只剩 git baseline。',
     )
   }
