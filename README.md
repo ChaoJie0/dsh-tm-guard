@@ -104,9 +104,13 @@ dsh --profile tm-lab --dump-config | grep -A2 'dsh-tm-guard'
 
 # 2. Boot the profile — the console should print:
 #   [tm-guard] Loaded. Protected paths: ... Audit log: ... Deny-read paths: ...
+#   [tm-guard] 首次运行基线报告已生成: .tm-guard/baseline-report.md — 请查看你的实际保护等级
 dsh --profile tm-lab
 
-# 3. In a session, the registered tools are available — ask the agent to run
+# 3. Read the first-run baseline report — what THIS machine actually protects:
+cat .tm-guard/baseline-report.md
+
+# 4. In a session, the registered tools are available — ask the agent to run
 #    tm_status, or call tm_audit to inspect the gate log.
 ```
 
@@ -160,6 +164,29 @@ Anything unrecognized is denied by default (conservative). For locally executed 
 | `tm_backup` | Start a backup to the configured TM disk; background by default, `wait=true` blocks for a browsable restore point. |
 | `tm_backup_status` | Show whether a backup is running, percent complete, and current phase. |
 | `tm_git_bloat` | **Read-only** diagnosis of what makes a `.git` large: ranks the biggest reachable blobs with path, size, and the commit that introduced each. Never rewrites history — cleanup is a manual decision (see [Diagnosing .git bloat](#diagnosing-git-bloat)). |
+
+### First-run baseline report
+
+On the **first** `apply()` in a workspace — detected by `.tm-guard/baseline-report.md` not existing — the plugin writes `.tm-guard/baseline-report.md` and prints one line pointing at it. The report answers the question a fresh install otherwise cannot: **what protection level am I actually in right now?**
+
+It contains six sections, each a read-only probe of *this* machine:
+
+| # | Section | What it reports |
+|---|---|---|
+| 1 | Time Machine 配置 | `tmutil destinationinfo` result, workspace TM-protection, overall TM health |
+| 2 | Workspace 保护状态 | the effective writable scope, and which paths TM's exclusion list misses |
+| 3 | Git baseline 可建性 | whether `git` is on PATH and the directory is already a work tree |
+| 4 | denyReadPaths 实际生效项 | the effective count and the full list, with the merge semantics in force |
+| 5 | 平台支持状态 | `full mode` on macOS, `limited mode` elsewhere |
+| 6 | 已知残余风险 | the residual risks from [Limitations](#limitations--honest-scope), restated on your machine |
+
+Three properties are worth stating explicitly:
+
+- **Read-only.** The git probe runs `git rev-parse` and stops. It does **not** call `git init`, does **not** commit, does **not** create a snapshot, and does **not** touch your config. The report says so itself, and section 3 states that the baseline is created lazily at your first write. (This is why the report can be generated at load time without mutating the workspace.)
+- **Generated once, kept.** Later `apply()`s do a single `existsSync` and leave the file alone — the report is a first-run *snapshot*, not a live view. If your Time Machine setup changes afterwards, the file keeps showing what was true at first run; use `tm_status` for the live answer. To regenerate, delete the file and restart the session.
+- **Never fatal.** If the report cannot be written, `apply()` logs a warning and the gate loads normally. A display artifact must never stop the safety mechanism it describes.
+
+`tm_status` echoes the path in its 【Data sources】 section, so the report is discoverable from the tool a user reaches for when something looks wrong.
 
 ### Diagnosing .git bloat
 
@@ -289,6 +316,7 @@ On **any other platform** there is no `tmutil`, so the plugin runs in **limited 
 - The gate **does not block writes** for absence of a TM net (there is none to check); the TM-health fail-closed check and every `tm_*` snapshot/rollback path are inert. The git baseline is still created and committed before writes exactly as on macOS.
 - A `console.warn` restates the degradation **once per apply()** the first time a write is approved, so a long unattended run cannot forget it. It is deliberately not repeated per call — a warning that fires constantly is one users learn to ignore.
 - `tm_status` reports `platform: <platform> — limited mode (no TM)` and marks TM health `N/A — no TM on this platform (git baseline is the rollback net)` instead of the misleading `UNHEALTHY — writes BLOCKED`.
+- The **first-run baseline report** labels section 5 `limited mode（无 TM）`, names the git baseline as the only rollback net, and renders section 1 as "TM 不适用 … 能力限制，不是故障" — it never claims a Time Machine destination or health it cannot have. This is pinned by test: a non-macOS report must not contain `TM 已配置` or `HEALTHY ✅`.
 
 The point of stating this loudly is that **silent degradation is the dangerous outcome in a safety tool**. Before this probe, a non-macOS user saw a handful of failing `tm_*` tools while the gate still spoke fail-closed language about Time Machine protection — easy to read as "a rollback net exists" when none did. If you need real rollback guarantees, run on macOS with Time Machine configured, or use a disposable VM/profile.
 
@@ -331,6 +359,8 @@ src/
   audit.ts         # JSONL audit log
   report.ts        # per-turn markdown report
   verify.ts        # independent per-turn acceptance check
+  status.ts        # tm_status layered rendering (pure)
+  baseline-report.ts # first-run safety baseline self-check (U-27, read-only)
 cordis.patch.yml       # bundle layer (references the package by name)
 cordis.patch.local.yml # maintainer-only absolute-source overlay (not published)
 scripts/build/build.mjs

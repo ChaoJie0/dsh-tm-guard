@@ -57,7 +57,7 @@ const FORBIDDEN_HINT = [
 ]
 
 const expectedTop = ['lib', 'cordis.patch.yml', 'README.md', 'CHANGELOG.md', 'LICENSE', 'package.json']
-const expectedLibCount = 9 // 8 js + index.d.ts (must match lib/ output)
+const expectedLibCount = 14 // 13 js + index.d.ts (must match lib/ output)
 
 for (const f of files) {
   const path = f.path

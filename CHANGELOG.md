@@ -5,6 +5,30 @@ All notable changes to dsh-tm-guard will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **First-run safety baseline report (U-27)**. The first `apply()` in a
+  workspace writes `.tm-guard/baseline-report.md` and prints a one-line pointer
+  to it. The report probes *this* machine — TM destination and health, the
+  effective writable scope, whether `git` is on PATH and the directory is a work
+  tree, the effective `denyReadPaths` count and merge semantics, the platform
+  mode — and closes with the residual risks from README § Limitations, so the
+  honest boundaries are facts on the user's machine rather than a README section
+  they may never scroll to. Previously `tm_status` was the only source of these
+  facts, it had to be asked, and it left nothing behind.
+  - **First run is detected by the absence of the file**, not by a flag in
+    `state.json`: self-describing, survives a wiped state file, and lets a user
+    regenerate by deleting the report. Later `apply()`s cost one `existsSync`.
+  - **Strictly read-only, and it says so.** The git probe is `git rev-parse`
+    and stops — it does **not** call `ensureGitBaseline` (which runs `git init`
+    + a baseline commit) during plugin load. The report states that the baseline
+    is created lazily at the first write. No snapshot, no config change.
+  - **Published synchronously.** The report exists when `apply()` returns; the
+    (async) tmutil section is filled in afterwards and renders as an explicit
+    "unknown — check `tm_status`" until it lands, never as a false "configured".
+  - **Never fatal**: an unwritable report degrades to a `console.warn` and the
+    gate still loads (same rule as report pruning).
+  - `tm_status` 【Data sources】 now echoes the report path so it is discoverable
+    from the diagnostic tool. New `src/baseline-report.ts`; new
+    `probeGitSync` in `src/git.ts` (sync, read-only, test-seamed).
 - **`tm_git_bloat` — read-only `.git` bloat diagnosis (U-26)**. Ranks the
   largest reachable blobs (`git rev-list --objects --all` piped into
   `git cat-file --batch-check`), and for each reports the path, the size, and
