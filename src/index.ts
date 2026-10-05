@@ -44,6 +44,10 @@ import {
   type GateDecision,
 } from './classifier.ts'
 import { scanCommandForEgress } from './scan-scripts.ts'
+import {
+  DEFAULT_SENSITIVE_PATHS,
+  mergeDenyReadPaths,
+} from './sensitive-paths.ts'
 import { AuditLog, AUDIT_DEFAULTS } from './audit.ts'
 import {
   readState,
