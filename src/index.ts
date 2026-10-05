@@ -761,9 +761,14 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
 
         const reportDir = join(audit.dirPath, 'reports')
         mkdirSync(reportDir, { recursive: true })
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-        const file = join(reportDir, `turn-${stamp}.md`)
+        const file = join(reportDir, turnReportFileName())
         writeFileSync(file, `${report.md}\n${verification.markdown}`, 'utf8')
+
+        // Advance the durable watermark now that the report is on disk. Doing
+        // this only after a successful write means a crash mid-report loses
+        // nothing: the same records are reported again next turn.
+        state = { ...state, reportWatermark: watermarkOf(all) }
+        writeState(audit.dirPath, state)
 
         console.log(`[tm-guard] Turn ${payload.turn ?? 0} report: ${file}`)
         for (const s of report.summary) {
