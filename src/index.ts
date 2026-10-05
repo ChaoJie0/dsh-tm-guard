@@ -1328,57 +1328,25 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         const writeCount = all.filter(
           (r) => r.decision === 'allow' && r.targetPaths.length > 0,
         ).length
+        // Recent decisions come from the parsed array, not `audit.recent()`,
+        // which would re-read every generation a third time.
+        const recentDecisions = all
+          .filter((r) => r.decision === 'allow' || r.decision === 'deny')
+          .slice(-RECENT_STATUS_ITEMS)
+          .reverse()
 
-        const lines = [
-          '=== TM-Guard Status ===',
-          '',
-          // Platform first (U-19c): it reframes everything below it. On a
-          // non-macOS host the TM lines are not "unhealthy" — TM simply does
-          // not exist, and the plugin is in limited mode. Reporting that as a
-          // fixable TM fault would send the user chasing a tmutil that is not
-          // installable, so the mode is stated explicitly and up front.
-          platformSupported
-            ? `Platform                 : ${process.platform} — full mode (Time Machine available)`
-            : `Platform                 : ${process.platform} — limited mode (no TM)`,
-        ]
-        if (!platformSupported) {
-          lines.push(
-            '  ⚠️  Time Machine is unavailable on this platform: the plugin runs with the',
-            '     git-baseline rollback net only. TM-related tools and fail-closed TM',
-            '     checks are inert; write protection comes from local git checkpoints.',
-          )
-        }
-        lines.push(
-          `TM Health (fail-closed)  : ${
-            platformSupported
-              ? (health.healthy ? 'HEALTHY ✅' : 'UNHEALTHY 🚫 — writes BLOCKED')
-              : 'N/A — no TM on this platform (git baseline is the rollback net)'
-          }`,
-        )
-        if (!health.healthy && platformSupported) {
-          for (const issue of health.issues) {
-            lines.push(`  ⚠️  ${issue}`)
-          }
-        }
-        lines.push(
-          '',
-          `Time Machine destination : ${status.destinationConfigured ? 'configured' : 'NOT configured ⚠️'}`,
-          `Local snapshots          : ${status.snapshotCount} available`,
-          `Latest snapshot          : ${latest ? latest.date + ' (' + latest.createdAt.toLocaleString() + ')' : 'none ⚠️'}`,
-          `Workspace                : ${process.cwd()}`,
-          `Workspace protected      : ${health.workspaceProtected ? 'YES ✅' : 'NO ⚠️'}`,
-          `Protected path prefixes  : ${config.protectedPaths.join(', ')}`,
-          `Sensitive read paths     : ${config.denyReadPaths.join(', ') || '(none)'}`,
-          '',
-          `Snapshot cooldown        : ${config.snapshotCooldownSeconds}s`,
-          `Network ops              : ${config.denyNetwork ? 'BLOCKED' : 'allowed'}`,
-          `System/process ops       : ${config.denySystem ? 'BLOCKED' : 'allowed'}`,
-          `Fail-closed              : ${config.failClosed ? 'YES (block writes if TM unhealthy)' : 'no'}`,
-          `Require task snapshot    : ${config.requireTaskSnapshot ? 'YES' : 'no'}`,
-          `Audit log                : ${auditCount} records (${writeCount} write ops) at ${audit.path}`,
-          `Health checked at        : ${health.checkedAt.toLocaleString()}`,
-        )
-        return lines.join('\n')
+        return renderStatusReport({
+          platformSupported,
+          platform: process.platform,
+          health,
+          status,
+          latest,
+          config,
+          audit,
+          auditCount,
+          writeCount,
+          recentDecisions,
+        })
       },
     }),
   )
