@@ -131,6 +131,21 @@ export interface TmGuardConfig {
    */
   turnReports: boolean
   /**
+   * How many turn reports to keep under `.tm-guard/reports` (default 200).
+   * Reports are pure derived display artifacts — the audit log remains the
+   * source of truth for `tm_rollback` — so pruning them is always safe. This
+   * threshold is ANDed with `reportsRetainDays`: a report is deleted only when
+   * it is both beyond this count and older than that age.
+   */
+  reportsRetainCount: number
+  /**
+   * Minimum age in days before a turn report becomes eligible for deletion
+   * (default 30). Intersected with `reportsRetainCount` so lightly-used
+   * workspaces are not wiped purely for being old. `0` disables the age gate
+   * (count alone decides).
+   */
+  reportsRetainDays: number
+  /**
    * When true, run a BLOCKING full Time Machine backup to the backup disk
    * (tm_backup, wait) before EVERY file write. This gives each write a
    * restore point that tm_rollback can read back WITHOUT root/sudo — at the
