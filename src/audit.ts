@@ -122,8 +122,8 @@ export class AuditLog {
   }
 
   /**
-   * Append a record to the audit log, rotating first if the current file has
-   * grown past `auditMaxBytes`.
+   * Append a record to the audit log, then rotate if the file has reached
+   * `auditMaxBytes` (design §4.3: `statSync(audit.jsonl).size >= auditMaxBytes`).
    *
    * SINGLE-INSTANCE CONSTRAINT (design §4.2.2): rotation operates on
    * `this.logPath`, the path captured at construction. Rotation and `record()`
@@ -131,12 +131,13 @@ export class AuditLog {
    * instance with a different resolved directory would rotate one file while
    * appends land in another.
    *
-   * ORDER: rotate BEFORE the append, not after. Rotating after the append would
-   * push the just-written record into `.1`, so `readAll()` would still see it —
-   * but the size check would then re-trigger on every subsequent write once the
-   * file sits just above the threshold, turning a rare maintenance step into a
-   * per-write IO burst. Rotating first keeps the trigger low-frequency (design
-   * §1.3 "check size, rotate only when exceeded").
+   * ORDER: the size check runs AFTER the append. The check is a single
+   * `statSync` on the hot path (cheap); only a size at/over the threshold —
+   * which can happen at most once per `auditMaxBytes` of traffic — pays for the
+   * rotation itself, so the IO-heavy work stays off the common path (§1.3).
+   * Rotating after the append also means the record that crossed the threshold
+   * is preserved in the freshly rotated `.1`, so no record is ever written to a
+   * file that then has its content moved out from under it.
    */
   record(entry: Omit<AuditRecord, 'ts'>): void {
     const record: AuditRecord = {
@@ -144,8 +145,8 @@ export class AuditLog {
       ...entry,
     }
     try {
-      this.maybeRotate()
       appendFileSync(this.logPath, JSON.stringify(record) + '\n', 'utf8')
+      this.maybeRotate()
     } catch (err) {
       console.warn('[tm-guard] Failed to write audit log:', err)
     }
