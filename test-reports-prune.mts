@@ -173,9 +173,10 @@ test('U-02b: count and age are ANDed — stale files inside the newest N are kep
   for (let i = 0; i < 250; i++) {
     const p = join(reportsDir(), `turn-x-${String(i).padStart(3, '0')}.md`)
     writeFileSync(p, 'x\n', 'utf8')
-    // i < 100 → oldest 100 → stale; else fresh.
+    // Rank order follows mtime ascending, so i is also the rank from the
+    // bottom. Offset by seconds only, so the stale/fresh split (90d vs 1d)
+    // stays far from the 30-day cutoff no matter how many files there are.
     const ageDays = i < 100 ? 90 : 1
-    // Rank order follows mtime ascending, so i is also the rank from the bottom.
     const t = (now - ageDays * DAY_MS + i * 1000) / 1000
     utimesSync(p, t, t)
   }
