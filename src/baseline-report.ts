@@ -28,11 +28,10 @@
  * lazily at the first write. See `docs/` for the U-27 design note.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { getTmStatus, getTmHealth } from './tm.ts'
-import { repoRoot } from './git.ts'
 
 /** File name of the first-run report, relative to `.tm-guard/`. */
 export const BASELINE_REPORT_FILE = 'baseline-report.md'
@@ -332,22 +331,48 @@ export function renderBaselineReport(input: BaselineReportInput): string {
 }
 
 /**
- * Generate the report if it does not exist yet.
+ * The placeholder written when the report has to go to disk before the
+ * asynchronous tmutil probe has answered.
  *
- * Returns `{ written, reportPath, markdown }` — `written: false` with the
- * existing path is the normal steady-state result of every apply() after the
- * first, and is the entire cost of this feature on the hot path
+ * Why a placeholder rather than waiting: the report must exist the moment
+ * apply() returns. Consumers read it (and tests assert it) as soon as the
+ * plugin is loaded, and a "first-run report" that appears a second later is
+ * indistinguishable from one that never appears. The git probe is synchronous,
+ * so there is no reason to publish a half-blank file — only the TM section has
+ * to be filled in later. `probed: false` renders as an explicit "unknown, do
+ * not read as configured" rather than as an unconfigured destination.
+ */
+export const UNPROBED_TM: TmBaselineFacts = {
+  probed: false,
+  destinationConfigured: false,
+  healthy: false,
+  workspaceProtected: false,
+  unprotectedPaths: [],
+}
+
+export interface BaselineWriteResult {
+  written: boolean
+  reportPath: string
+  markdown: string
+  error?: string
+}
+
+/**
+ * Write the report if it does not exist yet — synchronously.
+ *
+ * Returns `{ written: false }` with the existing path in the steady state,
+ * which is the entire cost of this feature on every apply() after the first
  * (one `existsSync`).
  *
  * Never throws: this runs at plugin load, and a report that cannot be written
- * must not stop the gate from loading (design R6 — same rule the report
- * pruning follows). Failures are reported in the return value so `apply()` can
+ * must not stop the gate from loading (design R6 — the same rule report
+ * pruning follows). Failures come back in the return value so `apply()` can
  * degrade to a warning.
  */
 export function ensureBaselineReport(
   dir: string,
   input: Omit<BaselineReportInput, 'reportPath'>,
-): { written: boolean; reportPath: string; markdown: string; error?: string } {
+): BaselineWriteResult {
   const reportPath = join(dir, BASELINE_REPORT_FILE)
   if (existsSync(reportPath)) {
     return { written: false, reportPath, markdown: '' }
@@ -368,63 +393,83 @@ export function ensureBaselineReport(
 }
 
 /**
- * Gather every fact the report needs, in one read-only pass.
+ * Fill in the TM section once the asynchronous probe answers.
  *
- * Split from `apply()` so it is directly testable and so the (async, tmutil-
- * touching) probing is not tangled with config normalization. `probeGitBaseline`
- * is synchronous by design: it is one `git rev-parse` with a 10s timeout, and
- * making it async would force the whole first-run path into a promise chain
- * for no behavioural gain.
+ * A single read-check-write, deliberately WITHOUT the "does it exist" first-run
+ * gate: by the time this runs, `ensureBaselineReport` has already decided that
+ * this workspace's first run is happening. If the file is gone by now (the user
+ * deleted it mid-load) the rewrite is exactly what the next apply() would have
+ * done anyway, so this cannot resurrect a report the user wanted gone for longer
+ * than one load.
+ *
+ * Returns whether the on-disk bytes actually changed, so the caller can keep
+ * the first-run notice honest.
  */
-export async function collectBaselineFacts(opts: {
-  platform: string
-  workspace: string
-  protectedPaths: string[]
-}): Promise<{
-  platformSupported: boolean
-  status: { destinationConfigured: boolean }
-  health: { healthy: boolean; workspaceProtected: boolean; unprotectedPaths: string[] }
-  git: GitBaselineProbe & { gitAvailable: boolean }
-}> {
-  const platformSupported = opts.platform === 'darwin'
-  // On a non-macOS host every tmutil call is a guaranteed failure, and the
-  // pre-U-19 behaviour of letting them fail noisily is exactly what U-19
-  // removed. Skip the probe and report the capability gap explicitly.
-  if (!platformSupported) {
-    return {
-      platformSupported,
-      status: { destinationConfigured: false },
-      health: { healthy: false, workspaceProtected: false, unprotectedPaths: [] },
-      git: probeGitBaseline(opts.workspace),
-    }
+export function refineBaselineReportTm(
+  reportPath: string,
+  input: Omit<BaselineReportInput, 'reportPath'>,
+): boolean {
+  try {
+    if (!existsSync(reportPath)) return false
+    const before = readFileSync(reportPath, 'utf8')
+    const after = renderBaselineReport({ ...input, reportPath, tm: input.tm })
+    if (after === before) return false
+    writeFileSync(reportPath, after, 'utf8')
+    return true
+  } catch {
+    // A refinement failure leaves the placeholder in place, which already says
+    // "unknown — check tm_status". Nothing to escalate.
+    return false
   }
-  let status = { destinationConfigured: false }
+}
+
+/**
+ * Synchronous part of the fact gathering: everything except TM.
+ *
+ * Only the git probe is synchronous by design — it is one `git rev-parse` with
+ * a 10s timeout, and it never mutates the repository. See
+ * `collectTmBaselineFacts` for the async half.
+ */
+export function collectSyncBaselineFacts(workspace: string): { git: GitBaselineProbe } {
+  return { git: probeGitBaseline(workspace) }
+}
+
+/**
+ * Asynchronous TM half of the fact gathering, in one read-only pass.
+ *
+ * On a non-macOS host every tmutil call is a guaranteed failure, and letting
+ * them fail noisily is exactly what U-19 removed — so the probe is skipped and
+ * the result is reported as not-applicable. Never throws: a probe that cannot
+ * complete yields `probed: false`, which the renderer prints as "unknown".
+ */
+export async function collectTmBaselineFacts(opts: {
+  platform: string
+  protectedPaths: string[]
+}): Promise<TmBaselineFacts> {
+  if (opts.platform !== 'darwin') return { ...UNPROBED_TM }
+  let destinationConfigured = false
   try {
     const s = await getTmStatus()
-    status = { destinationConfigured: s.destinationConfigured }
+    destinationConfigured = s.destinationConfigured
   } catch {
     // tmutil unavailable/failing is itself a finding — it renders as NO ⚠️.
   }
-  let health = { healthy: false, workspaceProtected: false, unprotectedPaths: [] as string[] }
+  let healthy = false
+  let workspaceProtected = false
+  let unprotectedPaths: string[] = []
   try {
     const h = await getTmHealth(opts.protectedPaths, true)
-    health = {
-      healthy: h.healthy,
-      workspaceProtected: h.workspaceProtected,
-      unprotectedPaths: h.unprotectedPaths,
-    }
+    healthy = h.healthy
+    workspaceProtected = h.workspaceProtected
+    unprotectedPaths = h.unprotectedPaths
   } catch {
     // Same: an unknown health is reported as not-healthy, never as healthy.
   }
-  return { platformSupported, status, health, git: probeGitBaseline(opts.workspace) }
+  return {
+    probed: true,
+    destinationConfigured,
+    healthy,
+    workspaceProtected,
+    unprotectedPaths,
+  }
 }
-
-/** True when `a` is inside (or equal to) `b`. Directory-boundary safe. */
-export function isInside(a: string, b: string): boolean {
-  const x = a.replace(/\/+$/, '')
-  const y = b.replace(/\/+$/, '')
-  return x === y || x.startsWith(y + '/')
-}
-
-/** Re-export so index.ts does not need a second import for the probe. */
-export { repoRoot }
