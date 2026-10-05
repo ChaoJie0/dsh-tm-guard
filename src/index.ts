@@ -305,6 +305,8 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     requireGitBaseline: normalizeBool(rawConfig?.requireGitBaseline, DEFAULT_CONFIG.requireGitBaseline),
     autoApprove: normalizeBool(rawConfig?.autoApprove, DEFAULT_CONFIG.autoApprove),
     turnReports: normalizeBool(rawConfig?.turnReports, DEFAULT_CONFIG.turnReports),
+    reportsRetainCount: normalizeNumber(rawConfig?.reportsRetainCount, DEFAULT_CONFIG.reportsRetainCount),
+    reportsRetainDays: normalizeNumber(rawConfig?.reportsRetainDays, DEFAULT_CONFIG.reportsRetainDays),
     blockingBackupBeforeWrite: normalizeBool(rawConfig?.blockingBackupBeforeWrite, DEFAULT_CONFIG.blockingBackupBeforeWrite),
     snapshotCooldownSeconds: normalizeNumber(rawConfig?.snapshotCooldownSeconds, DEFAULT_CONFIG.snapshotCooldownSeconds),
   }
