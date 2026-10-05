@@ -524,8 +524,13 @@ test('U-27: renderBaselineReport is pure and deterministic', () => {
     failClosed: true,
     autoApprove: false,
     requireGitBaseline: true,
-    status: { destinationConfigured: true },
-    health: { healthy: true, workspaceProtected: true, unprotectedPaths: [] },
+    tm: {
+      probed: true,
+      destinationConfigured: true,
+      healthy: true,
+      workspaceProtected: true,
+      unprotectedPaths: [],
+    },
     git: { repo: true, root: '/w', hasGitDir: true, gitAvailable: true },
     generatedAt: new Date('2026-10-06T05:41:00Z'),
   }
@@ -552,8 +557,13 @@ test('U-27: renderBaselineReport is pure and deterministic', () => {
   // Unhealthy facts render as problems with a next step, never as a green light.
   const unhealthy = renderBaselineReport({
     ...input,
-    status: { destinationConfigured: false },
-    health: { healthy: false, workspaceProtected: false, unprotectedPaths: ['/w'] },
+    tm: {
+      probed: true,
+      destinationConfigured: false,
+      healthy: false,
+      workspaceProtected: false,
+      unprotectedPaths: ['/w'],
+    },
   })
   assert.match(unhealthy, /UNHEALTHY/)
   assert.match(unhealthy, /下一步/)

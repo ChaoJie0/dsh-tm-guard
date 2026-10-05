@@ -61,8 +61,11 @@ import { buildTurnReport, pruneReports } from './report.ts'
 import { renderStatusReport, RECENT_STATUS_ITEMS } from './status.ts'
 import {
   BASELINE_REPORT_FILE,
-  collectBaselineFacts,
+  UNPROBED_TM,
+  collectSyncBaselineFacts,
+  collectTmBaselineFacts,
   ensureBaselineReport,
+  refineBaselineReportTm,
 } from './baseline-report.ts'
 import { verifyTurn } from './verify.ts'
 import { dirname, join, resolve } from 'node:path'
