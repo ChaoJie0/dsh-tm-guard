@@ -334,6 +334,16 @@ export function renderStatusReport(input: StatusInput): string {
     }`,
   )
 
+  // First-run baseline report (U-27). Always printed, exists or not: a missing
+  // report is itself the answer to "where is my protection-level summary?", and
+  // silence would leave the user re-deriving it from the sections above.
+  const baselinePath = join(audit.dirPath, BASELINE_REPORT_FILE)
+  out.push(
+    `  Baseline report         : .tm-guard/${BASELINE_REPORT_FILE} ${
+      existsSync(baselinePath) ? '(首次运行生成)' : '(尚未生成 — 重启会话后自动生成)'
+    }`,
+  )
+
   /* --- 4. Recent decisions ---------------------------------------- */
   out.push('', `【Recent】 last ${RECENT_STATUS_ITEMS} audit decision(s), newest first:`)
   if (input.recentDecisions.length === 0) {
