@@ -4,8 +4,8 @@
  * The command-level classifier trusts an interpreter (`python x.py`,
  * `node x.js`, `bash deploy.sh`) as `local_exec` because the interpreter
  * itself has no network side effects. The blind spot is the SCRIPT it runs:
- * `requests.get(...)`, `fetch(...)`, `curl` inside a .sh, etc. are invisible
- * to string matching on the command line.
+ * an HTTP client call, or a shell-out to a downloader inside a .sh, is
+ * invisible to string matching on the command line.
  *
  * This module closes that blind spot by inspecting:
  *   1. inline code passed via `python -c "..."` / `node -e "..."`,
