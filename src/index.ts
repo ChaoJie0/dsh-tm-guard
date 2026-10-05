@@ -342,6 +342,9 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     reportsRetainDays: normalizeNumber(rawConfig?.reportsRetainDays, DEFAULT_CONFIG.reportsRetainDays),
     blockingBackupBeforeWrite: normalizeBool(rawConfig?.blockingBackupBeforeWrite, DEFAULT_CONFIG.blockingBackupBeforeWrite),
     snapshotCooldownSeconds: normalizeNumber(rawConfig?.snapshotCooldownSeconds, DEFAULT_CONFIG.snapshotCooldownSeconds),
+    auditMaxBytes: normalizeNumber(rawConfig?.auditMaxBytes, DEFAULT_CONFIG.auditMaxBytes),
+    auditRetainFiles: normalizeNumber(rawConfig?.auditRetainFiles, DEFAULT_CONFIG.auditRetainFiles),
+    auditTotalMaxBytes: normalizeNumber(rawConfig?.auditTotalMaxBytes, DEFAULT_CONFIG.auditTotalMaxBytes),
   }
   // Empty writable scope is a silent footgun: `protectedPaths: []` means the
   // agent can never write anywhere (every write is denied), which most users
