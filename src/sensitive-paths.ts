@@ -92,17 +92,32 @@ export const DEFAULT_SENSITIVE_PATHS: string[] = [
  * disguised as a small config tweak. Adding is the safe direction: a user can
  * only ever widen the deny set unless they explicitly opt into replacement.
  *
- * @param userPaths  Raw `config.denyReadPaths` (already normalized to strings).
+ * Non-string entries are dropped rather than forwarded: a hand-edited
+ * cordis.patch.yml can supply numbers or nulls, and a non-string reaching the
+ * matcher would throw on `.replace()` deep inside classify — turning a config
+ * typo into a crash instead of a safe default. Drop the entry, keep the list.
+ *
+ * @param userPaths  Raw `config.denyReadPaths` (validated here).
  * @param replace    When true, `userPaths` replaces the defaults outright.
  * @returns          Deduplicated list; defaults first, then user additions.
  */
 export function mergeDenyReadPaths(
-  userPaths: string[] | undefined,
+  userPaths: unknown,
   replace: boolean,
 ): string[] {
-  if (userPaths === undefined) return [...DEFAULT_SENSITIVE_PATHS]
-  if (replace) return [...new Set(userPaths)]
+  if (userPaths === undefined || userPaths === null) return [...DEFAULT_SENSITIVE_PATHS]
+  if (!Array.isArray(userPaths)) {
+    // Present but the wrong shape entirely (e.g. a bare string): treat it as a
+    // single path rather than discarding the user's intent — but only when it
+    // actually is a string.
+    if (typeof userPaths === 'string') {
+      return [...new Set([...DEFAULT_SENSITIVE_PATHS, userPaths])]
+    }
+    return [...DEFAULT_SENSITIVE_PATHS]
+  }
+  const clean = userPaths.filter((x): x is string => typeof x === 'string')
+  if (replace) return [...new Set(clean)]
   // Defaults first so the documented base list is always present and the
   // user's additions read as additions in tm_status.
-  return [...new Set([...DEFAULT_SENSITIVE_PATHS, ...userPaths])]
+  return [...new Set([...DEFAULT_SENSITIVE_PATHS, ...clean])]
 }
