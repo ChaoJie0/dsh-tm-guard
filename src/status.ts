@@ -25,6 +25,7 @@ import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import type { AuditLog, AuditRecord } from './audit.ts'
 import type { SnapshotInfo, TmHealth, TmStatus } from './tm.ts'
+import { BASELINE_REPORT_FILE } from './baseline-report.ts'
 
 /** How many recent audit decisions the 【Recent】 section shows. */
 export const RECENT_STATUS_ITEMS = 5
