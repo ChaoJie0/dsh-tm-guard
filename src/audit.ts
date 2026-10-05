@@ -17,7 +17,14 @@ import {
 import { join } from 'node:path'
 import type { OpCategory } from './classifier.ts'
 
-export interface AuditRecord {  /** ISO timestamp */
+/**
+ * Highest rotation generation (`.N`) scanned when reassembling history.
+ * Kept in sync with the rotation cap; scanning beyond it only costs stats.
+ */
+const MAX_ROTATED_FILES = 20
+
+export interface AuditRecord {
+  /** ISO timestamp */
   ts: string
   /** Tool name as registered in dsh */
   tool: string
