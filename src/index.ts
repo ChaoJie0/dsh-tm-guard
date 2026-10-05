@@ -51,7 +51,7 @@ import {
   watermarkOf,
 } from './state.ts'
 import { ensureGitBaseline, commitCheckpoint } from './git.ts'
-import { buildTurnReport } from './report.ts'
+import { buildTurnReport, pruneReports } from './report.ts'
 import { verifyTurn } from './verify.ts'
 import { dirname, join, resolve } from 'node:path'
 import { execSync } from 'node:child_process'
