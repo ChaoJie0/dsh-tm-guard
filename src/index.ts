@@ -770,8 +770,19 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       /* --- Fail-closed: when git net is absent, a write needs a healthy TM backstop --- */
       const needsTmBackstop = isFileWrite && !gitNetReady
       const blockReads = isReadOp && config.failClosedBlockReads
+      // Platform degradation (U-19b): off macOS there is no tmutil, so the
+      // TM-health backstop is meaningless — `getTmHealth` can only report
+      // UNHEALTHY (the exec fails), which would turn every write that the git
+      // net does not cover into a spurious fail-closed denial. Skipping the
+      // check is the correct behaviour for "no TM exists"; the git baseline
+      // remains the operative net, and the degradation is announced once.
+      const tmBackstopEvaluable = platformSupported
+      if (!tmBackstopEvaluable && (needsTmBackstop || blockReads)) {
+        warnPlatformOnce()
+      }
       if (
         config.failClosed &&
+        tmBackstopEvaluable &&
         !isTmInternalTool &&
         (needsTmBackstop || blockReads)
       ) {
