@@ -1198,8 +1198,14 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         const status = await getTmStatus()
         const latest = await latestSnapshot('/')
         const health = await getTmHealth(config.protectedPaths, true)
-        const auditCount = audit.readAll().length
-        const writeCount = audit.writeOperations().length
+        // One full parse, not two (design §4.4.2). `writeOperations()` internally
+        // calls readAll() again, so the old pairing parsed the whole retained
+        // history twice per tm_status.
+        const all = audit.readAll()
+        const auditCount = all.length
+        const writeCount = all.filter(
+          (r) => r.decision === 'allow' && r.targetPaths.length > 0,
+        ).length
 
         const lines = [
           '=== TM-Guard Status ===',
