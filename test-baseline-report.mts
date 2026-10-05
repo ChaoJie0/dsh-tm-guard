@@ -9,16 +9,32 @@
 //
 // These tests pin the three properties that make the artifact trustworthy:
 //
-//   a. FIRST apply() (no baseline-report.md) writes the report, and the report
-//      contains all six section headings — including the risk list.
-//   b. LATER apply()s are no-ops: the file is not rewritten (pinned by
-//      comparing bytes AND mtime, so a silent identical rewrite still fails).
-//   c. On a non-macOS host the report says `limited mode` and does not claim a
-//      Time Machine net it cannot have (U-19 semantics, restated on disk).
+//   a. FIRST apply() (no baseline-report.md in the workspace) writes the report,
+//      and the report contains all six section headings — including the risk
+//      list quoted from README Limitations.
+//   b. LATER apply()s are no-ops: the file is not rewritten (pinned by comparing
+//      bytes AND mtime, so even an identical silent rewrite fails), and the
+//      first-run notice is printed exactly once per workspace.
+//   c. On a non-macOS host the report says `limited mode`, names the git
+//      baseline as the only rollback net, and does not claim a Time Machine net
+//      it cannot have (U-19 semantics, restated on disk).
 //
-// Plus the two invariants that make it safe to run at plugin load: the probes
-// are read-only (no git init, no commit), and a failure to write degrades to a
+// Plus the invariants that make this safe to run at plugin load: the probes are
+// read-only (no git init/commit, no tmutil on non-macOS, nothing but the report
+// written into the workspace), and an unwritable report path degrades to a
 // warning instead of stopping the gate from loading.
+//
+// Two harness details worth stating, because both encode a decision:
+//
+//   * The workspace is pinned through the `DSH_HOME` fallback that `AuditLog`
+//     already uses, rather than by chdir'ing. apply() resolves `.tm-guard/`
+//     from `process.cwd()` (it is a single-instance object, per design §4.2.2),
+//     so chdir would make the report path depend on ambient cwd; DSH_HOME makes
+//     "which workspace is this?" explicit. No production behaviour is added —
+//     the field was already read by the constructor.
+//   * `apply()` is called between console capture boundaries, so the report —
+//     which is written synchronously on the first run — is asserted directly
+//     rather than raced against a promise.
 //
 // `process.platform` is a read-only own accessor on `process`, so it is stubbed
 // with Object.defineProperty and restored in a finally — apply() reads it fresh.
@@ -58,12 +74,12 @@ function stubPlatform(value: string): () => void {
   return () => { Object.defineProperty(process, 'platform', desc) }
 }
 
-/** Sleep so a rewrite would land on a strictly later mtime. */
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
 }
 
 let ORIG_CWD = ''
+let ORIG_DSH_HOME: string | undefined
 let ROOT = ''
 let seq = 0
 
@@ -82,59 +98,66 @@ function mockCtx() {
   }
 }
 
-/**
- * Fresh workspace per test. Each gets its own `.tm-guard/` so the "report must
- * not exist yet" precondition of a first run is real rather than restored.
- */
+/** Fresh workspace per test: its own `.tm-guard/`, so "first run" is real. */
 function workspace(): string {
   const dir = mkdtempSync(join(tmpdir(), `tm-baseline-${seq++}-`))
   mkdirSync(join(dir, '.tm-guard'), { recursive: true })
   return dir
 }
 
-/** Apply with a stubbed platform, capturing console output. */
-function applyAs(platform: string, config: Record<string, unknown> = {}) {
-  const restore = stubPlatform(platform)
+/** console.log capture that can be opened and closed around several apply()s. */
+function logCapture() {
   const logs: string[] = []
   const warns: string[] = []
   const origLog = console.log
   const origWarn = console.warn
-  console.log = (...a: unknown[]) => { logs.push(a.map(String).join(' ')) }
-  console.warn = (...a: unknown[]) => { warns.push(a.map(String).join(' ')) }
-  const { ctx } = mockCtx()
-  try {
-    apply(ctx as any, { protectedPaths: [ROOT], ...config } as any)
-  } finally {
-    console.log = origLog
-    console.warn = origWarn
-    restore()
+  return {
+    logs,
+    warns,
+    open() {
+      console.log = (...a: unknown[]) => { logs.push(a.map(String).join(' ')) }
+      console.warn = (...a: unknown[]) => { warns.push(a.map(String).join(' ')) }
+    },
+    close() {
+      console.log = origLog
+      console.warn = origWarn
+    },
   }
-  return { ctx, logs, warns }
 }
 
 /**
- * apply() generates the report asynchronously (it probes tmutil), so the
- * assertion has to wait for the file rather than assume it is there.
+ * Run one apply() against `workspace` with `platform` presented as current.
+ * Fully synchronous: the first-run report is written before apply() returns.
  */
-async function waitFor(path: string, timeoutMs = 5000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (existsSync(path)) return true
-    await sleep(20)
+function applyIn(workspace: string, platform: string, config: Record<string, unknown> = {}) {
+  const restore = stubPlatform(platform)
+  const saved = process.env.DSH_HOME
+  process.env.DSH_HOME = workspace
+  try {
+    const m = mockCtx()
+    apply(m.ctx as any, { protectedPaths: [workspace], ...config } as any)
+    return m
+  } finally {
+    if (saved === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = saved
+    restore()
   }
-  return existsSync(path)
+}
+
+function reportOf(workspace: string): string {
+  return join(workspace, '.tm-guard', BASELINE_REPORT_FILE)
 }
 
 before(() => {
   ORIG_CWD = process.cwd()
+  ORIG_DSH_HOME = process.env.DSH_HOME
   ROOT = mkdtempSync(join(tmpdir(), 'tm-baseline-root-'))
   execSync(`git init -q ${ROOT} && git -C ${ROOT} config user.email t@t && git -C ${ROOT} config user.name t`)
   execSync(`echo base > ${join(ROOT, 'base.txt')} && git -C ${ROOT} add -A && git -C ${ROOT} commit -qm baseline`)
   process.chdir(ROOT)
-  // A healthy macOS fixture by default; individual tests override it to model
-  // an unconfigured destination. `localsnapshot` throws on purpose: U-27 is a
-  // read-only probe, so any attempt to take a snapshot is a bug, not a test
-  // fixture gap — and the unexpected-exec fallback makes that loud.
+  // A healthy macOS fixture. `localsnapshot` deliberately throws: U-27 is a
+  // read-only probe, so any attempt to take a snapshot is a bug — and the
+  // unexpected-exec fallback makes that loud instead of silently tolerated.
   __setExecOverride(async (f: string, a: string[]) => {
     if (a[0] === 'listlocalsnapshots') {
       return { stdout: 'Snapshots for disk /:\ncom.apple.TimeMachine.2026-09-06-120000.local\n' }
@@ -149,6 +172,8 @@ after(() => {
   __setExecOverride(null)
   __setGitOverride(null)
   process.chdir(ORIG_CWD)
+  if (ORIG_DSH_HOME === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = ORIG_DSH_HOME
   rmSync(ROOT, { recursive: true, force: true })
 })
 
@@ -160,33 +185,19 @@ beforeEach(() => {
 /* a. First run generates the report                                   */
 /* ------------------------------------------------------------------ */
 
-test('U-27a: first apply() writes .tm-guard/baseline-report.md', async () => {
+test('U-27a: first apply() writes .tm-guard/baseline-report.md', () => {
   const ws = workspace()
-  const restore = stubPlatform('darwin')
-  try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-    process.chdir(ROOT) // apply() resolved cwd; keep the suite's cwd stable
-  } finally {
-    restore()
-  }
-  const report = join(ws, '.tm-guard', BASELINE_REPORT_FILE)
-  assert.ok(await waitFor(report), `baseline report not written: ${report}`)
-  const md = readFileSync(report, 'utf8')
-  assert.ok(md.length > 500, 'report should be a real document, not a stub')
-  rmSync(ws, { recursive: true, force: true })
+  applyIn(ws, 'darwin')
+  const report = reportOf(ws)
+  assert.ok(existsSync(report), `baseline report not written: ${report}`)
+  planCleanup(ws)
 })
 
-test('U-27a: the report carries all six section headings, in order', async () => {
+test('U-27a: the report carries all six section headings, in order', () => {
   const ws = workspace()
-  const restore = stubPlatform('darwin')
-  try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-  } finally {
-    restore()
-  }
-  const report = join(ws, '.tm-guard', BASELINE_REPORT_FILE)
-  assert.ok(await waitFor(report), 'baseline report not written')
-  const md = readFileSync(report, 'utf8')
+  applyIn(ws, 'darwin')
+  const md = readFileSync(reportOf(ws), 'utf8')
+  assert.ok(md.length > 500, 'report should be a real document, not a stub')
 
   assert.equal(BASELINE_SECTIONS.length, 6, 'U-27 specifies exactly six sections')
   let cursor = -1
@@ -196,32 +207,30 @@ test('U-27a: the report carries all six section headings, in order', async () =>
     assert.ok(at > cursor, `section out of order: ${heading}`)
     cursor = at
   }
-  rmSync(ws, { recursive: true, force: true })
+  planCleanup(ws)
 })
 
-test('U-27a: the report states the probe facts and the README risk list', async () => {
+test('U-27a: the report states the probe facts and the README risk list', () => {
   const ws = workspace()
-  const restore = stubPlatform('darwin')
-  try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-  } finally {
-    restore()
-  }
-  const md = readFileSync(join(ws, '.tm-guard', BASELINE_REPORT_FILE), 'utf8')
+  applyIn(ws, 'darwin')
+  const md = readFileSync(reportOf(ws), 'utf8')
 
   // (a) TM configured — the healthy fixture reports a destination.
-  assert.match(md, /TM 已配置/, 'TM configuration line missing')
-  // (b) workspace protection is stated, not implied.
-  assert.match(md, /Workspace 受 TM 保护/, 'workspace protection line missing')
-  // (c) git baseline reachability.
-  assert.match(md, /git 可用/, 'git availability line missing')
-  assert.match(md, /requireGitBaseline/, 'requireGitBaseline state missing')
+  assert.match(md, /TM 已配置/)
+  // (b) workspace protection stated, not implied.
+  assert.match(md, /Workspace 受 TM 保护/)
+  // (c) git baseline reachability + creation policy.
+  assert.match(md, /git 可用/)
+  assert.match(md, /requireGitBaseline/)
+  assert.match(md, /惰性创建/, 'must say the baseline is created lazily, i.e. not by this probe')
   // (d) denyReadPaths effective count — the real merged list, not a placeholder.
   const count = md.match(/实际生效项数：(\d+)/)
   assert.ok(count, 'denyReadPaths effective-count line missing')
-  assert.ok(Number(count![1]) > 0, 'a fresh install must never report zero protected paths')
+  assert.ok(Number(count![1]) > 0, 'a fresh install must never report zero deny-read paths')
   assert.match(md, /~\/\.ssh/, 'the default sensitive list should be enumerated')
-  // (f) residual risks quoted from README Limitations.
+  // (e) platform mode.
+  assert.match(md, /full mode/)
+  // (f) residual risks, quoted from README Limitations.
   assert.match(md, /eval \/ decode 逃逸/, 'eval/decode escape risk missing')
   assert.match(md, /运行时 URL/, 'runtime-URL risk missing')
   assert.match(md, /与其他权限插件叠加语义/, 'plugin-coexistence risk missing')
@@ -230,29 +239,24 @@ test('U-27a: the report states the probe facts and the README risk list', async 
   }
   // The read-only promise must be visible in the artifact itself.
   assert.match(md, /只读探测/, 'the read-only guarantee must be stated in the report')
-  rmSync(ws, { recursive: true, force: true })
+  planCleanup(ws)
 })
 
-test('U-27a: first apply() logs the one-line pointer to the report', async () => {
+test('U-27a: first apply() logs the one-line pointer to the report', () => {
   const ws = workspace()
-  const logs: string[] = []
-  const restore = stubPlatform('darwin')
-  const origLog = console.log
-  console.log = (...a: unknown[]) => { logs.push(a.map(String).join(' ')) }
+  const cap = logCapture()
+  cap.open()
   try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
+    applyIn(ws, 'darwin')
   } finally {
-    console.log = origLog
-    restore()
+    cap.close()
   }
-  assert.ok(await waitFor(join(ws, '.tm-guard', BASELINE_REPORT_FILE)), 'report not written')
-  // Give the promise chain one more tick to reach the console call.
-  await sleep(20)
-  const line = logs.find((l) => l.includes('首次运行基线报告已生成'))
-  assert.ok(line, `expected the first-run notice, got: ${JSON.stringify(logs)}`)
+  assert.ok(existsSync(reportOf(ws)), 'report not written')
+  const line = cap.logs.find((l) => l.includes('首次运行基线报告已生成'))
+  assert.ok(line, `expected the first-run notice, got: ${JSON.stringify(cap.logs)}`)
   assert.match(line!, /baseline-report\.md/)
   assert.match(line!, /实际保护等级/)
-  rmSync(ws, { recursive: true, force: true })
+  planCleanup(ws)
 })
 
 /* ------------------------------------------------------------------ */
@@ -261,128 +265,91 @@ test('U-27a: first apply() logs the one-line pointer to the report', async () =>
 
 test('U-27b: a second apply() does not rewrite an existing report', async () => {
   const ws = workspace()
-  const report = join(ws, '.tm-guard', BASELINE_REPORT_FILE)
-  const restore = stubPlatform('darwin')
-  try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-    assert.ok(await waitFor(report), 'first apply did not generate the report')
-    await sleep(30) // ensure a rewrite would get a strictly later mtime
-    const first = readFileSync(report, 'utf8')
-    const firstMtime = statSync(report).mtimeMs
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-    await sleep(200) // longer than any plausible second write
-    assert.equal(readFileSync(report, 'utf8'), first, 'report bytes changed on re-apply')
-    assert.equal(statSync(report).mtimeMs, firstMtime, 'report was rewritten on re-apply')
-  } finally {
-    restore()
-  }
-  rmSync(ws, { recursive: true, force: true })
+  const report = reportOf(ws)
+  applyIn(ws, 'darwin')
+  assert.ok(existsSync(report), 'first apply did not generate the report')
+  await sleep(30) // so a rewrite would land on a strictly later mtime
+  const first = readFileSync(report, 'utf8')
+  const firstMtime = statSync(report).mtimeMs
+
+  applyIn(ws, 'darwin')
+  assert.equal(readFileSync(report, 'utf8'), first, 'report bytes changed on re-apply')
+  assert.equal(statSync(report).mtimeMs, firstMtime, 'report was rewritten on re-apply')
+  planCleanup(ws)
 })
 
-test('U-27b: deleted report is regenerated (existence is the only state)', async () => {
+test('U-27b: a second apply() prints no first-run notice', () => {
   const ws = workspace()
-  const report = join(ws, '.tm-guard', BASELINE_REPORT_FILE)
-  const restore = stubPlatform('darwin')
-  try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-    assert.ok(await waitFor(report), 'first apply did not generate the report')
-    rmSync(report)
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-    assert.ok(await waitFor(report), 'report was not regenerated after deletion')
-  } finally {
-    restore()
-  }
-  rmSync(ws, { recursive: true, force: true })
-})
+  applyIn(ws, 'darwin')
+  assert.ok(existsSync(reportOf(ws)), 'first apply did not generate the report')
 
-test('U-27b: a second apply() that finds the report logs no first-run notice', async () => {
-  const ws = workspace()
-  const report = join(ws, '.tm-guard', BASELINE_REPORT_FILE)
-  const restore = stubPlatform('darwin')
+  const cap = logCapture()
+  cap.open()
   try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-    assert.ok(await waitFor(report), 'first apply did not generate the report')
+    applyIn(ws, 'darwin')
   } finally {
-    restore()
-  }
-
-  const logs: string[] = []
-  const origLog = console.log
-  console.log = (...a: unknown[]) => { logs.push(a.map(String).join(' ')) }
-  const restore2 = stubPlatform('darwin')
-  try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-    await sleep(200)
-  } finally {
-    console.log = origLog
-    restore2()
+    cap.close()
   }
   assert.equal(
-    logs.filter((l) => l.includes('首次运行基线报告已生成')).length,
+    cap.logs.filter((l) => l.includes('首次运行基线报告已生成')).length,
     0,
-    `a second apply must not announce a first run: ${JSON.stringify(logs)}`,
+    `a second apply must not announce a first run: ${JSON.stringify(cap.logs)}`,
   )
-  rmSync(ws, { recursive: true, force: true })
+  planCleanup(ws)
 })
 
-test('U-27b: regeneration names the existing file only once per workspace', async () => {
-  // Guards the detection rule itself: "first run" is the ABSENCE of the file in
-  // THIS workspace, so two workspaces are two first runs, each with its own
-  // report — the state is per-workspace, not per-process.
+test('U-27b: deleting the report makes the NEXT apply a first run again', () => {
+  const ws = workspace()
+  const report = reportOf(ws)
+  applyIn(ws, 'darwin')
+  assert.ok(existsSync(report), 'first apply did not generate the report')
+
+  rmSync(report)
+  const cap = logCapture()
+  cap.open()
+  try {
+    applyIn(ws, 'darwin')
+  } finally {
+    cap.close()
+  }
+  assert.ok(existsSync(report), 'report was not regenerated after deletion')
+  assert.ok(
+    cap.logs.some((l) => l.includes('首次运行基线报告已生成')),
+    'regeneration after deletion should announce itself again',
+  )
+  planCleanup(ws)
+})
+
+test('U-27b: detection is per-workspace — two workspaces are two first runs', () => {
   const a = workspace()
   const b = workspace()
-  const restore = stubPlatform('darwin')
-  try {
-    apply(mockCtx().ctx as any, { protectedPaths: [a, b] } as any)
-    assert.ok(await waitFor(join(a, '.tm-guard', BASELINE_REPORT_FILE)), 'no report in workspace A')
-    assert.ok(existsSync(join(b, '.tm-guard', BASELINE_REPORT_FILE)) === false ||
-      true, 'sanity')
-  } finally {
-    restore()
-  }
-  rmSync(a, { recursive: true, force: true })
-  rmSync(b, { recursive: true, force: true })
+  applyIn(a, 'darwin')
+  assert.ok(existsSync(reportOf(a)), 'no report in workspace A')
+  assert.equal(existsSync(reportOf(b)), false, 'workspace B must not have a report yet')
+  applyIn(b, 'darwin')
+  assert.ok(existsSync(reportOf(b)), 'no report in workspace B after its own first run')
+  planCleanup(a)
+  planCleanup(b)
 })
 
-/* ------------------------------------------------------------------ */
-/* c. Non-macOS platform labels the limitation                         */
-/* ------------------------------------------------------------------ */
-
-test('U-27c: a non-macOS host is labelled limited mode in the report', async () => {
+test('U-27b: an existing report is left byte-identical even if the facts changed', () => {
+  // The report is a first-run SNAPSHOT, not a live view: if TM is reconfigured
+  // afterwards the file must not silently start rendering half-old facts.
+  // `tm_status` is the live answer; the report stays the historical one.
   const ws = workspace()
-  const restore = stubPlatform('linux')
-  try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-  } finally {
-    restore()
-  }
-  const report = join(ws, '.tm-guard', BASELINE_REPORT_FILE)
-  assert.ok(await waitFor(report), 'baseline report not written on the non-macOS host')
-  const md = readFileSync(report, 'utf8')
-  assert.match(md, /limited mode/, 'non-macOS report must say limited mode')
-  assert.match(md, /linux/, 'non-macOS report must name the platform')
-  // The platform section specifically — not merely the summary table.
-  const platformSection = md.slice(md.indexOf(BASELINE_SECTIONS[4]))
-  assert.match(platformSection, /limited mode（无 TM）/, 'platform section must state limited mode')
-  assert.match(platformSection, /git baseline/, 'limited mode must name the fallback net')
-  // And it must NOT claim a TM net it cannot have.
-  assert.doesNotMatch(md, /TM 已配置/, 'a non-macOS host must not claim a TM destination')
-  assert.doesNotMatch(md, /HEALTHY ✅/, 'a non-macOS host must not claim TM health')
-  rmSync(ws, { recursive: true, force: true })
-})
+  applyIn(ws, 'darwin')
+  const report = reportOf(ws)
+  const first = readFileSync(report, 'utf8')
 
-test('U-27c: non-macOS probing never shells out to tmutil', async () => {
-  const ws = workspace()
-  const calls: string[] = []
-  __setExecOverride(async (_f: string, a: string[]) => {
-    calls.push(a.join(' '))
-    throw new Error('tmutil must not be reached on a non-macOS host')
+  __setExecOverride(async (f: string, a: string[]) => {
+    if (a[0] === 'destinationinfo') throw new Error('TM was turned off after the first run')
+    if (a[0] === 'listlocalsnapshots') throw new Error('no snapshots anymore')
+    if (a[0] === 'isexcluded') return { stdout: `[Excluded] ${a[1]}\n` }
+    throw new Error(`unexpected exec: ${f} ${a.join(' ')}`)
   })
-  const restore = stubPlatform('linux')
   try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
+    applyIn(ws, 'darwin')
   } finally {
-    restore()
     __setExecOverride(async (f: string, a: string[]) => {
       if (a[0] === 'listlocalsnapshots') {
         return { stdout: 'Snapshots for disk /:\ncom.apple.TimeMachine.2026-09-06-120000.local\n' }
@@ -392,17 +359,64 @@ test('U-27c: non-macOS probing never shells out to tmutil', async () => {
       throw new Error(`unexpected exec: ${f} ${a.join(' ')}`)
     })
   }
-  assert.ok(await waitFor(join(ws, '.tm-guard', BASELINE_REPORT_FILE)), 'report not written')
-  await sleep(50)
+  assert.equal(readFileSync(report, 'utf8'), first, 'an existing report must not be rewritten')
+  planCleanup(ws)
+})
+
+/* ------------------------------------------------------------------ */
+/* c. Non-macOS platform labels the limitation                         */
+/* ------------------------------------------------------------------ */
+
+test('U-27c: a non-macOS host is labelled limited mode in the report', () => {
+  const ws = workspace()
+  applyIn(ws, 'linux')
+  const report = reportOf(ws)
+  assert.ok(existsSync(report), 'baseline report not written on the non-macOS host')
+  const md = readFileSync(report, 'utf8')
+  assert.match(md, /limited mode/, 'non-macOS report must say limited mode')
+  assert.match(md, /linux/, 'non-macOS report must name the platform')
+
+  // The platform section specifically — not merely the summary table.
+  const platformSection = md.slice(md.indexOf(BASELINE_SECTIONS[4]))
+  assert.match(platformSection, /limited mode（无 TM）/, 'platform section must state limited mode')
+  assert.match(platformSection, /git baseline/, 'limited mode must name the fallback net')
+
+  // And it must NOT claim a TM net it cannot have.
+  assert.doesNotMatch(md, /TM 已配置/, 'a non-macOS host must not claim a TM destination')
+  assert.doesNotMatch(md, /HEALTHY ✅/, 'a non-macOS host must not claim TM health')
+  assert.match(md, /能力限制/, 'the missing TM must be framed as a capability limit, not a fault')
+  planCleanup(ws)
+})
+
+test('U-27c: non-macOS probing never shells out to tmutil', () => {
+  const ws = workspace()
+  const calls: string[] = []
+  __setExecOverride(async (_f: string, a: string[]) => {
+    calls.push(a.join(' '))
+    throw new Error('tmutil must not be reached on a non-macOS host')
+  })
+  try {
+    applyIn(ws, 'linux')
+  } finally {
+    __setExecOverride(async (f: string, a: string[]) => {
+      if (a[0] === 'listlocalsnapshots') {
+        return { stdout: 'Snapshots for disk /:\ncom.apple.TimeMachine.2026-09-06-120000.local\n' }
+      }
+      if (a[0] === 'destinationinfo') return { stdout: 'Name : SD\n' }
+      if (a[0] === 'isexcluded') return { stdout: `[Included] ${a[1]}\n` }
+      throw new Error(`unexpected exec: ${f} ${a.join(' ')}`)
+    })
+  }
+  assert.ok(existsSync(reportOf(ws)), 'report not written')
   assert.deepEqual(calls, [], `no tmutil call may happen on linux: ${JSON.stringify(calls)}`)
-  rmSync(ws, { recursive: true, force: true })
+  planCleanup(ws)
 })
 
 /* ------------------------------------------------------------------ */
 /* Read-only + fail-open invariants                                    */
 /* ------------------------------------------------------------------ */
 
-test('U-27: generating the report does not touch git (read-only probe)', async () => {
+test('U-27: generating the report does not touch git (read-only probe)', () => {
   const ws = workspace()
   const headBefore = execSync('git -C . rev-parse HEAD', { encoding: 'utf8' }).trim()
   const statusBefore = execSync('git -C . status --porcelain', { encoding: 'utf8' })
@@ -411,15 +425,12 @@ test('U-27: generating the report does not touch git (read-only probe)', async (
     gitCalls.push(args.join(' '))
     return ''
   })
-  const restore = stubPlatform('darwin')
   try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
+    applyIn(ws, 'darwin')
   } finally {
-    restore()
     __setGitOverride(null)
   }
-  assert.ok(await waitFor(join(ws, '.tm-guard', BASELINE_REPORT_FILE)), 'report not written')
-  await sleep(50)
+  assert.ok(existsSync(reportOf(ws)), 'report not written')
   // Only query subcommands — never init/add/commit.
   for (const call of gitCalls) {
     assert.match(call, /^rev-parse/, `the baseline probe must stay read-only, saw: ${call}`)
@@ -427,44 +438,52 @@ test('U-27: generating the report does not touch git (read-only probe)', async (
   assert.deepEqual(gitCalls, ['rev-parse --show-toplevel'], 'exactly one read-only git probe expected')
   assert.equal(execSync('git -C . rev-parse HEAD', { encoding: 'utf8' }).trim(), headBefore, 'HEAD moved')
   assert.equal(execSync('git -C . status --porcelain', { encoding: 'utf8' }), statusBefore, 'work tree changed')
-  rmSync(ws, { recursive: true, force: true })
+  planCleanup(ws)
 })
 
-test('U-27: an unwritable report path degrades to a warning, never a load failure', async () => {
+test('U-27: the only file written into the workspace is the report itself', () => {
   const ws = workspace()
-  const logs: string[] = []
-  const warns: string[] = []
-  const origLog = console.log
-  const origWarn = console.warn
-  console.log = (...a: unknown[]) => { logs.push(a.map(String).join(' ')) }
-  console.warn = (...a: unknown[]) => { warns.push(a.map(String).join(' ')) }
-  const restore = stubPlatform('darwin')
+  const before = readdirSync(join(ROOT, '.tm-guard')).sort()
+  applyIn(ws, 'darwin')
+  assert.ok(existsSync(reportOf(ws)), 'report not written')
+  // No snapshots, no reports/ entries, no state.json — and the cwd workspace
+  // the gate's own audit log lives in is untouched.
+  assert.deepEqual(
+    readdirSync(join(ws, '.tm-guard')).sort(),
+    [BASELINE_REPORT_FILE],
+    'the baseline probe must write nothing but the report',
+  )
+  assert.deepEqual(readdirSync(join(ROOT, '.tm-guard')).sort(), before, 'cwd .tm-guard changed')
+  planCleanup(ws)
+})
+
+test('U-27: an unwritable report path degrades to a warning, never a load failure', () => {
+  const ws = workspace()
+  // `.tm-guard` exists in every workspace(); replace it with a regular file so
+  // the report has nowhere to go.
+  rmSync(join(ws, '.tm-guard'), { recursive: true, force: true })
+  writeFileSync(join(ws, '.tm-guard'), 'not a directory', 'utf8')
+
+  const cap = logCapture()
+  cap.open()
   try {
-    // `.tm-guard` is a FILE, so the report cannot be created inside it.
-    // The workspace itself already contains a `.tm-guard` directory, so use a
-    // second workspace whose `.tm-guard` is replaced by a regular file.
-    rmSync(join(ws, '.tm-guard'), { recursive: true, force: true })
-    writeFileSync(join(ws, '.tm-guard'), 'not a directory', 'utf8')
     assert.doesNotThrow(() => {
-      apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
+      applyIn(ws, 'darwin')
     }, 'apply() must survive an unwritable report path')
-    await sleep(200)
   } finally {
-    console.log = origLog
-    console.warn = origWarn
-    restore()
+    cap.close()
   }
   // No first-run success notice, and the failure is reported rather than swallowed.
-  assert.equal(logs.filter((l) => l.includes('首次运行基线报告已生成')).length, 0)
+  assert.equal(cap.logs.filter((l) => l.includes('首次运行基线报告已生成')).length, 0)
   assert.ok(
-    warns.some((l) => l.includes('Baseline report skipped')),
-    `expected a degradation warning, got: ${JSON.stringify(warns)}`,
+    cap.warns.some((l) => l.includes('Baseline report skipped')),
+    `expected a degradation warning, got: ${JSON.stringify(cap.warns)}`,
   )
-  rmSync(ws, { recursive: true, force: true })
+  planCleanup(ws)
 })
 
 /* ------------------------------------------------------------------ */
-/* Pure renderer (no apply, no tmutil)                                 */
+/* Pure renderer + probe units (no apply, no tmutil)                   */
 /* ------------------------------------------------------------------ */
 
 test('U-27: renderBaselineReport is pure and deterministic', () => {
@@ -491,12 +510,20 @@ test('U-27: renderBaselineReport is pure and deterministic', () => {
   for (const heading of BASELINE_SECTIONS) assert.ok(first.includes(heading))
 
   // Replacement semantics must be visible: a user who dropped the defaults has
-  // to see that from the report alone.
-  const replaced = renderBaselineReport({ ...input, denyReadPathsReplace: true, denyReadPaths: ['~/project'] })
+  // to be able to see that from the report alone.
+  const replaced = renderBaselineReport({
+    ...input,
+    denyReadPathsReplace: true,
+    denyReadPaths: ['~/project'],
+  })
   assert.match(replaced, /替换/)
   assert.match(replaced, /实际生效项数：1/)
+  // An empty list is a fail-open opt-out and must be called out as one.
+  const emptied = renderBaselineReport({ ...input, denyReadPaths: [] })
+  assert.match(emptied, /实际生效项数：0/)
+  assert.match(emptied, /清单为空/)
 
-  // Unhealthy facts render as problems with a next step, not as a green light.
+  // Unhealthy facts render as problems with a next step, never as a green light.
   const unhealthy = renderBaselineReport({
     ...input,
     status: { destinationConfigured: false },
@@ -507,31 +534,12 @@ test('U-27: renderBaselineReport is pure and deterministic', () => {
   assert.match(unhealthy, /\/w/)
 })
 
-test('U-27: the rendered report never leaks the local user name', () => {
+test('U-27: the report does not leak the maintainer home path', () => {
   // The report is written into the user's own workspace, so it is theirs to
-  // keep — but the shipped *code* must stay free of maintainer paths (the
-  // pack audit enforces the same rule for the tarball).
+  // keep — but the shipped *code* must stay free of maintainer paths (the pack
+  // audit enforces the same rule for the tarball).
   const src = readFileSync(new URL('./src/baseline-report.ts', import.meta.url), 'utf8')
   assert.doesNotMatch(src, /\/Users\/zero\b/, 'no maintainer home path in the report generator')
-})
-
-test('U-27: the report states the read-only guarantee it actually keeps', async () => {
-  const before = readdirSync(join(ROOT, '.tm-guard')).sort()
-  const ws = workspace()
-  const restore = stubPlatform('darwin')
-  try {
-    apply(mockCtx().ctx as any, { protectedPaths: [ws] } as any)
-  } finally {
-    restore()
-  }
-  assert.ok(await waitFor(join(ws, '.tm-guard', BASELINE_REPORT_FILE)), 'report not written')
-  await sleep(50)
-  // The report must not create snapshots, reports/ entries, or state files in
-  // the workspace it describes.
-  const after = readdirSync(join(ws, '.tm-guard')).sort()
-  assert.deepEqual(after, [BASELINE_REPORT_FILE], `unexpected files written: ${JSON.stringify(after)}`)
-  assert.deepEqual(readdirSync(join(ROOT, '.tm-guard')).sort(), before, 'cwd .tm-guard changed')
-  rmSync(ws, { recursive: true, force: true })
 })
 
 test('U-27: probeGitBaseline is read-only even outside a repository', () => {
@@ -550,13 +558,15 @@ test('U-27: probeGitBaseline is read-only even outside a repository', () => {
 })
 
 test('U-27: probeGitBaseline reports a missing git binary without throwing', () => {
-  // PATH without git: the probe must answer "not available", not crash the
-  // plugin load — an installer-shaped failure deserves a finding, not a stack.
+  // PATH without git: the probe must answer "not available" rather than crash
+  // the plugin load — an installer-shaped failure deserves a finding, not a
+  // stack trace at startup.
   const savedPath = process.env.PATH
   process.env.PATH = '/nonexistent-bin'
   try {
     const probe = probeGitBaseline(ROOT)
     assert.equal(probe.gitAvailable, false)
+    assert.equal(probe.repo, false)
   } finally {
     process.env.PATH = savedPath
   }
