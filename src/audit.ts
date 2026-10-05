@@ -122,31 +122,36 @@ export class AuditLog {
   }
 
   /**
-   * Append a record to the audit log, then rotate if the file has reached
-   * `auditMaxBytes` (design §4.3: `statSync(audit.jsonl).size >= auditMaxBytes`).
+   * Append a record to the audit log.
+   *
+   * PRE-APPEND PREDICTION ROTATION (test-audit-rotate.mts §a): before
+   * appending, estimate whether this record would push the live file past
+   * `maxBytes`. If so, rotate the *existing* content to `.1` first, then
+   * append into the freshly truncated file — so `.1` is byte-for-byte the
+   * pre-rotation file and the triggering record lands alone in the live file.
+   * This is the opposite of post-append rotation (which would sweep the
+   * triggering record into `.1` and leave it out of the live log).
    *
    * SINGLE-INSTANCE CONSTRAINT (design §4.2.2): rotation operates on
    * `this.logPath`, the path captured at construction. Rotation and `record()`
-   * must therefore run through the *same* `AuditLog` instance; a second
-   * instance with a different resolved directory would rotate one file while
-   * appends land in another.
+   * must therefore run through the *same* `AuditLog` instance.
    *
-   * ORDER: the size check runs AFTER the append. The check is a single
-   * `statSync` on the hot path (cheap); only a size at/over the threshold —
-   * which can happen at most once per `auditMaxBytes` of traffic — pays for the
-   * rotation itself, so the IO-heavy work stays off the common path (§1.3).
-   * Rotating after the append also means the record that crossed the threshold
-   * is preserved in the freshly rotated `.1`, so no record is ever written to a
-   * file that then has its content moved out from under it.
+   * The size probe is one `statSync` on every write (cheap); only a predicted
+   * over-limit — which can happen at most once per `maxBytes` of traffic —
+   * pays for the rotation itself (design §1.3).
    */
   record(entry: Omit<AuditRecord, 'ts'>): void {
     const record: AuditRecord = {
       ts: new Date().toISOString(),
       ...entry,
     }
+    const line = JSON.stringify(record) + '\n'
     try {
-      appendFileSync(this.logPath, JSON.stringify(record) + '\n', 'utf8')
-      this.maybeRotate()
+      const { maxBytes } = this.rotation
+      if (maxBytes > 0 && this.currentSize() + line.length > maxBytes) {
+        this.rotate()
+      }
+      appendFileSync(this.logPath, line, 'utf8')
     } catch (err) {
       console.warn('[tm-guard] Failed to write audit log:', err)
     }
@@ -166,11 +171,12 @@ export class AuditLog {
   }
 
   /**
-   * Rotate when the current file has reached `maxBytes`.
+   * Rotate when the current file has grown strictly *beyond* `maxBytes`.
    *
-   * Strictly `>` threshold, not `>=`: a file of exactly `auditMaxBytes` is
-   * already within budget, and rotating it would produce an empty current file
-   * plus an identical-sized `.1` for no gain.
+   * Boundary rule (test-audit-rotate.mts §e): a file sitting exactly at the
+   * threshold is NOT rotated — only a file that has crossed it by at least one
+   * byte triggers. This avoids churning on a file that happened to land on the
+   * boundary from an external write.
    */
   maybeRotate(): boolean {
     const { maxBytes } = this.rotation
