@@ -58,6 +58,19 @@ export const DEFAULT_ROTATION: RotationConfig = {
   lockTimeoutSeconds: AUDIT_DEFAULTS.lockTimeoutSeconds,
 }
 
+/** Stall clock: lets recover the stale-lock timeout on waiters. */
+const START_TIME = Date.now()
+
+/** Liveness probe for a lock holder, without signalling it (EPERM ⇒ alive). */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM'
+  }
+}
+
 export interface AuditRecord {
   /** ISO timestamp */
   ts: string
