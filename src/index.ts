@@ -509,7 +509,7 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
   /* -------------------------------------------------------------- */
 
   let startupHealth: TmHealth | null = null
-  if (config.failClosed) {
+  if (config.failClosed && platformSupported) {
     // Run asynchronously; don't block plugin load. The pre-execute
     // hook will re-check if this hasn't resolved yet.
     getTmHealth(config.protectedPaths)
