@@ -348,13 +348,12 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     ...DEFAULT_CONFIG,
     ...rawConfig,
     protectedPaths: normalizeArray(rawConfig?.protectedPaths, DEFAULT_CONFIG.protectedPaths),
-    // Additive merge (U-18c): the raw value is passed through as-is so that
-    // `undefined` (absent → pure defaults), `[]` (explicit → no additions, or
-    // full disable with replace=true) and a real list stay distinguishable.
+    // Additive merge (U-18c): the raw value is passed through unnormalized so
+    // that `undefined` (absent → pure defaults), `[]` (explicit → no additions,
+    // or full disable with replace=true) and a real list stay distinguishable.
+    // mergeDenyReadPaths validates entry types itself.
     denyReadPaths: mergeDenyReadPaths(
-      Array.isArray(rawConfig?.denyReadPaths)
-        ? rawConfig.denyReadPaths.filter((x): x is string => typeof x === 'string')
-        : undefined,
+      rawConfig?.denyReadPaths,
       normalizeBool(rawConfig?.denyReadPathsReplace, DEFAULT_CONFIG.denyReadPathsReplace),
     ),
     denyReadPathsReplace: normalizeBool(rawConfig?.denyReadPathsReplace, DEFAULT_CONFIG.denyReadPathsReplace),
