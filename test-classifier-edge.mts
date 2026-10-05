@@ -49,6 +49,32 @@ test('empty command: classified as read/Empty without crashing', () => {
   assert.match(c2.reason, /Empty command/)
 })
 
+// U-04 regression: `git count-objects` is a read-only local object-store
+// inspection. It was missing from localGitSubs, so it fell through to
+// vcs_remote and the gate denied the plugin's own gc probe.
+test('U-04: git count-objects is local_git (vcs_local), not vcs_remote', () => {
+  for (const cmd of [
+    'git count-objects -v',
+    'git count-objects -vH',
+    'git count-objects',
+    '/usr/bin/git count-objects -v',
+  ]) {
+    const { c, d } = gate(cmd)
+    assert.equal(c.category, 'vcs_local', `${cmd} must be local git, got ${c.category}`)
+    assert.notEqual(c.category, 'vcs_remote', `${cmd} must not be misjudged as remote`)
+    assert.equal(c.mutates, false, `${cmd} only reads the object store`)
+    assert.equal(d.allow, true, `${cmd} must be allowed (local, read-only)`)
+  }
+})
+
+test('U-04: remote git subcommands still classify as vcs_remote (no over-widening)', () => {
+  for (const cmd of ['git push origin main', 'git clone https://x/repo', 'git fetch --all']) {
+    const { c, d } = gate(cmd)
+    assert.equal(c.category, 'vcs_remote', `${cmd} must stay remote, got ${c.category}`)
+    assert.equal(d.allow, false, `${cmd} must stay denied`)
+  }
+})
+
 test('system commands force-deny', () => {
   for (const cmd of ['reboot', 'launchctl kickstart com.apple.x', 'osascript -e "say hi"']) {
     const { d } = gate(cmd)
