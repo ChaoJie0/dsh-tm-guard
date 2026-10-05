@@ -70,6 +70,23 @@ export interface GitBaselineProbe {
   root: string | null
   /** Whether a `.git` directory is present at (or above) the work tree root. */
   hasGitDir: boolean
+  /** Whether a `git` binary was found at all (false = not installed / not on PATH). */
+  gitAvailable: boolean
+}
+
+/**
+ * Time Machine facts for the report.
+ *
+ * `probed: false` is NOT the same as "TM is unhealthy": on a non-macOS host
+ * there is no tmutil to ask, so the report must say "not applicable" rather
+ * than render an unconfigured destination as a fault the user should chase.
+ */
+export interface TmBaselineFacts {
+  probed: boolean
+  destinationConfigured: boolean
+  healthy: boolean
+  workspaceProtected: boolean
+  unprotectedPaths: string[]
 }
 
 export interface BaselineReportInput {
