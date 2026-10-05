@@ -282,7 +282,7 @@ test('U-08: Data sources reports audit size, rotation generations, reports, .git
     healthyInput({ audit, auditCount: 60, writeCount: 7 }),
   )
   const data = out.slice(out.indexOf('【Data sources】'), out.indexOf('【Recent】'))
-  assert.match(data, /audit\.jsonl\s*:\s*\d+(\.\d+)?\s*[BKMGT]i?B/)
+  assert.match(data, /audit\.jsonl\s*:\s*\d+(\.\d+)?\s*[BKMGT]?(i)?B/)
   assert.match(data, /2 rotation generation\(s\)/)
   assert.match(data, /\.1, \.2/)
   assert.match(data, /60 records across generations \(7 write ops\)/)
