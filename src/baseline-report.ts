@@ -108,10 +108,8 @@ export interface BaselineReportInput {
   failClosed: boolean
   autoApprove: boolean
   requireGitBaseline: boolean
-  /** `tmutil destinationinfo` outcome. */
-  status: { destinationConfigured: boolean }
-  /** Workspace-protection outcome. */
-  health: { healthy: boolean; workspaceProtected: boolean; unprotectedPaths: string[] }
+  /** `tmutil` probe outcome (see TmBaselineFacts). */
+  tm: TmBaselineFacts
   /** Git baseline reachability at the workspace. */
   git: GitBaselineProbe
   /** When the report was generated. */
