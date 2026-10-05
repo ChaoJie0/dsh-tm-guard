@@ -26,12 +26,11 @@
 //
 // Two harness details worth stating, because both encode a decision:
 //
-//   * The workspace is pinned through the `DSH_HOME` fallback that `AuditLog`
-//     already uses, rather than by chdir'ing. apply() resolves `.tm-guard/`
-//     from `process.cwd()` (it is a single-instance object, per design §4.2.2),
-//     so chdir would make the report path depend on ambient cwd; DSH_HOME makes
-//     "which workspace is this?" explicit. No production behaviour is added —
-//     the field was already read by the constructor.
+//   * The workspace under test is selected by chdir'ing into it. There is no
+//     other seam: apply() builds its single `AuditLog` from `process.cwd()`
+//     (design §4.2.2 — one instance, one `.tm-guard/`), and `.tm-guard/` is
+//     where U-27 writes. The suite therefore restores the original cwd after
+//     every test, and `ROOT` keeps the git repo the gate itself resolves.
 //   * `apply()` is called between console capture boundaries, so the report —
 //     which is written synchronously on the first run — is asserted directly
 //     rather than raced against a promise.
@@ -79,7 +78,6 @@ function sleep(ms: number): Promise<void> {
 }
 
 let ORIG_CWD = ''
-let ORIG_DSH_HOME: string | undefined
 let ROOT = ''
 let seq = 0
 
@@ -144,17 +142,16 @@ function logCapture() {
  * Fully synchronous: the first-run report is written before apply() returns.
  */
 function applyIn(workspace: string, platform: string, config: Record<string, unknown> = {}) {
-  const restore = stubPlatform(platform)
-  const saved = process.env.DSH_HOME
-  process.env.DSH_HOME = workspace
+  const restorePlatform = stubPlatform(platform)
+  const savedCwd = process.cwd()
+  process.chdir(workspace)
   try {
     const m = mockCtx()
     apply(m.ctx as any, { protectedPaths: [workspace], ...config } as any)
     return m
   } finally {
-    if (saved === undefined) delete process.env.DSH_HOME
-    else process.env.DSH_HOME = saved
-    restore()
+    process.chdir(savedCwd)
+    restorePlatform()
   }
 }
 
@@ -162,9 +159,25 @@ function reportOf(workspace: string): string {
   return join(workspace, '.tm-guard', BASELINE_REPORT_FILE)
 }
 
+/**
+ * Wait until the asynchronous TM refinement has replaced the placeholder.
+ * The report itself is written synchronously (that is the point of U-27's
+ * first-run contract); only section 1 is filled in later.
+ */
+async function waitForTmSection(report: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      if (/TM 已配置|TM 不适用|TM 探测未完成/.test(readFileSync(report, 'utf8'))) return
+    } catch {
+      // Not written yet.
+    }
+    await sleep(20)
+  }
+}
+
 before(() => {
   ORIG_CWD = process.cwd()
-  ORIG_DSH_HOME = process.env.DSH_HOME
   ROOT = mkdtempSync(join(tmpdir(), 'tm-baseline-root-'))
   execSync(`git init -q ${ROOT} && git -C ${ROOT} config user.email t@t && git -C ${ROOT} config user.name t`)
   execSync(`echo base > ${join(ROOT, 'base.txt')} && git -C ${ROOT} add -A && git -C ${ROOT} commit -qm baseline`)
@@ -186,8 +199,6 @@ after(() => {
   __setExecOverride(null)
   __setGitOverride(null)
   process.chdir(ORIG_CWD)
-  if (ORIG_DSH_HOME === undefined) delete process.env.DSH_HOME
-  else process.env.DSH_HOME = ORIG_DSH_HOME
   rmSync(ROOT, { recursive: true, force: true })
 })
 
@@ -236,9 +247,12 @@ test('U-27a: the report carries all six section headings, in order', () => {
   planCleanup(ws)
 })
 
-test('U-27a: the report states the probe facts and the README risk list', () => {
+test('U-27a: the report states the probe facts and the README risk list', async () => {
   const ws = workspace()
   applyIn(ws, 'darwin')
+  // The file exists the instant apply() returns; the TM section is filled in by
+  // the detached tmutil probe, so wait for that refinement before reading it.
+  await waitForTmSection(reportOf(ws))
   const md = readFileSync(reportOf(ws), 'utf8')
 
   // (a) TM configured — the healthy fixture reports a destination.
@@ -442,10 +456,17 @@ test('U-27c: non-macOS probing never shells out to tmutil', () => {
 /* Read-only + fail-open invariants                                    */
 /* ------------------------------------------------------------------ */
 
-test('U-27: generating the report does not touch git (read-only probe)', () => {
+test('U-27: generating the report does not touch git (read-only probe)', async () => {
   const ws = workspace()
-  const headBefore = execSync('git -C . rev-parse HEAD', { encoding: 'utf8' }).trim()
-  const statusBefore = execSync('git -C . status --porcelain', { encoding: 'utf8' })
+  // The regression check below compares `git status` before/after, which only
+  // means anything in a real repository — so make the workspace one, the way a
+  // user's project would be. (The report itself must not depend on this.)
+  execSync(`git init -q ${ws} && git -C ${ws} config user.email t@t && git -C ${ws} config user.name t`)
+  writeFileSync(join(ws, 'base.txt'), 'base\n', 'utf8')
+  execSync('git add -A && git commit -qm baseline', { cwd: ws })
+  // The probe runs with cwd = ws, so pin that directory's git state.
+  const headBefore = execSync('git rev-parse HEAD', { cwd: ws, encoding: 'utf8' }).trim()
+  const statusBefore = execSync('git status --porcelain', { cwd: ws, encoding: 'utf8' })
   const gitCalls: string[] = []
   __setGitOverride(async (args: string[]) => {
     gitCalls.push(args.join(' '))
@@ -462,24 +483,25 @@ test('U-27: generating the report does not touch git (read-only probe)', () => {
     assert.match(call, /^rev-parse/, `the baseline probe must stay read-only, saw: ${call}`)
   }
   assert.deepEqual(gitCalls, ['rev-parse --show-toplevel'], 'exactly one read-only git probe expected')
-  assert.equal(execSync('git -C . rev-parse HEAD', { encoding: 'utf8' }).trim(), headBefore, 'HEAD moved')
-  assert.equal(execSync('git -C . status --porcelain', { encoding: 'utf8' }), statusBefore, 'work tree changed')
+  assert.equal(execSync('git rev-parse HEAD', { cwd: ws, encoding: 'utf8' }).trim(), headBefore, 'HEAD moved')
+  assert.equal(execSync('git status --porcelain', { cwd: ws, encoding: 'utf8' }), statusBefore, 'work tree changed')
   planCleanup(ws)
 })
 
-test('U-27: the only file written into the workspace is the report itself', () => {
+test('U-27: the probe writes nothing but the report into the workspace', () => {
   const ws = workspace()
-  const before = readdirSync(join(ROOT, '.tm-guard')).sort()
+  // Everything the gate writes lives in the cwd's `.tm-guard/`, so record it
+  // first: the baseline probe must add exactly one file — the report — and no
+  // snapshot, no reports/ entry, no state.json.
+  const before = readdirSync(join(ws, '.tm-guard')).sort()
   applyIn(ws, 'darwin')
   assert.ok(existsSync(reportOf(ws)), 'report not written')
-  // No snapshots, no reports/ entries, no state.json — and the cwd workspace
-  // the gate's own audit log lives in is untouched.
+  assert.deepEqual(before, [], 'the workspace starts empty (audit.jsonl is created lazily)')
   assert.deepEqual(
     readdirSync(join(ws, '.tm-guard')).sort(),
     [BASELINE_REPORT_FILE],
     'the baseline probe must write nothing but the report',
   )
-  assert.deepEqual(readdirSync(join(ROOT, '.tm-guard')).sort(), before, 'cwd .tm-guard changed')
   planCleanup(ws)
 })
 
