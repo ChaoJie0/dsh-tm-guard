@@ -163,26 +163,29 @@ test('U-02b: 300 old reports are pruned down to reportsRetainCount (200)', () =>
 })
 
 test('U-02b: count and age are ANDed — stale files inside the newest N are kept', () => {
-  // 250 files. Newest-first ranking: ranks 200..249 are the newest 50, ranks
-  // 0..199 are the rest. Make the OLDEST 100 stale and everything else fresh.
-  // Ranks 0..99 (stale) are beyond rank 200 AND old → deleted.
-  // Ranks 100..199 (fresh) are beyond rank 200 but NOT old → kept.
-  // Ranks 200..249 are inside the count window → kept regardless of age.
+  // 250 files: the OLDEST 100 are stale (90d), the newest 150 are fresh (1d).
+  // Ranks are newest-first, so the stale files occupy ranks 150..249 and the
+  // fresh ones ranks 0..149.
+  //   ranks   0..149  fresh, beyond nothing relevant  → kept (fresh)
+  //   ranks 150..199  stale but INSIDE the newest 200 → kept (count protects)
+  //   ranks 200..249  stale AND beyond the newest 200 → deleted
+  // The 50 kept at ranks 150..199 are the point of the intersection: an OR
+  // rule would have deleted all 100 stale files.
   mkdirSync(reportsDir(), { recursive: true })
   const now = Date.now()
   for (let i = 0; i < 250; i++) {
     const p = join(reportsDir(), `turn-x-${String(i).padStart(3, '0')}.md`)
     writeFileSync(p, 'x\n', 'utf8')
-    // Rank order follows mtime ascending, so i is also the rank from the
-    // bottom. Offset by seconds only, so the stale/fresh split (90d vs 1d)
-    // stays far from the 30-day cutoff no matter how many files there are.
     const ageDays = i < 100 ? 90 : 1
     const t = (now - ageDays * DAY_MS + i * 1000) / 1000
     utimesSync(p, t, t)
   }
   const res = pruneReports(reportsDir(), { retainCount: 200, retainDays: 30 })
-  assert.equal(res.deleted.length, 100, 'exactly the stale files beyond rank 200 go')
-  assert.equal(res.kept.length, 150)
+  assert.equal(res.deleted.length, 50, 'only stale files beyond the newest 200 go')
+  assert.equal(res.kept.length, 200)
+  // Nothing fresh may ever be deleted, and the newest 200 always survive.
+  assert.equal(res.deleted.includes('turn-x-249.md'), false, 'newest file must survive')
+  assert.equal(res.deleted.includes('turn-x-150.md'), false, 'stale-but-recent file must survive')
 })
 
 test('U-02b: a stale file INSIDE the retain count survives (AND semantics, not OR)', () => {
