@@ -8,6 +8,7 @@
  * Extension points used:
  *   - tools/pre-execute  : permission gate (allow/deny) + audit logging
  *   - ctx.tools.register : tm_snapshot / tm_rollback / tm_audit / tm_status
+ *                          / tm_git_bloat (read-only .git diagnosis)
  *   - ctx.systemPrompt   : injects operating-mode guidance + workflow
  *
  * Features (v0.1.0):
