@@ -159,6 +159,7 @@ Anything unrecognized is denied by default (conservative). For locally executed 
 | `tm_status` | Print TM health/destination/snapshot count, workspace protection, gate policy, and audit-log stats. |
 | `tm_backup` | Start a backup to the configured TM disk; background by default, `wait=true` blocks for a browsable restore point. |
 | `tm_backup_status` | Show whether a backup is running, percent complete, and current phase. |
+| `tm_git_bloat` | **Read-only** diagnosis of what makes a `.git` large: ranks the biggest reachable blobs with path, size, and the commit that introduced each. Never rewrites history — cleanup is a manual decision (see [Diagnosing .git bloat](#diagnosing-git-bloat)). |
 
 ---
 
