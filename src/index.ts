@@ -44,6 +44,12 @@ import {
 } from './classifier.ts'
 import { scanCommandForEgress } from './scan-scripts.ts'
 import { AuditLog } from './audit.ts'
+import {
+  readState,
+  writeState,
+  resolveWatermark,
+  watermarkOf,
+} from './state.ts'
 import { ensureGitBaseline, commitCheckpoint } from './git.ts'
 import { buildTurnReport } from './report.ts'
 import { verifyTurn } from './verify.ts'
