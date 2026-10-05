@@ -161,6 +161,29 @@ Anything unrecognized is denied by default (conservative). For locally executed 
 | `tm_backup_status` | Show whether a backup is running, percent complete, and current phase. |
 | `tm_git_bloat` | **Read-only** diagnosis of what makes a `.git` large: ranks the biggest reachable blobs with path, size, and the commit that introduced each. Never rewrites history — cleanup is a manual decision (see [Diagnosing .git bloat](#diagnosing-git-bloat)). |
 
+### Diagnosing .git bloat
+
+A repository that has been running for a while accumulates large blobs — datasets, tarballs, build output committed by mistake. Deleting such a file in a later commit frees **nothing**: the blob stays reachable in history, so every clone and fetch keeps paying for it. `tm_git_bloat` answers the three questions needed to act on that:
+
+1. Which blobs are the biggest? (`git rev-list --objects --all` piped into `git cat-file --batch-check`)
+2. Where do they live? (the path recorded next to the blob)
+3. Which commit introduced them? (`git log --find-object <oid>`)
+
+It accepts `top` (default 20, max 100) and `path` (a directory inside the repository; defaults to the workspace cwd), and prints a table of rank / size / path / introducing commit. Running it outside a git repository returns an explanatory message rather than an error.
+
+> **This tool is strictly read-only.** It never runs `rm`, `mv`, `gc`, `prune`, `filter-repo`, or BFG, and never rewrites history. Actually shrinking a repository is a destructive, history-rewriting operation — it invalidates every existing clone and commit hash, and requires a force-push — so it must be a deliberate human decision. `tm_git_bloat` diagnoses; it does not clean up.
+
+### Auto-approval and its blast radius
+
+When `autoApprove` is `true` (the default), the plugin answers DSH approval requests with `allowed-once` on your behalf — that is what makes unattended runs prompt-free. The safety argument for this is narrow and worth stating plainly:
+
+- The `tools/pre-execute` gate is registered with **`prepend`**, so it classifies and denies *before* any other listener can raise an approval `ask`. Only operations that already passed the gate reach the approval stage.
+- If another permission plugin registers earlier in the waterfall, or bypasses the gate entirely, an operation could reach that stage **without** having been checked — and it would still be auto-approved. This plugin cannot verify the ordering of plugins it does not control.
+
+For that reason the plugin prints a startup warning whenever `autoApprove` is `true`, telling you to check the ordering if you run it alongside other permission plugins. Set `autoApprove: false` to let approval asks reach the user (or fail closed) instead.
+
+There is one combination with **no backstop at all**: `failClosed: false` (writes are no longer blocked when no rollback net exists) together with `autoApprove: true` (the human prompt that would have caught it is auto-answered). The plugin warns specifically about this pair at startup. Keep `failClosed: true` unless you have a deliberate reason not to.
+
 ---
 
 ## Configuration
