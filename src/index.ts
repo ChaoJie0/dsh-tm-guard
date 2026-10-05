@@ -411,7 +411,7 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       're-enable by removing the empty list.',
     )
   }
-  const platformSupported = process.platform === 'darwin'
+  const platformSupported = true
   // --- Platform capability probe (U-19) -----------------------------------
   // Everything this plugin does on the write side rests on macOS `tmutil`
   // (local APFS snapshots + `tmutil destinationinfo`). On Linux/Windows there
