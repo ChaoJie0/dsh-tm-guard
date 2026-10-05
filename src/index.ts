@@ -669,11 +669,11 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
   /* Feedback layer 1: turn completion reports                       */
   /* -------------------------------------------------------------- */
 
-  // Track how many audit records have already been consumed by previous
-  // reports so each report covers exactly one turn's activity. Initialized to
-  // the record count already on disk at boot so a restarted harness does not
-  // fold pre-restart history into the first report.
-  let lastReportedCount = audit.readAll().length
+  // Watermark marking the last audit record already folded into a turn
+  // report, persisted to .tm-guard/state.json. Deliberately NOT an array
+  // index: `slice(length)` breaks silently as soon as the log rotates or is
+  // trimmed (skipped reports, then duplicate reports). See src/state.ts.
+  let state = readState(audit.dirPath)
 
   ctx.on(
     'agent/turn-stopping',
@@ -681,15 +681,31 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       if (!config.turnReports) return
       try {
         const all = audit.readAll()
-        const activity = all.slice(lastReportedCount)
-        lastReportedCount = all.length
+        const { activity, watermarkLost } = resolveWatermark(
+          all,
+          state.reportWatermark,
+        )
+        if (watermarkLost) {
+          console.warn(
+            '[tm-guard] Report watermark is older than the retained audit window ' +
+            '(rotated/cleared) — the next report may repeat history once.',
+          )
+        }
 
         // Plugin self-test / boot records (explicit-allow) are noise here;
         // report only real gate decisions.
         const real = activity.filter(
           (r) => r.decision === 'allow' || r.decision === 'deny',
         )
-        if (real.length === 0) return
+        if (real.length === 0) {
+          // Nothing to report, but still advance the watermark past any
+          // non-decision noise so it cannot accumulate unboundedly.
+          if (activity.length > 0) {
+            state = { ...state, reportWatermark: watermarkOf(all) }
+            writeState(audit.dirPath, state)
+          }
+          return
+        }
 
         // Best-effort environment context (failures are non-fatal).
         let gitStatus = ''
