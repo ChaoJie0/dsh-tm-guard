@@ -539,7 +539,7 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     // reused by the refinement below — a probe is a subprocess, and re-running
     // it a tick later would make the report's two halves describe two different
     // moments for no reason.
-    const facts = {
+    const baseFacts = {
       platform: process.platform,
       platformSupported,
       workspace: process.cwd(),
@@ -552,7 +552,7 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       git: collectSyncBaselineFacts(process.cwd()).git,
     }
     const result = ensureBaselineReport(audit.dirPath, {
-      ...facts,
+      ...baseFacts,
       tm: UNPROBED_TM,
       generatedAt: new Date(),
     })
