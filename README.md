@@ -236,6 +236,47 @@ Example — your profile's `cordis.patch.yml` (the shipped bundle itself inserts
 
 ---
 
+## Sensitive paths
+
+`denyReadPaths` is a list of **prefixes**. Every entry matches the path itself and everything beneath it, so `~/.ssh` covers `~/.ssh/id_rsa`, `~/.ssh/config` and so on. A match denies the operation whether the path is being read *or* written — the list protects credentials from being overwritten, not just read.
+
+The built-in list ships with the plugin (source of truth: `src/sensitive-paths.ts`, exported as `DEFAULT_SENSITIVE_PATHS`):
+
+| Group | Paths | What it protects |
+|---|---|---|
+| Cloud & shell credentials | `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.config` | Private keys, cloud CLI credentials and SSO token caches, GPG keyrings, kubeconfig bearer tokens, registry auth, plaintext HTTPS tokens. `~/.config` is the XDG base directory (`gh`, `gcloud`, `heroku`, …). |
+| Agent & CLI credentials | `~/.config/gh/hosts.yml`, `~/.cursor`, `~/.codex`, `~/.claude.json`, `~/.claude`, `~/.gemini`, `~/.aider.conf.yml`, `~/.continue` | Credential stores belonging to the agent/CLI tools this plugin runs alongside — the GitHub CLI OAuth token, and the auth/session state of the Cursor, Codex, Claude Code, Gemini, Aider and Continue tooling. These are long-lived tokens for *other* execution surfaces, so an autonomous agent reading them widens its own blast radius. |
+| Platform keystores | `~/Library/Keychains`, `~/Library/Cookies` | The macOS login/System keychain databases and browser session cookies. |
+
+### Adding your own paths (additive by default)
+
+`config.denyReadPaths` is **appended** to the built-in list, so a profile can add a project-specific secret location without weakening anything:
+
+```yaml
+- insert:
+    - id: tm-guard
+      name: dsh-tm-guard
+      config:
+        denyReadPaths:
+          - '~/work/private-credentials'   # added to the defaults above
+```
+
+This is deliberate. The earlier semantics replaced the whole list, so a profile that appended one path silently dropped *every* cloud and agent credential entry — a fail-open change disguised as a small config tweak.
+
+To replace the list outright (e.g. you curate the set yourself and want a narrower policy), set `denyReadPathsReplace: true`. The plugin then names every dropped default in a startup warning, because losing them is exactly the kind of change that should never be silent:
+
+```yaml
+      config:
+        denyReadPathsReplace: true
+        denyReadPaths:
+          - '~/.ssh'
+          - '~/.aws'
+```
+
+`denyReadPaths: []` with `denyReadPathsReplace: true` disables the restriction entirely. That is a documented opt-out — reads are then unrestricted, including of private keys, so it is only appropriate on a disposable machine with no real credentials.
+
+---
+
 ## Limitations & honest scope
 
 Please read this before trusting the plugin. It raises the bar for unattended runs; it is not a proof of isolation.
