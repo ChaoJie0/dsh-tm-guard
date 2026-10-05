@@ -211,8 +211,14 @@ export class AuditLog {
    * where `.i` is briefly missing (design §4.2.1 "步骤原子性").
    */
   rotate(): boolean {
+    // Mark the in-flight window so a re-entrant call from this same process is
+    // distinguishable from an unrelated holder that recorded our pid.
+    ROTATION_IN_FLIGHT = true
     const unlock = this.acquireLock()
-    if (!unlock) return false // another process is rotating
+    if (!unlock) {
+      ROTATION_IN_FLIGHT = false
+      return false // another process is rotating
+    }
     try {
       return this.rotateLocked()
     } catch (err) {
@@ -220,6 +226,7 @@ export class AuditLog {
       return false
     } finally {
       unlock()
+      ROTATION_IN_FLIGHT = false
     }
   }
 
