@@ -244,7 +244,7 @@ The built-in list ships with the plugin (source of truth: `src/sensitive-paths.t
 
 | Group | Paths | What it protects |
 |---|---|---|
-| Cloud & shell credentials | `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.config` | Private keys, cloud CLI credentials and SSO token caches, GPG keyrings, kubeconfig bearer tokens, registry auth, plaintext HTTPS tokens. `~/.config` is the XDG base directory (`gh`, `gcloud`, `heroku`, …). |
+| Cloud & shell credentials | `~/.ssh`, `~/.ssh/config`, `~/.aws`, `~/.aws/credentials`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.config` | Private keys, cloud CLI credentials and SSO token caches, GPG keyrings, kubeconfig bearer tokens, registry auth, plaintext HTTPS tokens. `~/.config` is the XDG base directory (`gh`, `gcloud`, `heroku`, …). |
 | Agent & CLI credentials | `~/.config/gh/hosts.yml`, `~/.cursor`, `~/.codex`, `~/.claude.json`, `~/.claude`, `~/.gemini`, `~/.aider.conf.yml`, `~/.continue` | Credential stores belonging to the agent/CLI tools this plugin runs alongside — the GitHub CLI OAuth token, and the auth/session state of the Cursor, Codex, Claude Code, Gemini, Aider and Continue tooling. These are long-lived tokens for *other* execution surfaces, so an autonomous agent reading them widens its own blast radius. |
 | Platform keystores | `~/Library/Keychains`, `~/Library/Cookies` | The macOS login/System keychain databases and browser session cookies. |
 
