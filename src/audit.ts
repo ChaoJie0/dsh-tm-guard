@@ -82,35 +82,303 @@ export interface AuditRecord {
 export class AuditLog {
   private logPath: string
   private dir: string
+  private rotation: RotationConfig
+  /** Set once a rotation has been performed; surfaced for status/diagnostics. */
+  private rotatedCount = 0
 
-  constructor(workspaceDir?: string) {
+  constructor(workspaceDir?: string, rotation?: Partial<RotationConfig>) {
     const base = workspaceDir ?? process.env.DSH_HOME ?? process.cwd()
     this.dir = join(base, '.tm-guard')
     this.logPath = join(this.dir, 'audit.jsonl')
+    this.rotation = { ...DEFAULT_ROTATION, ...rotation }
     try {
       if (!existsSync(this.dir)) {
         mkdirSync(this.dir, { recursive: true })
       }
     } catch {
-      // Fall back to /tmp if workspace is read-only
+      // Fall back to /tmp if workspace is read-only.
+      //
+      // ⚠️ /tmp/.tm-guard is a SHARED directory: several sessions (possibly
+      // different users) can end up on the same audit.jsonl and the same
+      // .rotate.lock. The lock therefore records pid+uid+start-time and is only
+      // reclaimed when the holder is provably gone — see acquireLock().
       this.dir = '/tmp/.tm-guard'
       this.logPath = join(this.dir, 'audit.jsonl')
       if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true })
     }
   }
 
-  /** Append a record to the audit log. */
+  /**
+   * Append a record to the audit log, rotating first if the current file has
+   * grown past `auditMaxBytes`.
+   *
+   * SINGLE-INSTANCE CONSTRAINT (design §4.2.2): rotation operates on
+   * `this.logPath`, the path captured at construction. Rotation and `record()`
+   * must therefore run through the *same* `AuditLog` instance; a second
+   * instance with a different resolved directory would rotate one file while
+   * appends land in another.
+   *
+   * ORDER: rotate BEFORE the append, not after. Rotating after the append would
+   * push the just-written record into `.1`, so `readAll()` would still see it —
+   * but the size check would then re-trigger on every subsequent write once the
+   * file sits just above the threshold, turning a rare maintenance step into a
+   * per-write IO burst. Rotating first keeps the trigger low-frequency (design
+   * §1.3 "check size, rotate only when exceeded").
+   */
   record(entry: Omit<AuditRecord, 'ts'>): void {
     const record: AuditRecord = {
       ts: new Date().toISOString(),
       ...entry,
     }
     try {
+      this.maybeRotate()
       appendFileSync(this.logPath, JSON.stringify(record) + '\n', 'utf8')
     } catch (err) {
       console.warn('[tm-guard] Failed to write audit log:', err)
     }
   }
+
+  /* ---------------------------------------------------------------- */
+  /* Rotation (design §4.2.1 / §4.3)                                   */
+  /* ---------------------------------------------------------------- */
+
+  /** Size of the current log in bytes, or 0 when absent/unreadable. */
+  private currentSize(): number {
+    try {
+      return statSync(this.logPath).size
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * Rotate when the current file has reached `maxBytes`.
+   *
+   * Strictly `>` threshold, not `>=`: a file of exactly `auditMaxBytes` is
+   * already within budget, and rotating it would produce an empty current file
+   * plus an identical-sized `.1` for no gain.
+   */
+  maybeRotate(): boolean {
+    const { maxBytes } = this.rotation
+    if (!(maxBytes > 0)) return false // 0 / negative disables rotation
+    if (this.currentSize() <= maxBytes) return false
+    return this.rotate()
+  }
+
+  /**
+   * Force one rotation, ignoring the size threshold. Returns true on success.
+   *
+   * The whole procedure is a single synchronous block — no `await` anywhere —
+   * so a same-process `readAll()` can never observe the intermediate state
+   * where `.i` is briefly missing (design §4.2.1 "步骤原子性").
+   */
+  rotate(): boolean {
+    const unlock = this.acquireLock()
+    if (!unlock) return false // another process is rotating
+    try {
+      return this.rotateLocked()
+    } catch (err) {
+      console.warn('[tm-guard] Audit rotation failed:', err)
+      return false
+    } finally {
+      unlock()
+    }
+  }
+
+  /**
+   * The rotation steps, in the order fixed by design §4.2.1 (the B2 fix).
+   *
+   * ⚠️ ORDER IS LOAD-BEARING. `rename` overwrites its destination, so the
+   * shift MUST complete before `.1` is written. Writing `.1` first (the v1
+   * order) destroys the previous generation before it can be shifted to `.2`,
+   * costing one generation of history on every single rotation and leaving a
+   * hole in the `.N` sequence.
+   */
+  private rotateLocked(): boolean {
+    const { retainFiles, totalMaxBytes } = this.rotation
+    if (!(retainFiles >= 1)) return false
+
+    // Bail out before touching anything when there is nothing to rotate.
+    let content: string
+    try {
+      content = readFileSync(this.logPath, 'utf8')
+    } catch {
+      return false
+    }
+    if (content.length === 0) return false
+
+    // --- Step 1: shift old generations, oldest first ------------------
+    // Drop the generation that would fall outside the retention window, then
+    // walk backwards so no rename can clobber a not-yet-shifted file.
+    this.unlinkIfExists(this.rotatedPath(retainFiles))
+    for (let i = retainFiles - 1; i >= 1; i--) {
+      const from = this.rotatedPath(i)
+      if (!existsSync(from)) continue
+      renameSync(from, this.rotatedPath(i + 1))
+    }
+
+    // --- Steps 3-5: current content → .1.tmp → fsync → rename .1 ------
+    // `.1` is now provably free, so this rename cannot destroy history.
+    const tmp = `${this.logPath}.1.tmp`
+    this.unlinkIfExists(tmp)
+
+    // INTEGRAL-LINE INVARIANT (design §4.1, B3): `content` is whatever was
+    // read in full, never a byte-offset slice, and `parse()` tolerates a torn
+    // trailing line. A crash-residue half line therefore survives verbatim in
+    // `.1` and stays individually un-parseable — it can never cause a *valid*
+    // neighbouring line to be truncated away.
+    writeFileSync(tmp, content, 'utf8')
+    const fd = openSync(tmp, 'r+')
+    try {
+      fsyncSync(fd) // durability before the rename makes .1 visible
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(tmp, this.rotatedPath(1))
+
+    // --- Step 6: truncate in place -----------------------------------
+    // truncate (not unlink+create) keeps the inode: a concurrent holder of the
+    // old append fd keeps writing to the same file, and post-truncate appends
+    // land cleanly in the emptied file instead of a rotated-away one.
+    truncateSync(this.logPath, 0)
+
+    this.rotatedCount++
+    this.enforceTotalLimit(totalMaxBytes)
+    return true
+  }
+
+  /**
+   * Total-size backstop (design §4.3). `auditRetainFiles` is the *predictable*
+   * window control; this ceiling only exists for abnormal shapes (a generation
+   * far past `maxBytes`, or an oversized file from before rotation was
+   * enabled). With the default 100 MiB vs. 5 × 10 MiB it should not fire in
+   * steady state.
+   */
+  private enforceTotalLimit(totalMaxBytes: number): void {
+    if (!(totalMaxBytes > 0)) return
+    const oldestFirst = (): { path: string; size: number; gen: number }[] => {
+      const out: { path: string; size: number; gen: number }[] = []
+      for (let i = MAX_ROTATED_FILES; i >= 1; i--) {
+        const p = this.rotatedPath(i)
+        try {
+          out.push({ path: p, size: statSync(p).size, gen: i })
+        } catch {
+          // not present
+        }
+      }
+      return out
+    }
+    let total = this.currentSize() + oldestFirst().reduce((n, f) => n + f.size, 0)
+    if (total <= totalMaxBytes) return
+    // Delete from the oldest generation inward, never the current file: the
+    // live log is the only copy of the newest records.
+    for (const f of oldestFirst()) {
+      if (total <= totalMaxBytes) break
+      try {
+        rmSync(f.path, { force: true })
+        total -= f.size
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private rotatedPath(gen: number): string {
+    return `${this.logPath}.${gen}`
+  }
+
+  private unlinkIfExists(path: string): void {
+    try {
+      rmSync(path, { force: true })
+    } catch {
+      // ignore
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Cross-process rotation lock (design §4.2.3)                       */
+  /* ---------------------------------------------------------------- */
+
+  private get lockPath(): string {
+    // Follows the audit directory, so the read-only fallback locks
+    // /tmp/.tm-guard/.rotate.lock rather than the workspace.
+    return join(this.dir, '.rotate.lock')
+  }
+
+  /**
+   * Take the rotation lock, or return null when another live holder owns it.
+   *
+   * The payload is `pid:uid:startTimeMs`. A lock whose pid no longer exists —
+   * or whose holder started after the lock was written, meaning the pid was
+   * recycled — is stale and gets reclaimed. The timeout is a second, coarser
+   * backstop for a holder that is alive but wedged.
+   *
+   * Residual risk, stated rather than hidden: on the shared `/tmp/.tm-guard`
+   * fallback path this lock is global, and a rotation started by another
+   * session between our staleness check and our `openSync(..., 'wx')` could
+   * still interleave. The lock narrows that window; it does not erase it.
+   */
+  private acquireLock(): (() => void) | null {
+    const deadline = Date.now() + 2000
+    for (;;) {
+      try {
+        // 'wx' = O_CREAT|O_EXCL: atomic across processes.
+        const fd = openSync(this.lockPath, 'wx')
+        try {
+          writeSync(fd, `${process.pid}:${process.getuid?.() ?? -1}:${START_TIME}\n`)
+        } finally {
+          closeSync(fd)
+        }
+        return () => this.unlinkIfExists(this.lockPath)
+      } catch {
+        if (this.reclaimIfStale()) continue
+        if (Date.now() >= deadline) return null
+        // Brief spin: the holder is a synchronous block, so this is short.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+      }
+    }
+  }
+
+  /** Remove the lock file if its holder is gone. Returns true if removed. */
+  private reclaimIfStale(): boolean {
+    let stat: { mtimeMs: number }
+    let raw: string
+    try {
+      stat = statSync(this.lockPath)
+      raw = readFileSync(this.lockPath, 'utf8')
+    } catch {
+      return false // vanished on its own — retry the create
+    }
+
+    const [pidStr, uidStr, startStr] = raw.trim().split(':')
+    const pid = Number(pidStr)
+    const uid = Number(uidStr)
+    const start = Number(startStr)
+    const mine = (process.getuid?.() ?? -1) === uid
+    let stale = false
+
+    if (!Number.isFinite(pid) || pid <= 0) {
+      stale = true // unreadable payload (truncated write / foreign tool)
+    } else if (pid === process.pid) {
+      stale = true // we already hold it; a re-entrant call must not deadlock
+    } else if (mine && !isProcessAlive(pid)) {
+      stale = true
+    } else if (Number.isFinite(start) && mine && start > stat.mtimeMs) {
+      stale = true // pid recycled: holder started after the lock was taken
+    } else if (Date.now() - stat.mtimeMs > this.rotation.lockTimeoutSeconds * 1000) {
+      // Wedged-but-alive holder: the timeout is the only escape hatch. Not
+      // restricted to our own uid, matching the design's 60s rule.
+      stale = true
+    }
+
+    if (!stale) return false
+    this.unlinkIfExists(this.lockPath)
+    return true
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Reads                                                             */
+  /* ---------------------------------------------------------------- */
 
   /** Parse one JSONL payload into records, skipping blank/corrupt lines. */
   private static parse(content: string): AuditRecord[] {
