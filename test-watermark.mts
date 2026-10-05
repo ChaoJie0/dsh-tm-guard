@@ -147,10 +147,8 @@ test('U-03: watermark persists to state.json after a report', async () => {
     assert.ok(existsSync(statePath()), 'state.json must be created')
     const st = readState(join(ROOT, '.tm-guard'))
     assert.ok(st.reportWatermark, 'watermark must be recorded')
-    const all = [rec()]
     assert.equal(typeof st.reportWatermark!.ts, 'string')
     assert.equal(typeof st.reportWatermark!.tool, 'string')
-    void all
   } finally { __setExecOverride(null) }
 })
 
