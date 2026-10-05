@@ -62,7 +62,7 @@ import {
   type BaselineReportInput,
 } from './src/baseline-report.ts'
 import { __setExecOverride } from './src/tm.ts'
-import { __setGitOverride } from './src/git.ts'
+import { __setGitOverride, __setGitSyncOverride } from './src/git.ts'
 
 const REAL_PLATFORM = process.platform
 
@@ -200,6 +200,7 @@ before(() => {
 after(() => {
   __setExecOverride(null)
   __setGitOverride(null)
+  __setGitSyncOverride(null)
   process.chdir(ORIG_CWD)
   rmSync(ROOT, { recursive: true, force: true })
 })
@@ -470,21 +471,25 @@ test('U-27: generating the report does not touch git (read-only probe)', async (
   const headBefore = execSync('git rev-parse HEAD', { cwd: ws, encoding: 'utf8' }).trim()
   const statusBefore = execSync('git status --porcelain', { cwd: ws, encoding: 'utf8' })
   const gitCalls: string[] = []
-  __setGitOverride(async (args: string[]) => {
-    gitCalls.push(args.join(' '))
-    return ''
+  // The U-27 probe is synchronous (the report must exist when apply() returns),
+  // so it is observed through the sync seam rather than the async one.
+  __setGitSyncOverride((dir) => {
+    gitCalls.push(`rev-parse --show-toplevel (cwd=${dir})`)
+    return { gitAvailable: true, root: dir }
   })
   try {
     applyIn(ws, 'darwin')
   } finally {
-    __setGitOverride(null)
+    __setGitSyncOverride(null)
   }
   assert.ok(existsSync(reportOf(ws)), 'report not written')
   // Only query subcommands — never init/add/commit.
   for (const call of gitCalls) {
     assert.match(call, /^rev-parse/, `the baseline probe must stay read-only, saw: ${call}`)
   }
-  assert.deepEqual(gitCalls, ['rev-parse --show-toplevel'], 'exactly one read-only git probe expected')
+  // Exactly one probe per apply(): the refinement reuses the sync facts rather
+  // than re-measuring. Two probes would also mean two different moments.
+  assert.equal(gitCalls.length, 1, `exactly one read-only git probe expected, got: ${JSON.stringify(gitCalls)}`)
   assert.equal(execSync('git rev-parse HEAD', { cwd: ws, encoding: 'utf8' }).trim(), headBefore, 'HEAD moved')
   assert.equal(execSync('git status --porcelain', { cwd: ws, encoding: 'utf8' }), statusBefore, 'work tree changed')
   planCleanup(ws)

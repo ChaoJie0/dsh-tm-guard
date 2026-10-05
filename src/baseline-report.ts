@@ -30,8 +30,8 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { execFileSync } from 'node:child_process'
 import { getTmStatus, getTmHealth } from './tm.ts'
+import { probeGitSync } from './git.ts'
 
 /** File name of the first-run report, relative to `.tm-guard/`. */
 export const BASELINE_REPORT_FILE = 'baseline-report.md'
@@ -128,30 +128,13 @@ function yesNo(ok: boolean, yes = 'YES ✅', no = 'NO ⚠️'): string {
 /**
  * Probe whether a git baseline can be built at `dir` — WITHOUT building it.
  *
- * `git rev-parse --show-toplevel` is a pure read: it reports the work tree
- * root (or exits non-zero outside a repo). We use it instead of `repoRoot()`
- * from git.ts for one reason: the installer-shaped failure ("git is not
- * installed") and the ordinary failure ("this is not a repository yet") must
- * be distinguishable in the report, and `repoRoot` collapses both into `null`.
- * Never throws; a probe that cannot run is reported as such.
+ * The actual subprocess lives in git.ts (`probeGitSync`) so that the one
+ * read-only git command in this plugin shares the module's test seam. This
+ * wrapper only adds the `.git`-presence check and shapes the result for the
+ * report. Never throws.
  */
 export function probeGitBaseline(dir: string): GitBaselineProbe {
-  let gitAvailable = false
-  let root: string | null = null
-  try {
-    const probe = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-      cwd: dir,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 10_000,
-    }).trim()
-    gitAvailable = true
-    root = probe || null
-  } catch (err) {
-    // Non-zero exit still proves git ran and answered; ENOENT does not.
-    const code = (err as { code?: unknown })?.code
-    gitAvailable = code !== 'ENOENT'
-  }
+  const { gitAvailable, root } = probeGitSync(dir)
   const gitDir = root ?? dir
   return {
     repo: root !== null,
