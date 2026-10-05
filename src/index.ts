@@ -384,7 +384,15 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     )
   }
 
-  const audit = new AuditLog(process.cwd())
+  // SINGLE INSTANCE (design §4.2.2): rotation and record() both act on the
+  // path this instance resolved, so every audit write in this plugin must go
+  // through this one object. Constructing a second AuditLog (e.g. inside a
+  // tool handler) would rotate a different file than the one being appended to.
+  const audit = new AuditLog(process.cwd(), {
+    maxBytes: config.auditMaxBytes,
+    retainFiles: config.auditRetainFiles,
+    totalMaxBytes: config.auditTotalMaxBytes,
+  })
 
   // Bounded report retention: delete reports that are BOTH beyond the newest
   // `reportsRetainCount` AND older than `reportsRetainDays`. Reports are pure
