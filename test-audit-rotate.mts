@@ -46,9 +46,14 @@ beforeEach(() => {
   mkdirSync(guardDir(), { recursive: true })
 })
 
-/** Tight thresholds so a handful of records trips rotation. */
+/**
+ * Tight thresholds so a handful of records trips rotation.
+ *
+ * One record serialises to ~126 bytes, so `maxBytes: 400` holds 3 records and
+ * trips on the 4th — which lets each test use small, readable generations.
+ */
 function log(over: Partial<{ maxBytes: number; retainFiles: number; totalMaxBytes: number }> = {}) {
-  return new AuditLog(ROOT, { maxBytes: 200, retainFiles: 2, totalMaxBytes: 10_000, ...over })
+  return new AuditLog(ROOT, { maxBytes: 400, retainFiles: 2, totalMaxBytes: 100_000, ...over })
 }
 
 let seq = 0
