@@ -52,7 +52,7 @@ import {
   watermarkOf,
 } from './state.ts'
 import { ensureGitBaseline, commitCheckpoint } from './git.ts'
-import { diagnoseGitBloat } from './bloat.ts'
+import { diagnoseGitBloat, BLOAT_TOP_N } from './bloat.ts'
 import { buildTurnReport, pruneReports } from './report.ts'
 import { verifyTurn } from './verify.ts'
 import { dirname, join, resolve } from 'node:path'
