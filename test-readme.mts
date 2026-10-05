@@ -73,13 +73,35 @@ test('README config table defaults match DEFAULT_CONFIG', () => {
 
 test('README denyReadPaths default list matches code', () => {
   const codeList = DEFAULT_CONFIG.denyReadPaths
-  assert.equal(codeList.length, 12, `code has ${codeList.length} denyReadPaths`)
+  // The count is derived from the exported constant, not hardcoded: adding a
+  // credential location is the whole point of the list, so the test must fail
+  // only when README and code DISAGREE — never merely because the list grew.
+  assert.equal(
+    codeList.length,
+    DEFAULT_SENSITIVE_PATHS.length,
+    'DEFAULT_CONFIG.denyReadPaths must mirror DEFAULT_SENSITIVE_PATHS',
+  )
+  assert.ok(codeList.length >= 12, `code has ${codeList.length} denyReadPaths`)
   // README lists them inline (line with `~/.ssh`, `~/.aws`, ...)
   const line = README.split('\n').find((l) => l.includes('~/.ssh') && l.includes('~/.aws'))
   assert.ok(line, 'README denyReadPaths line not found')
   for (const p of codeList) {
     assert.ok(line.includes(p), `README missing denyReadPaths entry ${p}`)
   }
+})
+
+test('README documents the denyReadPaths merge semantics and replacement switch', () => {
+  // U-18c changed the merge from replace-all to additive. A user reading the
+  // old table would believe listing one path drops every default, so the
+  // documented meaning must track the code.
+  assert.ok(
+    /denyReadPathsReplace/.test(README),
+    'README must document the denyReadPathsReplace option',
+  )
+  const row = README.split('\n').find((l) => l.startsWith('| `denyReadPathsReplace`'))
+  assert.ok(row, 'README config table must have a denyReadPathsReplace row')
+  assert.equal(DEFAULT_CONFIG.denyReadPathsReplace, false, 'default must be additive')
+  assert.match(row!, /`false`/, 'documented default should be false')
 })
 
 test('README example commands behave as documented (curl blocked, git allowed)', async () => {
