@@ -1325,9 +1325,30 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         const lines = [
           '=== TM-Guard Status ===',
           '',
-          `TM Health (fail-closed)  : ${health.healthy ? 'HEALTHY ✅' : 'UNHEALTHY 🚫 — writes BLOCKED'}`,
+          // Platform first (U-19c): it reframes everything below it. On a
+          // non-macOS host the TM lines are not "unhealthy" — TM simply does
+          // not exist, and the plugin is in limited mode. Reporting that as a
+          // fixable TM fault would send the user chasing a tmutil that is not
+          // installable, so the mode is stated explicitly and up front.
+          platformSupported
+            ? `Platform                 : ${process.platform} — full mode (Time Machine available)`
+            : `Platform                 : ${process.platform} — limited mode (no TM)`,
         ]
-        if (!health.healthy) {
+        if (!platformSupported) {
+          lines.push(
+            '  ⚠️  Time Machine is unavailable on this platform: the plugin runs with the',
+            '     git-baseline rollback net only. TM-related tools and fail-closed TM',
+            '     checks are inert; write protection comes from local git checkpoints.',
+          )
+        }
+        lines.push(
+          `TM Health (fail-closed)  : ${
+            platformSupported
+              ? (health.healthy ? 'HEALTHY ✅' : 'UNHEALTHY 🚫 — writes BLOCKED')
+              : 'N/A — no TM on this platform (git baseline is the rollback net)'
+          }`,
+        )
+        if (!health.healthy && platformSupported) {
           for (const issue of health.issues) {
             lines.push(`  ⚠️  ${issue}`)
           }
