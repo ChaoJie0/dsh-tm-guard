@@ -291,6 +291,39 @@ function unquote(s: string): string {
 /* Code scanning                                                       */
 /* ------------------------------------------------------------------ */
 
+/**
+ * True when a line's *code* portion is a bare regex literal (a rule
+ * definition), as opposed to a statement that happens to contain one.
+ *
+ * Only matches `X = /.../flags`, `X.push(/.../)`-style lone literals and
+ * array entries `  /.../,` — i.e. lines whose trimmed text *starts* with `/`
+ * after an optional `name: ` / `name = ` / `(` prefix, or that are just a
+ * commented-out pattern. A real call such as `const r = await fetch(u)` does
+ * not start with a slash, so it is still scanned.
+ *
+ * Deliberately conservative: a false negative here (missing a smuggled call
+ * hidden inside a regex-looking line) is not achievable, because executing
+ * code cannot be written as a lone literal — a regex literal has no side
+ * effects. Anything that can actually run still fails the "starts with /"
+ * test.
+ */
+function isRegexLiteralLine(line: string): boolean {
+  const t = line.trim()
+  // Comment lines carry prose and examples, not executable calls. Only treat
+  // doc/comment text as inert for the *call-site* patterns; imports and
+  // dynamic-eval checks below still see the full file via their own pass.
+  if (t.startsWith('*') || t.startsWith('//') || t.startsWith('/*')) return true
+
+  // Strip an optional `key:` or `key =` prefix and opening bracket/paren.
+  const body = t
+    .replace(/^(?:[\w$]+|['"][^'"]*['"])\s*[:=]\s*/, '')
+    .replace(/^\(+/, '')
+  if (!body.startsWith('/')) return false
+  // `/.../flags` where the literal closes on this line and nothing trails it
+  // except a separator — i.e. a rule entry, not an expression using division.
+  return /^\/(?:[^/\\\n]|\\.)*\/[gimsuy]*\s*[,;)\]]*\s*$/.test(body)
+}
+
 function scanCode(code: string, language: Lang, where: string, out: EgressHit[]): boolean {
   const rules = RULES[language]
   let unverifiable = false
