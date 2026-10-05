@@ -810,6 +810,10 @@ function classifySingleCommand(command: string): ClassifyResult {
         'fsck', 'repack', 'prune', 'notes', 'replace', 'mktag',
         'verify-commit', 'verify-tag', 'shortlog', 'describe',
         'archive', 'bundle', 'cat-file', 'hash-object', 'ls-files',
+        // Read-only object-store inspection. Without this, the plugin's own
+        // gc probe (`git count-objects -v`) falls through to vcs_remote and
+        // is denied by its own gate — a self-inflicted false positive.
+        'count-objects',
         'ls-tree', 'read-tree', 'write-tree', 'commit-tree',
         'update-index', 'update-ref', 'symbolic-ref', 'rev-parse',
         'rev-list', 'for-each-ref', 'show-ref', 'name-rev',
