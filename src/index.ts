@@ -194,6 +194,11 @@ export const DEFAULT_CONFIG: TmGuardConfig = {
   failClosed: true,
   failClosedBlockReads: false,
   turnReports: true,
+  // Report retention: reports are derived display artifacts (no rollback
+  // dependency), so bounding them is safe. Count and age are ANDed — see
+  // pruneReports() in report.ts for why an intersection beats a union.
+  reportsRetainCount: 200,
+  reportsRetainDays: 30,
   // Default off: local git is the instant, root-free rollback mechanism (see the
   // system-prompt workflow). Set true to instead run a blocking (~1 min) TM backup
   // before every state-changing op for non-git directories.
