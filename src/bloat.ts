@@ -77,6 +77,8 @@ export function __setBloatGitOverride(fn: BloatGitOverride | null): void {
 
 async function git(args: string[], cwd: string): Promise<string> {
   if (__bloatGitOverride) return (await __bloatGitOverride(args, cwd)).trim()
+  // `maxBuffer` is raised because `rev-list --objects --all` on a large repo
+  // can exceed the 1 MiB default and would otherwise fail with ENOBUFS.
   const { stdout } = await execFileAsync('git', args, {
     cwd,
     timeout: GIT_TIMEOUT_MS,
