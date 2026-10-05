@@ -67,7 +67,7 @@ import {
 import { verifyTurn } from './verify.ts'
 import { dirname, join, resolve } from 'node:path'
 import { execSync } from 'node:child_process'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 
 /* ------------------------------------------------------------------ */
 /* Plugin configuration                                                */
