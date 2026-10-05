@@ -196,7 +196,8 @@ The plugin accepts a `Partial<TmGuardConfig>` on its inserted row. Users normall
 | `snapshotCooldownSeconds` | `number` | `30` | Min seconds between automatic pre-write APFS snapshots. `0` snapshots before every write; negative disables auto-snapshot. |
 | `denyNetwork` | `boolean` | `true` | Deny classified network operations. |
 | `denySystem` | `boolean` | `true` | Deny process/system-management commands. |
-| `denyReadPaths` | `string[]` | credential/keychain paths listed above | Absolute or `~`-prefixed paths the agent may not read. Empty list disables the restriction. |
+| `denyReadPaths` | `string[]` | credential/keychain paths listed above | Absolute or `~`-prefixed paths the agent may not read. **Additive by default**: entries are appended to the built-in list ([Sensitive paths](#sensitive-paths)), so you cannot accidentally drop the defaults by listing one path. `[]` adds nothing. |
+| `denyReadPathsReplace` | `boolean` | `false` | When `true`, `denyReadPaths` **replaces** the built-in sensitive-path list instead of being appended to it. Replacement is the fail-open direction — the dropped defaults are named in a startup warning — so set this only when you are curating the whole list deliberately. |
 | `extraAllowTools` | `string[]` | `[]` | Tool names that bypass classification and are always allowed. |
 | `extraDenyTools` | `string[]` | `[]` | Tool names that are always denied. |
 | `verbose` | `boolean` | `true` | Log every gate decision to the host console. |
