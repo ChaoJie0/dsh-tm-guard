@@ -208,7 +208,7 @@ The plugin accepts a `Partial<TmGuardConfig>` on its inserted row. Users normall
 | `reportsRetainDays` | `number` | `30` | Minimum age in days before a turn report is eligible for deletion. Intersected with `reportsRetainCount` so lightly-used workspaces are never wiped merely for being old. |
 | `blockingBackupBeforeWrite` | `boolean` | `false` | Run a blocking full TM backup before each write (slow, SD-card-heavy) instead of an instant local snapshot. |
 | `requireGitBaseline` | `boolean` | `true` | Require a committed local-git baseline (auto-created) for file writes. |
-| `autoApprove` | `boolean` | `true` | Answer DSH approval requests `allowed-once` for calls already passed by the prepended gate. Set false to let approval asks reach the user / fail closed. |
+| `autoApprove` | `boolean` | `true` | Answer DSH approval requests `allowed-once` for calls already passed by the prepended gate. Prints a startup warning; **its safety depends on this plugin's `prepend` order** — see [Auto-approval and its blast radius](#auto-approval-and-its-blast-radius). Set false to let approval asks reach the user / fail closed. |
 
 > **⚠️ Do NOT put `subagent` / `subagent_fork` / `workflow` / `job_output` in `extraAllowTools`.** The allow-list short-circuits classification entirely, so a whitelisted subagent tool bypasses the gate's `mixed`-category denial and can write outside `protectedPaths` without rollback coverage. Subagents are `mixed` by default and denied for exactly that reason; keep them out of the allow-list (see Limitations).
 
