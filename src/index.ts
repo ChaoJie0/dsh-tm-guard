@@ -322,6 +322,34 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       'If this is unintended, add your workspace prefix(es).',
     )
   }
+  // --- Zero-intervention auto-approval: declare the risk out loud ---------
+  // autoApprove=true means this plugin answers DSH approval prompts on the
+  // user's behalf, so the *only* thing standing between an operation and
+  // execution is the TM-Guard gate itself. That safety argument depends on
+  // this plugin's tools/pre-execute hook being registered with `prepend`
+  // (it must classify and deny BEFORE any other listener can raise an
+  // approval 'ask'). A plugin that registers earlier, or one that bypasses
+  // the gate, breaks that assumption silently. Say so once at startup — an
+  // implicit auto-answer is exactly the kind of thing that should never be
+  // discovered after the fact. See README § "Auto-approval and its blast radius".
+  if (config.autoApprove === true) {
+    console.warn(
+      '[tm-guard] autoApprove=true：将自动应答 dsh approval 询问。' +
+      '安全依赖插件 prepend 注册顺序；若与其他权限插件共存请核对。' +
+      '详见 README（#auto-approval-and-its-blast-radius）',
+    )
+  }
+  // Fail-open + auto-approve is the one combination with no backstop at all:
+  // failClosed=false already lets writes through when no rollback net exists,
+  // and autoApprove then removes the human prompt that would have caught it.
+  if (config.failClosed === false && config.autoApprove === true) {
+    console.warn(
+      '[tm-guard] ⚠️  高风险组合：failClosed=false + autoApprove=true — ' +
+      '回滚网缺失时写入不再被拦截，且审批询问被自动应答，二者叠加后没有任何人工确认环节。' +
+      '建议保留 failClosed=true，或关闭 autoApprove。详见 README #auto-approval-and-its-blast-radius',
+    )
+  }
+
   const audit = new AuditLog(process.cwd())
 
   // Bounded report retention: delete reports that are BOTH beyond the newest
