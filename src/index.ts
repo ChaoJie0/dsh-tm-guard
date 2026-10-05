@@ -535,8 +535,11 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
   // does NOT create a baseline — see src/baseline-report.ts.
   let baselineReportPath: string | null = null
   try {
-    const { git } = collectSyncBaselineFacts(process.cwd())
-    const result = ensureBaselineReport(audit.dirPath, {
+    // The git half of the probe is synchronous, so it is measured once here and
+    // reused by the refinement below — a probe is a subprocess, and re-running
+    // it a tick later would make the report's two halves describe two different
+    // moments for no reason.
+    const facts = {
       platform: process.platform,
       platformSupported,
       workspace: process.cwd(),
@@ -546,8 +549,11 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       failClosed: config.failClosed,
       autoApprove: config.autoApprove,
       requireGitBaseline: config.requireGitBaseline,
+      git: collectSyncBaselineFacts(process.cwd()).git,
+    }
+    const result = ensureBaselineReport(audit.dirPath, {
+      ...facts,
       tm: UNPROBED_TM,
-      git,
       generatedAt: new Date(),
     })
     if (result.written) {
