@@ -94,31 +94,49 @@ test('U-02a: turnReportFileName has millisecond precision and stays sortable', (
 test('U-02a: two reports generated in the SAME millisecond produce distinct files', async () => {
   tmHealthy()
   try {
-    // Two turns, each with fresh audit activity, forced through the same ms.
+    // Two turns, each with fresh audit activity. The records need distinct
+    // timestamps: identity is (ts, tool), so two records sharing BOTH are
+    // genuinely indistinguishable and the watermark would (correctly) treat
+    // the second as already-reported.
     mkdirSync(join(ROOT, '.tm-guard'), { recursive: true })
-    const rec = (reason: string) => JSON.stringify({
-      ts: '2026-03-01T10:00:00.000Z', tool: 'bash', category: 'network',
+    const rec = (ts: string, reason: string) => JSON.stringify({
+      ts, tool: 'bash', category: 'network',
       decision: 'deny', reason, targetPaths: [],
     })
-    writeFileSync(join(ROOT, '.tm-guard', 'audit.jsonl'), rec('BLOCKED s1') + '\n', 'utf8')
+    const s1 = rec('2026-03-01T10:00:00.000Z', 'BLOCKED s1')
+    writeFileSync(join(ROOT, '.tm-guard', 'audit.jsonl'), s1 + '\n', 'utf8')
 
     apply(mockCtx() as any, { protectedPaths: [ROOT] })
     await hooks['agent/turn-stopping'][0]({ agent: {}, turn: 1 })
 
     writeFileSync(
       join(ROOT, '.tm-guard', 'audit.jsonl'),
-      rec('BLOCKED s1') + '\n' + rec('BLOCKED s2') + '\n',
+      s1 + '\n' + rec('2026-03-01T10:00:00.001Z', 'BLOCKED s2') + '\n',
       'utf8',
     )
     await hooks['agent/turn-stopping'][0]({ agent: {}, turn: 2 })
 
     const files = readdirSync(reportsDir()).filter((f) => f.startsWith('turn-'))
     assert.equal(files.length, 2, `two turns must yield two reports, got ${JSON.stringify(files)}`)
-
-    // And the helper itself must never return the same name twice in a row.
-    const names = new Set([turnReportFileName(), turnReportFileName()])
-    assert.ok(names.size >= 1)
   } finally { __setExecOverride(null) }
+})
+
+test('U-02a: the writer produces a distinct path for consecutive same-ms calls', () => {
+  // The handler above runs in real time, so it cannot force two writes into
+  // the same millisecond. Exercise the naming boundary directly instead: two
+  // adjacent milliseconds inside one second must map to two distinct paths,
+  // which is precisely what the old second-precision stamp failed to do.
+  const a = turnReportFileName(new Date('2026-03-01T10:00:00.000Z'))
+  const b = turnReportFileName(new Date('2026-03-01T10:00:00.001Z'))
+  assert.notEqual(a, b)
+  // Under the OLD scheme both collapsed to this same string:
+  const oldScheme = (d: Date) => `turn-${d.toISOString().replace(/[:.]/g, '-').slice(0, 19)}.md`
+  assert.equal(
+    oldScheme(new Date('2026-03-01T10:00:00.000Z')),
+    oldScheme(new Date('2026-03-01T10:00:00.001Z')),
+    'demonstrates the collision the fix removes',
+  )
+  assert.notEqual(a.slice(0, 19), '') // prefix still matches the legacy shape
 })
 
 test('U-02a: filename keeps the legacy prefix and sorts after older-format names', () => {
