@@ -72,6 +72,62 @@ export async function repoRoot(dir: string): Promise<string | null> {
   }
 }
 
+/**
+ * Read-only probe: can a git baseline be built here, and is git even present?
+ *
+ * Deliberately does NOT call `ensureGitBaseline`: that runs `git init` plus a
+ * baseline commit, and this probe is invoked at plugin load, where mutating the
+ * user's workspace would be unacceptable (U-27). "Can it be built?" is answered
+ * from `rev-parse` alone.
+ *
+ * Synchronous, unlike the rest of this module, because its caller (`apply()`)
+ * must be able to write the first-run report before returning; see
+ * src/baseline-report.ts. One subprocess with a bounded timeout, so blocking
+ * plugin load on it is acceptable in a way that blocking on a git *write* would
+ * not be.
+ *
+ * Consults `__gitOverride` so tests can pin the installer-shaped failures
+ * (missing binary, not a repository) without touching the real system — the
+ * same seam every other git entry point in this module uses.
+ */
+export function probeGitSync(dir: string): {
+  gitAvailable: boolean
+  root: string | null
+} {
+  if (__gitOverride) {
+    // The seam is async by contract (the callers of `git()` are all async), so
+    // probeGitSync cannot await it. Tests that need to observe this probe set
+    // `__gitSyncOverride` instead; without one, report "unknown but absent"
+    // rather than silently claiming a repository that was never checked.
+    return __gitSyncOverride ? __gitSyncOverride(dir) : { gitAvailable: true, root: null }
+  }
+  try {
+    const stdout = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: dir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 10_000,
+    })
+    const root = stdout.trim()
+    return { gitAvailable: true, root: root || null }
+  } catch (err) {
+    // A non-zero exit still proves git ran and answered ("not a repository");
+    // ENOENT does not — that is the "git is not installed" case.
+    const code = (err as { code?: unknown })?.code
+    return { gitAvailable: code !== 'ENOENT', root: null }
+  }
+}
+
+// Synchronous counterpart of `__gitOverride`, for probeGitSync only. Kept
+// separate instead of widening the existing seam: the async override is used by
+// fault-injection tests that care about init/commit/status outcomes, and making
+// it synchronous would change those call sites.
+type GitSyncOverride = (dir: string) => { gitAvailable: boolean; root: string | null }
+let __gitSyncOverride: GitSyncOverride | null = null
+export function __setGitSyncOverride(fn: GitSyncOverride | null): void {
+  __gitSyncOverride = fn
+}
+
 export async function hasCommit(root: string): Promise<boolean> {
   try {
     await git(['rev-parse', 'HEAD'], root)
