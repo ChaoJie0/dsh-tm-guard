@@ -387,6 +387,48 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       'If this is unintended, add your workspace prefix(es).',
     )
   }
+  // --- denyReadPaths: additive merge, and say so when it is not ------------
+  // Replacement is a fail-open direction (defaults dropped), so it must never
+  // be silent. announce the mode AND the effective count, so a config typo
+  // that empties the list is visible at load time rather than discovered
+  // after a credential read succeeded.
+  if (config.denyReadPathsReplace) {
+    const dropped = DEFAULT_SENSITIVE_PATHS.filter((p) => !config.denyReadPaths.includes(p))
+    if (dropped.length > 0) {
+      console.warn(
+        `[tm-guard] denyReadPathsReplace=true：用户 denyReadPaths 覆盖默认清单，` +
+        `${dropped.length} 条默认敏感路径不再受保护（${dropped.join(', ')}）。` +
+        '如非有意，改用追加（去掉 denyReadPathsReplace 或设为 false）。',
+      )
+    }
+  } else if (config.denyReadPaths.length === 0) {
+    // Unreachable with the additive merge (defaults are always present), but
+    // kept as a guard in case the merge semantics change again: an empty deny
+    // list means unrestricted reads of every credential store on the machine.
+    console.warn(
+      '[tm-guard] denyReadPaths is empty — the agent may read ANY path, ' +
+      'including SSH keys and cloud credentials. This is a deliberate opt-out; ' +
+      're-enable by removing the empty list.',
+    )
+  }
+  const platformSupported = process.platform === 'darwin'
+  // --- Platform capability probe (U-19) -----------------------------------
+  // Everything this plugin does on the write side rests on macOS `tmutil`
+  // (local APFS snapshots + `tmutil destinationinfo`). On Linux/Windows there
+  // is no tmutil at all, and the pre-U-19 behaviour was the worst possible
+  // one: a few `tm_*` tools failed at call time while the GATE still spoke
+  // fail-closed language ("protected by Time Machine"), so a user could
+  // reasonably believe a rollback net existed when none did. Silent
+  // degradation in a SAFETY tool is the bug — not the missing platform
+  // support. So: state the limitation loudly, keep the gate's git-baseline
+  // net working (it is platform-independent), and never claim TM protection.
+  if (!platformSupported) {
+    console.error(
+      `[tm-guard] 当前平台 ${process.platform} 不受支持：本插件依赖 macOS tmutil 本地快照。` +
+      '门控已按「无 TM 回滚网」模式运行——写保护仅依赖 git baseline。',
+    )
+  }
+
   // --- Zero-intervention auto-approval: declare the risk out loud ---------
   // autoApprove=true means this plugin answers DSH approval prompts on the
   // user's behalf, so the *only* thing standing between an operation and
