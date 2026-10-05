@@ -1106,6 +1106,40 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     }),
   )
 
+  // --- tm_git_bloat: read-only .git size diagnosis ---
+  ctx.tools.register(
+    defineTool({
+      name: 'tm_git_bloat',
+      description:
+        'READ-ONLY diagnosis of what makes a .git directory large: ranks the biggest ' +
+        'reachable blobs, and for each shows the path and the commit that introduced it. ' +
+        'Use when a repo is slow to clone or its .git has grown unexpectedly. ' +
+        'READ-ONLY: it never rewrites history, deletes objects, or runs gc/prune/filter-repo/BFG ' +
+        '— cleanup is a manual, destructive decision you must make yourself (see README). ' +
+        'Returns a clear message (not an error) when the target is not a git repository.',
+      parameters: {
+        top: {
+          type: 'number',
+          description: `How many blobs to rank (default ${BLOAT_TOP_N}, max 100).`,
+        },
+        path: {
+          type: 'string',
+          description:
+            'Directory inside the repository to analyse (default: the workspace cwd).',
+        },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args, value) => [{ type: 'text', text: value }],
+      },
+      async execute(args: { top?: number; path?: string }) {
+        const top = Math.max(1, Math.min(args.top ?? BLOAT_TOP_N, 100))
+        const target = args.path && args.path.trim() ? resolve(args.path) : process.cwd()
+        return diagnoseGitBloat(target, { topN: top })
+      },
+    }),
+  )
+
   // --- tm_status: system health check ---
   ctx.tools.register(
     defineTool({
