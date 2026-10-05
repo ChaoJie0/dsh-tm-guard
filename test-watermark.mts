@@ -202,22 +202,25 @@ test('U-03: successive turns partition records — no overlap, no gap', async ()
   try {
     apply(mockCtx() as any, { protectedPaths: [ROOT] })
 
-    // Turn 1: three fresh records.
+    // Denied records render their `reason` verbatim in the report, which makes
+    // them a precise marker for "was this record included in this turn?".
     writeAudit([
-      rec({ tool: 'edit', decision: 'allow', reason: 'turn1-a' }),
-      rec({ tool: 'edit', decision: 'allow', reason: 'turn1-b' }),
-      rec({ tool: 'edit', decision: 'allow', reason: 'turn1-c' }),
+      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-a' }),
+      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-b' }),
+      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-c' }),
     ])
     const r1 = await runTurn(1)
     assert.match(r1, /turn1-a/)
     assert.match(r1, /turn1-c/)
 
     // Turn 2: two more, appended. Must contain ONLY the new two.
-    const prev = readFileSync(auditPath(), 'utf8')
-    writeFileSync(auditPath(), prev + [
-      rec({ tool: 'edit', decision: 'allow', reason: 'turn2-a' }),
-      rec({ tool: 'edit', decision: 'allow', reason: 'turn2-b' }),
-    ].map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8')
+    writeAudit([
+      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-a' }),
+      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-b' }),
+      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn1-c' }),
+      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn2-a' }),
+      rec({ tool: 'bash', category: 'network', decision: 'deny', reason: 'BLOCKED turn2-b' }),
+    ])
 
     const r2 = await runTurn(2)
     assert.match(r2, /turn2-a/, 'turn 2 must report its own records')
