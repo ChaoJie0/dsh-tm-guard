@@ -59,6 +59,11 @@ import { ensureGitBaseline, commitCheckpoint } from './git.ts'
 import { diagnoseGitBloat, BLOAT_TOP_N } from './bloat.ts'
 import { buildTurnReport, pruneReports } from './report.ts'
 import { renderStatusReport, RECENT_STATUS_ITEMS } from './status.ts'
+import {
+  BASELINE_REPORT_FILE,
+  collectBaselineFacts,
+  ensureBaselineReport,
+} from './baseline-report.ts'
 import { verifyTurn } from './verify.ts'
 import { dirname, join, resolve } from 'node:path'
 import { execSync } from 'node:child_process'
