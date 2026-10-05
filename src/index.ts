@@ -505,6 +505,63 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
   }
 
   /* -------------------------------------------------------------- */
+  /* First-run safety baseline self-check (U-27)                   */
+  /* -------------------------------------------------------------- */
+
+  // "What protection level am I actually in?" had no durable answer: tm_status
+  // must be asked, and leaves nothing behind. So the first apply() writes one
+  // down. Detection is deliberately the *existence of the artifact*, not a
+  // state flag in state.json: it is self-describing, survives a wiped state
+  // file, and lets a user regenerate by deleting the report.
+  //
+  // Fully detached from the gate: the report is a display artifact, so a
+  // failure here must not stop the plugin from loading (same rule as report
+  // pruning above). The probes are read-only, and the git probe specifically
+  // does NOT create a baseline — see src/baseline-report.ts.
+  try {
+    if (!existsSync(join(audit.dirPath, BASELINE_REPORT_FILE))) {
+      void collectBaselineFacts({
+        platform: process.platform,
+        workspace: process.cwd(),
+        protectedPaths: config.protectedPaths,
+      })
+        .then((facts) => {
+          const result = ensureBaselineReport(audit.dirPath, {
+            platform: process.platform,
+            platformSupported: facts.platformSupported,
+            workspace: process.cwd(),
+            denyReadPaths: config.denyReadPaths,
+            protectedPaths: config.protectedPaths,
+            denyReadPathsReplace: config.denyReadPathsReplace,
+            failClosed: config.failClosed,
+            autoApprove: config.autoApprove,
+            requireGitBaseline: config.requireGitBaseline,
+            status: facts.status,
+            health: facts.health,
+            git: facts.git,
+            generatedAt: new Date(),
+          })
+          if (result.written) {
+            console.log(
+              `[tm-guard] 首次运行基线报告已生成: .tm-guard/${BASELINE_REPORT_FILE} — 请查看你的实际保护等级`,
+            )
+          } else if (result.error) {
+            console.warn(`[tm-guard] Baseline report skipped: ${result.error}`)
+          }
+        })
+        .catch((err) => {
+          console.warn(
+            `[tm-guard] Baseline report skipped: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        })
+    }
+  } catch (err) {
+    console.warn(
+      `[tm-guard] Baseline report skipped: ${err instanceof Error ? err.message : String(err)}`,
+    )
+  }
+
+  /* -------------------------------------------------------------- */
   /* Startup health check (fail-closed)                            */
   /* -------------------------------------------------------------- */
 
