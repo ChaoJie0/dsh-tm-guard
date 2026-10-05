@@ -17,8 +17,7 @@ import {
 import { join } from 'node:path'
 import type { OpCategory } from './classifier.ts'
 
-export interface AuditRecord {
-  /** ISO timestamp */
+export interface AuditRecord {  /** ISO timestamp */
   ts: string
   /** Tool name as registered in dsh */
   tool: string
