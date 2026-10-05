@@ -411,8 +411,16 @@ test('U-08: tm_status tool emits the four sections end-to-end', async () => {
 test('U-08: tm_status tool surfaces faults with next steps when TM is broken', async () => {
   const dir = workspace()
   process.chdir(dir)
-  __setExecOverride(async () => {
-    throw new Error('tmutil: Full Disk Access required')
+  // Partially-failing TM, matching the pre-existing unhealthy fixture: a bare
+  // always-throw override would make `latestSnapshot()` reject (it propagates
+  // tmutil errors) instead of exercising the fault-rendering path. Here the
+  // destination is configured but no snapshot exists and nothing is included,
+  // so the report is unhealthy without the snapshot probe throwing.
+  __setExecOverride(async (_f: string, a: string[]) => {
+    if (a[0] === 'destinationinfo') return { stdout: 'Name : SD\n' }
+    if (a[0] === 'listlocalsnapshots') return { stdout: 'Snapshots for disk /:\n' }
+    if (a[0] === 'isexcluded') return { stdout: `[Excluded] ${a[1]}\n` }
+    throw new Error(`unexpected ${_f} ${a.join(' ')}`)
   })
   const registered: any[] = []
   const ctx = {
@@ -427,6 +435,8 @@ test('U-08: tm_status tool surfaces faults with next steps when TM is broken', a
     assert.match(out, /UNHEALTHY/)
     assert.match(out, /⚠️/)
     assert.match(out, /→ next:/)
+    // No snapshot exists, so the remedy must point at a runnable command.
+    assert.match(out, /tm_snapshot|tm_backup/)
     const healthBody = out.slice(out.indexOf('【Health】'), out.indexOf('【Policy】'))
     assert.ok(
       healthBody.indexOf('UNHEALTHY') < healthBody.indexOf('Workspace protected'),
