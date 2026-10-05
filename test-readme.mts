@@ -6,6 +6,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { apply, DEFAULT_CONFIG } from './src/index.ts'
+import { DEFAULT_SENSITIVE_PATHS } from './src/sensitive-paths.ts'
 import { __setExecOverride } from './src/tm.ts'
 
 const README = readFileSync(new URL('./README.md', import.meta.url), 'utf8')
