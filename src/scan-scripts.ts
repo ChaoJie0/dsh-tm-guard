@@ -301,6 +301,13 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
   for (let i = 0; i < lines.length && out.length < MAX_HITS; i++) {
     const line = lines[i]
     if (!line || line.trim().length === 0) continue
+    // A regex literal is a PATTERN, not a call site. Without this, any file
+    // that defines network detection rules — including this one — matches its
+    // own patterns and self-reports as egress (`editors/`: `/\bfetch\s*\(/`
+    // contains the text `fetch(`). That turned every `node --test test-*.mts`
+    // into a false "network" denial the moment the import graph reached the
+    // detector's own source.
+    if (isRegexLiteralLine(line)) continue
 
     // Shell-out hits are always hard (no loopback downgrade for `curl ...`
     // with a remote host; loopback filter below handles 127.0.0.1 lines).
