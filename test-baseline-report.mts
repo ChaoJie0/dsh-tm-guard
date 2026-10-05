@@ -168,7 +168,9 @@ async function waitForTmSection(report: string, timeoutMs = 5000): Promise<void>
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     try {
-      if (/TM 已配置|TM 不适用|TM 探测未完成/.test(readFileSync(report, 'utf8'))) return
+      // "TM 探测未完成" is the PLACEHOLDER, not a finished state — matching it
+      // here would return before the refinement this helper exists to await.
+      if (/TM 已配置|TM 不适用/.test(readFileSync(report, 'utf8'))) return
     } catch {
       // Not written yet.
     }
