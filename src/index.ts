@@ -322,6 +322,28 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
   }
   const audit = new AuditLog(process.cwd())
 
+  // Bounded report retention: delete reports that are BOTH beyond the newest
+  // `reportsRetainCount` AND older than `reportsRetainDays`. Reports are pure
+  // derived display artifacts (the audit log is the rollback source of truth),
+  // so this needs no snapshot and can never affect the gate. Wrapped because
+  // cleanup must never break plugin load (design R6).
+  try {
+    const pruned = pruneReports(join(audit.dirPath, 'reports'), {
+      retainCount: config.reportsRetainCount,
+      retainDays: config.reportsRetainDays,
+    })
+    if (pruned.deleted.length > 0) {
+      console.log(
+        `[tm-guard] Pruned ${pruned.deleted.length} old turn report(s); ` +
+        `${pruned.kept.length} kept (reportsRetainCount=${config.reportsRetainCount}, reportsRetainDays=${config.reportsRetainDays}).`,
+      )
+    }
+  } catch (err) {
+    console.warn(
+      `[tm-guard] Report pruning skipped: ${err instanceof Error ? err.message : String(err)}`,
+    )
+  }
+
   /* -------------------------------------------------------------- */
   /* Startup health check (fail-closed)                            */
   /* -------------------------------------------------------------- */
