@@ -52,9 +52,18 @@ const CONFIG: StatusConfigView = {
   snapshotCooldownSeconds: 30,
 }
 
-/** Healthy TM fixture: every check passes. */
-function healthyInput(overrides: Partial<StatusInput> = {}): StatusInput {
-  const dir = workspace()
+/**
+ * Healthy TM fixture: every check passes.
+ *
+ * `auditDir` pins the workspace the audit log (and the sibling `reports/`
+ * directory) is read from; without it a fresh temp workspace is created, which
+ * would not be the one a test populated.
+ */
+function healthyInput(
+  overrides: Partial<StatusInput> = {},
+  auditDir?: string,
+): StatusInput {
+  const dir = auditDir ?? workspace()
   return {
     platformSupported: true,
     platform: 'darwin',
