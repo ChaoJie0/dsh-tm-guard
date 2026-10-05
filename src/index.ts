@@ -519,51 +519,89 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
   // state flag in state.json: it is self-describing, survives a wiped state
   // file, and lets a user regenerate by deleting the report.
   //
+  // The write is SYNCHRONOUS on the first run. The report is the whole point of
+  // the feature, and a file that appears one promise-tick later is — from a
+  // consumer's or a test's point of view — indistinguishable from one that
+  // never appears. The git half of the probe is synchronous anyway; only the
+  // tmutil half is async, and that section is rewritten in place as soon as it
+  // answers (the placeholder renders as "unknown", never as "configured").
+  //
   // Fully detached from the gate: the report is a display artifact, so a
   // failure here must not stop the plugin from loading (same rule as report
   // pruning above). The probes are read-only, and the git probe specifically
   // does NOT create a baseline — see src/baseline-report.ts.
+  let baselineReportPath: string | null = null
   try {
-    if (!existsSync(join(audit.dirPath, BASELINE_REPORT_FILE))) {
-      void collectBaselineFacts({
-        platform: process.platform,
-        workspace: process.cwd(),
-        protectedPaths: config.protectedPaths,
-      })
-        .then((facts) => {
-          const result = ensureBaselineReport(audit.dirPath, {
-            platform: process.platform,
-            platformSupported: facts.platformSupported,
-            workspace: process.cwd(),
-            denyReadPaths: config.denyReadPaths,
-            protectedPaths: config.protectedPaths,
-            denyReadPathsReplace: config.denyReadPathsReplace,
-            failClosed: config.failClosed,
-            autoApprove: config.autoApprove,
-            requireGitBaseline: config.requireGitBaseline,
-            status: facts.status,
-            health: facts.health,
-            git: facts.git,
-            generatedAt: new Date(),
-          })
-          if (result.written) {
-            console.log(
-              `[tm-guard] 首次运行基线报告已生成: .tm-guard/${BASELINE_REPORT_FILE} — 请查看你的实际保护等级`,
-            )
-          } else if (result.error) {
-            console.warn(`[tm-guard] Baseline report skipped: ${result.error}`)
-          }
-        })
-        .catch((err) => {
-          console.warn(
-            `[tm-guard] Baseline report skipped: ${err instanceof Error ? err.message : String(err)}`,
-          )
-        })
+    const { git } = collectSyncBaselineFacts(process.cwd())
+    const result = ensureBaselineReport(audit.dirPath, {
+      platform: process.platform,
+      platformSupported,
+      workspace: process.cwd(),
+      denyReadPaths: config.denyReadPaths,
+      protectedPaths: config.protectedPaths,
+      denyReadPathsReplace: config.denyReadPathsReplace,
+      failClosed: config.failClosed,
+      autoApprove: config.autoApprove,
+      requireGitBaseline: config.requireGitBaseline,
+      tm: UNPROBED_TM,
+      git,
+      generatedAt: new Date(),
+    })
+    if (result.written) {
+      baselineReportPath = result.reportPath
+      console.log(
+        `[tm-guard] 首次运行基线报告已生成: .tm-guard/${BASELINE_REPORT_FILE} — 请查看你的实际保护等级`,
+      )
+    } else if (result.error) {
+      console.warn(`[tm-guard] Baseline report skipped: ${result.error}`)
     }
   } catch (err) {
     console.warn(
       `[tm-guard] Baseline report skipped: ${err instanceof Error ? err.message : String(err)}`,
     )
+  }
+
+  // Second half of the first-run report: fill in the TM section once tmutil has
+  // answered. Detached, because the first-run file must exist before the plugin
+  // finishes loading (above) and the probe can take a second. On every later
+  // apply() `baselineReportPath` is null and this whole block is skipped — the
+  // steady-state cost of U-27 stays one `existsSync`.
+  if (baselineReportPath) {
+    const reportPath = baselineReportPath
+    const startedAt = Date.now()
+    void collectTmBaselineFacts({
+      platform: process.platform,
+      protectedPaths: config.protectedPaths,
+    })
+      .then((tm) => {
+        // A probe that never completed must not make the report look like it
+        // finished: `probed:false` is already rendered as an explicit unknown,
+        // so leave the placeholder exactly as written and say so once.
+        if (!tm.probed && process.platform === 'darwin' && Date.now() - startedAt > 20_000) {
+          console.warn(
+            '[tm-guard] Baseline report: TM probe did not complete; ' +
+            'section 1 stays "unknown" — run tm_status to confirm.',
+          )
+          return
+        }
+        refineBaselineReportTm(reportPath, {
+          platform: process.platform,
+          platformSupported,
+          workspace: process.cwd(),
+          denyReadPaths: config.denyReadPaths,
+          protectedPaths: config.protectedPaths,
+          denyReadPathsReplace: config.denyReadPathsReplace,
+          failClosed: config.failClosed,
+          autoApprove: config.autoApprove,
+          requireGitBaseline: config.requireGitBaseline,
+          tm,
+          git: collectSyncBaselineFacts(process.cwd()).git,
+          generatedAt: new Date(),
+        })
+      })
+      .catch(() => {
+        // The placeholder already tells the user to check tm_status.
+      })
   }
 
   /* -------------------------------------------------------------- */
