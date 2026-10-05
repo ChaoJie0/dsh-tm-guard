@@ -296,6 +296,10 @@ export const inject = ['tools']
  * string where an array belongs, a number where a boolean belongs, etc.
  * Plugins must degrade to defaults instead of crashing or silently flipping
  * policy (e.g. denyNetwork: 0 treated as false).
+ *
+ * `undefined` means "field absent" and falls back to the default; `[]` means
+ * "explicitly empty" and is preserved. That distinction is what keeps
+ * `denyReadPaths: []` working as the documented disable switch.
  */
 function normalizeArray(v: unknown, fallback: string[]): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : fallback
