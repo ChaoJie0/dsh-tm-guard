@@ -217,14 +217,15 @@ export const DEFAULT_CONFIG: TmGuardConfig = {
   snapshotCooldownSeconds: 30,
   denyNetwork: true,
   denySystem: true,
-  // Sensitive-path read restriction: default deny list for the most common
-  // credential/config locations outside the workspace. Override per profile
-  // via cordis.patch.yml (see both patch files for the active list).
-  denyReadPaths: [
-    '~/.ssh', '~/.aws', '~/.gnupg', '~/.kube', '~/.docker',
-    '~/.netrc', '~/.git-credentials', '~/.npmrc', '~/.pypirc',
-    '~/.config', '~/Library/Keychains', '~/Library/Cookies',
-  ],
+  // Sensitive-path read restriction. The base list lives in
+  // src/sensitive-paths.ts so it can be reviewed (and extended) as pure data,
+  // independently of the gate logic. Keep it a defensive copy: DEFAULT_CONFIG
+  // is exported, and a caller mutating `DEFAULT_CONFIG.denyReadPaths` in place
+  // must not be able to corrupt the module-level constant for later applies.
+  denyReadPaths: [...DEFAULT_SENSITIVE_PATHS],
+  // Additive by default — user entries are APPENDED to the base list. See the
+  // TmGuardConfig doc comment for why replacement is the opt-in direction.
+  denyReadPathsReplace: false,
   extraAllowTools: [],
   extraDenyTools: [],
   verbose: true,
