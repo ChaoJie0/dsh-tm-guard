@@ -841,7 +841,16 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       // work); read-only git (status/log/diff) does not need a restore point.
       const isMutation = decision.shouldSnapshot || classification.mutates === true
       let snapshotId: string | undefined
-      if (isMutation) {
+      if (isMutation && !platformSupported) {
+        // Off macOS every snapshot strategy shells out to tmutil, which does
+        // not exist. `startBackup` would throw and — because the blocking-
+        // backup branch is fail-closed — deny EVERY write on a platform the
+        // user may be running deliberately. The gate has already decided this
+        // write is acceptable on the git net alone, so skip the checkpoint and
+        // leave snapshotId undefined (the audit record then honestly shows no
+        // TM restore point instead of a fabricated one).
+        warnPlatformOnce()
+      } else if (isMutation) {
         if (config.blockingBackupBeforeWrite) {
           // User's chosen mode: a BLOCKING full backup to the TM disk before
           // every state-changing op, so a pre-change backup definitely exists
