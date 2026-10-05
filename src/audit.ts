@@ -424,13 +424,16 @@ export class AuditLog {
   /**
    * Read every audit record, oldest → newest, across rotation generations.
    *
-   * On-disk order in the *current* file is preserved. Rotated generations are
-   * prepended, so the result is chronological as long as rotation keeps
-   * generations ordered. Callers that only care about the current file's raw
-   * count (e.g. tm_status) keep using `readAll()`; this method exists so that
-   * rotation does not silently discard history.
+   * This is what makes rotation transparent to callers (design §4.1): the
+   * concatenation `.N` … `.1` + current is equivalent to the never-rotated
+   * history, within the retention window. `recent()` and `writeOperations()`
+   * sit on top of this, so `tm_rollback --last_operation` keeps finding the
+   * most recent write after a rotation.
+   *
+   * A generation that fails to read is skipped rather than aborting the whole
+   * reconstruction — losing one file must not hide the others.
    */
-  readAllGenerations(): AuditRecord[] {
+  readAll(): AuditRecord[] {
     const out: AuditRecord[] = []
     for (const p of this.rotatedPaths()) {
       try {
@@ -449,8 +452,8 @@ export class AuditLog {
     return out
   }
 
-  /** Read all audit records from the current file. */
-  readAll(): AuditRecord[] {
+  /** Read only the live file, ignoring rotated generations. */
+  readCurrent(): AuditRecord[] {
     try {
       if (!existsSync(this.logPath)) return []
       return AuditLog.parse(readFileSync(this.logPath, 'utf8'))
