@@ -9,10 +9,18 @@
 
 import {
   appendFileSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  truncateSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs'
 import { join } from 'node:path'
 import type { OpCategory } from './classifier.ts'
@@ -22,6 +30,33 @@ import type { OpCategory } from './classifier.ts'
  * Kept in sync with the rotation cap; scanning beyond it only costs stats.
  */
 const MAX_ROTATED_FILES = 20
+
+/** Defaults for rotation, mirrored in `DEFAULT_CONFIG` (src/index.ts). */
+export const AUDIT_DEFAULTS = {
+  /** Rotate the current file once it reaches this size (10 MiB). */
+  maxBytes: 10 * 1024 * 1024,
+  /** Keep `audit.jsonl.1` … `audit.jsonl.N`; `.1` is the newest. */
+  retainFiles: 5,
+  /** Hard ceiling across all generations (2× headroom over retain×max). */
+  totalMaxBytes: 100 * 1024 * 1024,
+  /** A rotation lock older than this is presumed stale and reclaimed. */
+  lockTimeoutSeconds: 60,
+} as const
+
+/** Rotation policy as handed to `AuditLog`. */
+export interface RotationConfig {
+  maxBytes: number
+  retainFiles: number
+  totalMaxBytes: number
+  lockTimeoutSeconds: number
+}
+
+export const DEFAULT_ROTATION: RotationConfig = {
+  maxBytes: AUDIT_DEFAULTS.maxBytes,
+  retainFiles: AUDIT_DEFAULTS.retainFiles,
+  totalMaxBytes: AUDIT_DEFAULTS.totalMaxBytes,
+  lockTimeoutSeconds: AUDIT_DEFAULTS.lockTimeoutSeconds,
+}
 
 export interface AuditRecord {
   /** ISO timestamp */
