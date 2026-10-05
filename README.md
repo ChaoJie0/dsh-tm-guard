@@ -277,6 +277,23 @@ To replace the list outright (e.g. you curate the set yourself and want a narrow
 
 ---
 
+## Platform support
+
+The plugin probes `process.platform` at load time.
+
+On **macOS (`darwin`)** it runs in **full mode**: local APFS snapshots, `tmutil` health checks, rollback strategies and the fail-closed Time Machine backstop are all active.
+
+On **any other platform** there is no `tmutil`, so the plugin runs in **limited mode** rather than pretending otherwise:
+
+- A one-line `console.error` states the platform is unsupported and that the gate is running in "no Time Machine rollback net" mode — write protection rests on the **git baseline only**.
+- The gate **does not block writes** for absence of a TM net (there is none to check); the TM-health fail-closed check and every `tm_*` snapshot/rollback path are inert. The git baseline is still created and committed before writes exactly as on macOS.
+- A `console.warn` restates the degradation **once per apply()** the first time a write is approved, so a long unattended run cannot forget it. It is deliberately not repeated per call — a warning that fires constantly is one users learn to ignore.
+- `tm_status` reports `platform: <platform> — limited mode (no TM)` and marks TM health `N/A — no TM on this platform (git baseline is the rollback net)` instead of the misleading `UNHEALTHY — writes BLOCKED`.
+
+The point of stating this loudly is that **silent degradation is the dangerous outcome in a safety tool**. Before this probe, a non-macOS user saw a handful of failing `tm_*` tools while the gate still spoke fail-closed language about Time Machine protection — easy to read as "a rollback net exists" when none did. If you need real rollback guarantees, run on macOS with Time Machine configured, or use a disposable VM/profile.
+
+---
+
 ## Limitations & honest scope
 
 Please read this before trusting the plugin. It raises the bar for unattended runs; it is not a proof of isolation.
