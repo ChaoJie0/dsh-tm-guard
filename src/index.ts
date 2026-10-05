@@ -828,6 +828,13 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         }
       }
 
+      // Any state-changing op is the moment the missing TM net matters most:
+      // it is about to be approved, and off macOS the user must know the only
+      // thing behind it is the git baseline. Warn once per apply().
+      if (isFileWrite || classification.mutates === true) {
+        warnPlatformOnce()
+      }
+
       // Pre-mutation checkpoint, enforced at the TOOL layer (the agent cannot
       // bypass this hook). In strict mode it covers file writes AND state-
       // changing local VCS ops (git commit/reset/checkout/clean can discard
