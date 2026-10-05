@@ -429,6 +429,21 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     )
   }
 
+  // One-shot "platform unsupported" reminder (U-19b). The startup banner above
+  // scrolls away; a long autonomous run needs the degradation restated at the
+  // moment it matters. Warn exactly ONCE per apply() — repeating it on every
+  // tool call would bury the gate's real decisions in noise, and a warning
+  // that fires constantly is one users learn to ignore.
+  let platformWarned = false
+  const warnPlatformOnce = (): void => {
+    if (platformSupported || platformWarned) return
+    platformWarned = true
+    console.warn(
+      `[tm-guard] ⚠️  平台不支持（${process.platform}）：无 Time Machine 回滚网，` +
+      '本轮写操作放行，回滚仅依赖 git baseline。',
+    )
+  }
+
   // --- Zero-intervention auto-approval: declare the risk out loud ---------
   // autoApprove=true means this plugin answers DSH approval prompts on the
   // user's behalf, so the *only* thing standing between an operation and
