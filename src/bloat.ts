@@ -134,13 +134,16 @@ async function findIntroducingCommit(
   oid: string,
   path: string,
 ): Promise<BloatEntry['commit']> {
+  // `--find-object` reports commits that changed the number of occurrences of
+  // an object. Restricting to the recorded path keeps the walk cheap; `--all`
+  // is the fallback for a blob whose path is unknown (or that was introduced
+  // under a different name). `--diff-filter=A` would miss blobs that merely
+  // reappear, so it is deliberately not used.
   const queries: string[][] = []
   if (path) {
-    // Walk only the history that touched this path — much cheaper than --all.
-    queries.push(['log', '--diff-filter=A', '--find-object', oid, '--format=%H%x1f%s%x1f%aI', '--', path])
+    queries.push(['log', '--find-object', oid, '--format=%H%x1f%s%x1f%aI', '--', path])
   }
-  // Fallback (and the path-less case): search every ref for the object itself.
-  queries.push(['log', '--diff-filter=A', '--find-object', oid, '--format=%H%x1f%s%x1f%aI', '--all'])
+  queries.push(['log', '--find-object', oid, '--format=%H%x1f%s%x1f%aI', '--all'])
 
   for (const args of queries) {
     let raw: string
