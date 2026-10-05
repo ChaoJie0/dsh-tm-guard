@@ -290,7 +290,7 @@ test('U-08: Data sources reports audit size, rotation generations, reports, .git
   writeFileSync(join(dir, 'reports', 'turn-b.md'), 'x', 'utf8')
 
   const out = renderStatusReport(
-    healthyInput({ audit, auditCount: 60, writeCount: 7 }),
+    healthyInput({ audit, auditCount: 60, writeCount: 7 }, dir),
   )
   const data = out.slice(out.indexOf('【Data sources】'), out.indexOf('【Recent】'))
   assert.match(data, /audit\.jsonl\s*:\s*\d+(\.\d+)?\s*[BKMGT]?(i)?B/)
