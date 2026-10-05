@@ -136,7 +136,7 @@ function yesNo(ok: boolean, yes = 'YES ✅', no = 'NO ⚠️'): string {
  * be distinguishable in the report, and `repoRoot` collapses both into `null`.
  * Never throws; a probe that cannot run is reported as such.
  */
-export function probeGitBaseline(dir: string): GitBaselineProbe & { gitAvailable: boolean } {
+export function probeGitBaseline(dir: string): GitBaselineProbe {
   let gitAvailable = false
   let root: string | null = null
   try {
