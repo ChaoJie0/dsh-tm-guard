@@ -283,11 +283,12 @@ test('U-08: Data sources reports audit size, rotation generations, reports, .git
   writeFileSync(audit.path, '{"ts":"t"}\n'.repeat(50), 'utf8')
   appendFileSync(`${audit.path}.1`, 'older\n', 'utf8')
   appendFileSync(`${audit.path}.2`, 'oldest\n', 'utf8')
-  // reports/ lives beside the audit log — the renderer reads audit.dirPath, so
-  // it must be created inside the SAME workspace as `audit`.
-  mkdirSync(join(dir, 'reports'), { recursive: true })
-  writeFileSync(join(dir, 'reports', 'turn-a.md'), 'x', 'utf8')
-  writeFileSync(join(dir, 'reports', 'turn-b.md'), 'x', 'utf8')
+  // reports/ lives beside the audit log — index.ts writes them to
+  // join(audit.dirPath, 'reports'), i.e. <workspace>/.tm-guard/reports.
+  const reportsDir = join(audit.dirPath, 'reports')
+  mkdirSync(reportsDir, { recursive: true })
+  writeFileSync(join(reportsDir, 'turn-a.md'), 'x', 'utf8')
+  writeFileSync(join(reportsDir, 'turn-b.md'), 'x', 'utf8')
 
   const out = renderStatusReport(
     healthyInput({ audit, auditCount: 60, writeCount: 7 }, dir),
