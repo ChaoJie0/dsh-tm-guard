@@ -494,7 +494,23 @@ export class AuditLog {
     return this.dir
   }
 
-  /** Clear the audit log. */
+  /** Rotation generations performed by this instance (diagnostics). */
+  get rotations(): number {
+    return this.rotatedCount
+  }
+
+  /** Effective rotation policy (diagnostics). */
+  get rotationConfig(): RotationConfig {
+    return { ...this.rotation }
+  }
+
+  /**
+   * Clear the audit log.
+   *
+   * Only the live file is emptied; rotated generations are deliberately left
+   * alone. `readAll()` therefore still returns `.1`…`.N` after a clear, which
+   * is a real semantic wrinkle for `tm_audit clear` rather than a silent one.
+   */
   clear(): void {
     try {
       writeFileSync(this.logPath, '', 'utf8')
