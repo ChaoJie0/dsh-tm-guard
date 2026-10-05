@@ -2,6 +2,33 @@
 
 All notable changes to dsh-tm-guard will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **`tm_git_bloat` — read-only `.git` bloat diagnosis (U-26)**. Ranks the
+  largest reachable blobs (`git rev-list --objects --all` piped into
+  `git cat-file --batch-check`), and for each reports the path, the size, and
+  the commit that introduced it (`git log --find-object`). Answers "why is this
+  repo slow to clone" without any risk to history. Parameters: `top`
+  (default 20, max 100) and `path`. A non-repository target returns an
+  explanatory message instead of throwing.
+  - **Hard read-only guarantee**: no `rm`/`mv`/`gc`/`prune`/`filter-repo`/BFG,
+    no history rewrite, no ref update. Cleanup is destructive (it invalidates
+    every clone and commit hash) and stays a manual, human decision — the tool
+    description and output say so explicitly. Covered by a test asserting that
+    only query subcommands are invoked and that HEAD, refs, and the work tree
+    are byte-identical after a scan.
+  - New `src/bloat.ts`; registered alongside `tm_audit`/`tm_status`.
+
+### Changed
+- **`autoApprove` risk made explicit (U-25)**. `autoApprove` defaults to `true`,
+  which means the plugin answers DSH approval prompts on the user's behalf; its
+  safety depends on this plugin's `prepend` registration order relative to any
+  other permission plugin. `apply()` now prints a startup warning stating this,
+  with a README pointer. A second warning fires for the combination
+  `failClosed=false` + `autoApprove=true`, which leaves no human confirmation
+  step and no rollback gate. No behaviour change — announcements only.
+
 ## [0.2.4] - 2026-10-03
 
 ### Changed
