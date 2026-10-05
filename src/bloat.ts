@@ -215,15 +215,22 @@ export async function analyzeGitBloat(dir: string, opts: BloatOptions = {}): Pro
   // a test injects non-repo behaviour.
 
   let batch: string
+  let revList: string
   try {
-    const revList = await git(['rev-list', '--objects', '--all'], root)
+    revList = await git(['rev-list', '--objects', '--all'], root)
     // Empty repo (no commits): nothing to analyse, and cat-file with empty
     // stdin is an error — return an empty report instead.
     if (!revList.trim()) {
       return { root, totalBlobBytes: 0, totalBlobs: 0, entries: [] }
     }
     if (__bloatGitOverride) {
-      batch = await git([`--batch-check=%(objecttype) %(objectname) %(objectsize) %(rest)`], root)
+      // The seam cannot feed stdin, so route the batch through `--batch-all-objects`
+      // restricted to blobs — semantically the reachable set minus unreachable
+      // garbage, which is what this diagnosis is about anyway.
+      batch = await git(
+        ['cat-file', '--batch-check=%(objecttype) %(objectname) %(objectsize) %(rest)', '--batch-all-objects'],
+        root,
+      )
     } else {
       batch = await catFileBatchCheck(root, revList)
     }
