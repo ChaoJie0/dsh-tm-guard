@@ -578,6 +578,8 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
   if (baselineReportPath) {
     const reportPath = baselineReportPath
     const startedAt = Date.now()
+    // `facts` is captured above; the TM half is the only thing this awaits.
+    const reportFacts = { ...baseFacts }
     void collectTmBaselineFacts({
       platform: process.platform,
       protectedPaths: config.protectedPaths,
@@ -593,20 +595,7 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
           )
           return
         }
-        refineBaselineReportTm(reportPath, {
-          platform: process.platform,
-          platformSupported,
-          workspace: process.cwd(),
-          denyReadPaths: config.denyReadPaths,
-          protectedPaths: config.protectedPaths,
-          denyReadPathsReplace: config.denyReadPathsReplace,
-          failClosed: config.failClosed,
-          autoApprove: config.autoApprove,
-          requireGitBaseline: config.requireGitBaseline,
-          tm,
-          git: collectSyncBaselineFacts(process.cwd()).git,
-          generatedAt: new Date(),
-        })
+        refineBaselineReportTm(reportPath, { ...reportFacts, tm, generatedAt: new Date() })
       })
       .catch(() => {
         // The placeholder already tells the user to check tm_status.
