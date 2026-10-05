@@ -50,6 +50,7 @@ const statePath = () => join(ROOT, '.tm-guard', 'state.json')
 
 /** Write a synthetic audit log (one JSON object per line). */
 function writeAudit(records: AuditRecord[]) {
+  mkdirSync(join(ROOT, '.tm-guard', 'reports'), { recursive: true })
   writeFileSync(auditPath(), records.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8')
 }
 
