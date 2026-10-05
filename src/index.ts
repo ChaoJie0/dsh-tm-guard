@@ -174,6 +174,29 @@ export interface TmGuardConfig {
    * gate. Set false to let escalation asks fall through to the user/deny.
    */
   autoApprove: boolean
+  /**
+   * Rotate `.tm-guard/audit.jsonl` once it exceeds this many bytes (default
+   * 10 MiB ≈ 22.9k records at 457 B/record). Rotation keeps the rollback
+   * history readable instead of letting one unbounded file grow forever.
+   * `0` (or negative) disables rotation entirely.
+   */
+  auditMaxBytes: number
+  /**
+   * How many rotated generations to keep as `audit.jsonl.1` … `audit.jsonl.N`
+   * (default 5, where `.1` is the NEWEST). With the default 10 MiB threshold
+   * this is a ≈50 MiB / ≈115k-record history window. The oldest generation is
+   * deleted once the window is full — that deletion is irreversible.
+   */
+  auditRetainFiles: number
+  /**
+   * Hard ceiling across the current log plus every rotated generation
+   * (default 100 MiB = 2× headroom over `auditRetainFiles × auditMaxBytes`).
+   * This is an abnormal-case backstop, not the normal window control: with
+   * headroom, the generation count trips first and this ceiling stays idle.
+   * Were it equal to retain×max, every single new record would force deleting
+   * an entire oldest generation.
+   */
+  auditTotalMaxBytes: number
 }
 
 export const DEFAULT_CONFIG: TmGuardConfig = {
