@@ -180,6 +180,8 @@ The plugin accepts a `Partial<TmGuardConfig>` on its inserted row. Users normall
 | `failClosed` | `boolean` | `true` | Block writes when no rollback net exists (git baseline uncreatable **and** Time Machine unhealthy). |
 | `failClosedBlockReads` | `boolean` | `false` | Also block reads when the backstop is unhealthy. Left false so the agent can diagnose. |
 | `turnReports` | `boolean` | `true` | Write the per-turn Markdown report + acceptance check. |
+| `reportsRetainCount` | `number` | `200` | Keep at most this many turn reports under `.tm-guard/reports`. Intersected with `reportsRetainDays` (a report must exceed **both** to be deleted). |
+| `reportsRetainDays` | `number` | `30` | Minimum age in days before a turn report is eligible for deletion. Intersected with `reportsRetainCount` so lightly-used workspaces are never wiped merely for being old. |
 | `blockingBackupBeforeWrite` | `boolean` | `false` | Run a blocking full TM backup before each write (slow, SD-card-heavy) instead of an instant local snapshot. |
 | `requireGitBaseline` | `boolean` | `true` | Require a committed local-git baseline (auto-created) for file writes. |
 | `autoApprove` | `boolean` | `true` | Answer DSH approval requests `allowed-once` for calls already passed by the prepended gate. Set false to let approval asks reach the user / fail closed. |
