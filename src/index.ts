@@ -44,7 +44,7 @@ import {
   type GateDecision,
 } from './classifier.ts'
 import { scanCommandForEgress } from './scan-scripts.ts'
-import { AuditLog } from './audit.ts'
+import { AuditLog, AUDIT_DEFAULTS } from './audit.ts'
 import {
   readState,
   writeState,
