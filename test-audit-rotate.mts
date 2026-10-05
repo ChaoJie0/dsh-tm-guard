@@ -182,6 +182,10 @@ test('U-01 (c): every line of every generation is valid JSON (no half-line cut)'
     if (content.length > 0) {
       assert.equal(content.at(-1), '\n', `${f} must end on a record boundary`)
     }
+    for (const [i, line] of content.split('\n').entries()) {
+      if (line.trim().length === 0) continue
+      assert.doesNotThrow(() => JSON.parse(line), `${f}:${i + 1} must be valid JSON`)
+    }
   }
 })
 
