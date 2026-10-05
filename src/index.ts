@@ -254,6 +254,20 @@ function normalizeNumber(v: unknown, fallback: number): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback
 }
 
+/**
+ * Build the report filename with millisecond precision.
+ *
+ * The old second-precision stamp (`slice(0, 19)`) meant two turns finishing in
+ * the same second wrote to the same path and the second silently overwrote the
+ * first. Milliseconds make that practically impossible, and the result stays
+ * lexicographically sortable (same `YYYY-MM-DDTHH-mm-ss` prefix as before), so
+ * prune-by-mtime and glob matching still work.
+ */
+export function turnReportFileName(now: Date = new Date()): string {
+  const stamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 23)
+  return `turn-${stamp}.md`
+}
+
 export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
   const config: TmGuardConfig = {
     ...DEFAULT_CONFIG,
