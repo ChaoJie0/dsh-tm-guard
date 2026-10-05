@@ -71,22 +71,67 @@ export class AuditLog {
     }
   }
 
-  /** Read all audit records. */
+  /** Parse one JSONL payload into records, skipping blank/corrupt lines. */
+  private static parse(content: string): AuditRecord[] {
+    return content
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .map((line) => {
+        try {
+          return JSON.parse(line) as AuditRecord
+        } catch {
+          return null
+        }
+      })
+      .filter((r): r is AuditRecord => r !== null)
+  }
+
+  /**
+   * Rotated generations, oldest → newest: `audit.jsonl.N` … `audit.jsonl.1`.
+   * Missing files are skipped so the order stays contiguous.
+   */
+  private rotatedPaths(): string[] {
+    const paths: string[] = []
+    for (let i = MAX_ROTATED_FILES; i >= 1; i--) {
+      const p = `${this.logPath}.${i}`
+      if (existsSync(p)) paths.push(p)
+    }
+    return paths
+  }
+
+  /**
+   * Read every audit record, oldest → newest, across rotation generations.
+   *
+   * On-disk order in the *current* file is preserved. Rotated generations are
+   * prepended, so the result is chronological as long as rotation keeps
+   * generations ordered. Callers that only care about the current file's raw
+   * count (e.g. tm_status) keep using `readAll()`; this method exists so that
+   * rotation does not silently discard history.
+   */
+  readAllGenerations(): AuditRecord[] {
+    const out: AuditRecord[] = []
+    for (const p of this.rotatedPaths()) {
+      try {
+        out.push(...AuditLog.parse(readFileSync(p, 'utf8')))
+      } catch {
+        // Unreadable generation: skip rather than lose the rest.
+      }
+    }
+    try {
+      if (existsSync(this.logPath)) {
+        out.push(...AuditLog.parse(readFileSync(this.logPath, 'utf8')))
+      }
+    } catch {
+      // ignore
+    }
+    return out
+  }
+
+  /** Read all audit records from the current file. */
   readAll(): AuditRecord[] {
     try {
       if (!existsSync(this.logPath)) return []
-      const content = readFileSync(this.logPath, 'utf8')
-      return content
-        .split('\n')
-        .filter((line) => line.trim().length > 0)
-        .map((line) => {
-          try {
-            return JSON.parse(line) as AuditRecord
-          } catch {
-            return null
-          }
-        })
-        .filter((r): r is AuditRecord => r !== null)
+      return AuditLog.parse(readFileSync(this.logPath, 'utf8'))
     } catch {
       return []
     }
