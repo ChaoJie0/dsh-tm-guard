@@ -162,24 +162,43 @@ test('U-02b: 300 old reports are pruned down to reportsRetainCount (200)', () =>
   assert.equal(readdirSync(reportsDir()).filter((f) => f.endsWith('.md')).length, 200)
 })
 
-test('U-02b: count and age are ANDed — recent surplus is kept, old surplus is deleted', () => {
-  // 250 files: the newest 150 are fresh, the oldest 100 are stale.
+test('U-02b: count and age are ANDed — stale files inside the newest N are kept', () => {
+  // 250 files. Newest-first ranking: ranks 200..249 are the newest 50, ranks
+  // 0..199 are the rest. Make the OLDEST 100 stale and everything else fresh.
+  // Ranks 0..99 (stale) are beyond rank 200 AND old → deleted.
+  // Ranks 100..199 (fresh) are beyond rank 200 but NOT old → kept.
+  // Ranks 200..249 are inside the count window → kept regardless of age.
   mkdirSync(reportsDir(), { recursive: true })
   const now = Date.now()
   for (let i = 0; i < 250; i++) {
     const p = join(reportsDir(), `turn-x-${String(i).padStart(3, '0')}.md`)
     writeFileSync(p, 'x\n', 'utf8')
-    // i >= 100 → fresh (1 day old); i < 100 → stale (90 days old)
-    const ageDays = i >= 100 ? 1 : 90
-    const t = (now - ageDays * DAY_MS + i) / 1000
+    // i < 100 → oldest 100 → stale; else fresh.
+    const ageDays = i < 100 ? 90 : 1
+    // Rank order follows mtime ascending, so i is also the rank from the bottom.
+    const t = (now - ageDays * DAY_MS + i * 1000) / 1000
     utimesSync(p, t, t)
   }
   const res = pruneReports(reportsDir(), { retainCount: 200, retainDays: 30 })
-  // Only stale files beyond rank 200 are eligible; all 100 stale files are
-  // beyond rank 200 (ranks 150..249 are fresh, ranks 0..149 include the stale
-  // 100 at ranks 0..99 → beyond count). So exactly the stale 100 go.
-  assert.equal(res.deleted.length, 100)
+  assert.equal(res.deleted.length, 100, 'exactly the stale files beyond rank 200 go')
   assert.equal(res.kept.length, 150)
+})
+
+test('U-02b: a stale file INSIDE the retain count survives (AND semantics, not OR)', () => {
+  // 10 files, ALL stale, retainCount 200 → none may be deleted. This is the
+  // core difference from a union rule, which would delete all of them.
+  seedReports(10, 365)
+  const res = pruneReports(reportsDir(), { retainCount: 200, retainDays: 30 })
+  assert.equal(res.deleted.length, 0)
+  assert.equal(res.kept.length, 10)
+})
+
+test('U-02b: a fresh file BEYOND the retain count survives (AND semantics, not OR)', () => {
+  // 250 fresh files, retainCount 200 → none may be deleted.
+  seedReports(250, 0)
+  const res = pruneReports(reportsDir(), { retainCount: 200, retainDays: 30 })
+  assert.equal(res.deleted.length, 0)
+  assert.equal(res.kept.length, 250)
 })
 
 test('U-02b: an old but tiny set is NOT wiped (age alone is insufficient)', () => {
