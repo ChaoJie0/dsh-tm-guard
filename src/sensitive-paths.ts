@@ -29,7 +29,9 @@
  */
 const CLOUD_AND_SHELL_CREDENTIALS = [
   '~/.ssh', // private keys, config, known_hosts, authorized_keys
+  '~/.ssh/config', // explicit: documents the highest-value ssh target
   '~/.aws', // credentials, config, SSO token cache
+  '~/.aws/credentials', // explicit: the long-lived access-key file
   '~/.gnupg', // GPG keyrings + private keys
   '~/.kube', // kubeconfig (cluster-admin bearer tokens)
   '~/.docker', // registry auth in config.json
