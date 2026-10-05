@@ -129,6 +129,10 @@ test('tm_git_bloat: is READ-ONLY — refs, HEAD and work tree unchanged', async 
   }
   assert.ok(seen.length > 0, 'the scan should have invoked git at least once')
   assert.ok(seen.some((a) => a[0] === 'rev-list'), 'scan should use rev-list --objects --all')
+  assert.ok(
+    seen.some((a) => a[0] === 'cat-file'),
+    'scan should read object metadata through cat-file',
+  )
 
   assert.equal(git(['rev-parse', 'HEAD'], DIR).trim(), before.head, 'HEAD moved — not read-only')
   assert.equal(git(['show-ref'], DIR).trim(), before.refs, 'refs changed — not read-only')
