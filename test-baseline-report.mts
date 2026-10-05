@@ -105,6 +105,20 @@ function workspace(): string {
   return dir
 }
 
+/**
+ * Queue a workspace for removal at process exit.
+ *
+ * Deliberately NOT `t.after(cleanup)`: node:test tears per-test hooks down
+ * after the test settles, which would delete the workspace while an assertion
+ * failure is still formatting its message (and is racy for the async tests).
+ * Deferring every removal to one exit hook keeps all of them independent of
+ * test timing.
+ */
+const pendingCleanup: string[] = []
+function planCleanup(dir: string): void {
+  pendingCleanup.push(dir)
+}
+
 /** console.log capture that can be opened and closed around several apply()s. */
 function logCapture() {
   const logs: string[] = []
