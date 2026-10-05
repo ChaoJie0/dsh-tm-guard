@@ -86,21 +86,15 @@ export async function repoRoot(dir: string): Promise<string | null> {
  * plugin load on it is acceptable in a way that blocking on a git *write* would
  * not be.
  *
- * Consults `__gitOverride` so tests can pin the installer-shaped failures
+ * Consults `__gitSyncOverride` so tests can pin the installer-shaped failures
  * (missing binary, not a repository) without touching the real system — the
- * same seam every other git entry point in this module uses.
+ * same seam pattern every other git entry point in this module uses.
  */
 export function probeGitSync(dir: string): {
   gitAvailable: boolean
   root: string | null
 } {
-  if (__gitOverride) {
-    // The seam is async by contract (the callers of `git()` are all async), so
-    // probeGitSync cannot await it. Tests that need to observe this probe set
-    // `__gitSyncOverride` instead; without one, report "unknown but absent"
-    // rather than silently claiming a repository that was never checked.
-    return __gitSyncOverride ? __gitSyncOverride(dir) : { gitAvailable: true, root: null }
-  }
+  if (__gitSyncOverride) return __gitSyncOverride(dir)
   try {
     const stdout = execFileSync('git', ['rev-parse', '--show-toplevel'], {
       cwd: dir,

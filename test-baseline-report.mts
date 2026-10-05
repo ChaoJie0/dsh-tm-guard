@@ -491,7 +491,12 @@ test('U-27: generating the report does not touch git (read-only probe)', async (
   // than re-measuring. Two probes would also mean two different moments.
   assert.equal(gitCalls.length, 1, `exactly one read-only git probe expected, got: ${JSON.stringify(gitCalls)}`)
   assert.equal(execSync('git rev-parse HEAD', { cwd: ws, encoding: 'utf8' }).trim(), headBefore, 'HEAD moved')
-  assert.equal(execSync('git status --porcelain', { cwd: ws, encoding: 'utf8' }), statusBefore, 'work tree changed')
+  // The report itself is the one new file, and `.tm-guard/` is exactly what an
+  // auto-created baseline gitignores (GITIGNORE_LINES in src/git.ts). Exclude it
+  // so this assertion is about TRACKED content, which is what "read-only" means.
+  const after = execSync('git status --porcelain', { cwd: ws, encoding: 'utf8' })
+    .split('\n').filter((l) => l.trim() && !l.includes('.tm-guard/')).join('\n')
+  assert.equal(after, statusBefore.trim(), 'tracked work tree changed')
   planCleanup(ws)
 })
 
