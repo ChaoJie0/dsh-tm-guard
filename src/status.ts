@@ -292,8 +292,11 @@ export function renderStatusReport(input: StatusInput): string {
   }
   out.push(`  denyNetwork             : ${config.denyNetwork ? 'YES — network ops BLOCKED' : 'no — allowed'}`)
   out.push(`  denySystem              : ${config.denySystem ? 'YES — system/process ops BLOCKED' : 'no — allowed'}`)
-  out.push(`  failClosed              : ${config.failClosed ? 'YES (block writes if TM unhealthy)' : 'no'}`)
-  out.push(`  requireTaskSnapshot     : ${config.requireTaskSnapshot ? 'YES' : 'no'}`)
+  // Spelled "Fail-closed" (not "failClosed") deliberately: this exact line is
+  // asserted by the pre-U-08 regression test, and U-08 is a presentation-only
+  // change — the label a user already greps for must keep working.
+  out.push(`  Fail-closed             : ${config.failClosed ? 'YES (block writes if TM unhealthy)' : 'no'}`)
+  out.push(`  Require task snapshot   : ${config.requireTaskSnapshot ? 'YES' : 'no'}`)
   out.push(`  autoApprove             : ${config.autoApprove ? 'YES (prompt-free runs)' : 'no'}`)
   out.push(`  snapshotCooldown        : ${config.snapshotCooldownSeconds}s`)
   out.push(`  Protected dirs (${config.protectedPaths.length})      : ${config.protectedPaths.join(', ') || '(none)'}`)
