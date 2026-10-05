@@ -314,14 +314,25 @@ function isRegexLiteralLine(line: string): boolean {
   // dynamic-eval checks below still see the full file via their own pass.
   if (t.startsWith('*') || t.startsWith('//') || t.startsWith('/*')) return true
 
-  // Strip an optional `key:` or `key =` prefix and opening bracket/paren.
+  // Strip an optional `key:` / `key =` prefix and opening bracket/paren.
   const body = t
     .replace(/^(?:[\w$]+|['"][^'"]*['"])\s*[:=]\s*/, '')
     .replace(/^\(+/, '')
   if (!body.startsWith('/')) return false
-  // `/.../flags` where the literal closes on this line and nothing trails it
-  // except a separator — i.e. a rule entry, not an expression using division.
-  return /^\/(?:[^/\\\n]|\\.)*\/[gimsuy]*\s*[,;)\]]*\s*$/.test(body)
+
+  // Walk the literal, honouring backslash escapes, to find its true closing
+  // delimiter. The naive "first unescaped /" scan stops early on patterns
+  // like `/node-fetch/`, leaving the remainder looking like trailing code.
+  let closed = -1
+  for (let i = 1; i < body.length; i++) {
+    if (body[i] === '\\') { i++; continue }
+    if (body[i] === '/') { closed = i; break }
+    if (body[i] === '\n') return false
+  }
+  if (closed < 0) return false
+  // Only a flag tail and list/statement separator may follow — `/a/.test(x)`
+  // and `/a/ + b` are real expressions, so they are NOT treated as inert.
+  return /^[gimsuy]*\s*[,;)\]]*\s*$/.test(body.slice(closed + 1))
 }
 
 function scanCode(code: string, language: Lang, where: string, out: EgressHit[]): boolean {
