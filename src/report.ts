@@ -9,6 +9,8 @@
  */
 
 import type { AuditRecord } from './audit.ts'
+import { readdirSync, statSync, unlinkSync } from 'node:fs'
+import { join } from 'node:path'
 
 export interface TurnReportInput {
   /** Agent turn number (1-based). */
