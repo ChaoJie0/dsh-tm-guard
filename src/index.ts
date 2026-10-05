@@ -90,9 +90,22 @@ export interface TmGuardConfig {
    * (read or write) referencing a path under one of these prefixes is denied
    * and audited. This closes the zero-intervention gap where the agent runs
    * with the user's full read access: credentials, keys and configs outside
-   * the workspace stay out of reach. Empty list disables the restriction.
+   * the workspace stay out of reach.
+   *
+   * ADDITIVE by default (U-18c): entries here are APPENDED to
+   * DEFAULT_SENSITIVE_PATHS. Set `denyReadPathsReplace: true` to make this
+   * list replace the defaults outright. An explicit empty list (`[]`) with
+   * replace=true disables the restriction entirely.
    */
   denyReadPaths: string[]
+  /**
+   * When true, `denyReadPaths` REPLACES `DEFAULT_SENSITIVE_PATHS` instead of
+   * being appended to it. Default false (additive) because replacement is the
+   * fail-open direction: a profile that adds one project path would otherwise
+   * silently drop every cloud/agent credential entry. Use this only when you
+   * are deliberately curating the whole list.
+   */
+  denyReadPathsReplace: boolean
   /**
    * Additional tool names to always allow (bypass classification).
    */
