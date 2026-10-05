@@ -191,6 +191,18 @@ after(() => {
   rmSync(ROOT, { recursive: true, force: true })
 })
 
+// Runs after the suite reports (exit hook), so a failure message can still name
+// its temp paths when it matters.
+process.on('exit', () => {
+  for (const dir of pendingCleanup) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // Best effort; these live in the OS temp dir.
+    }
+  }
+})
+
 beforeEach(() => {
   assert.equal(process.platform, REAL_PLATFORM, 'process.platform leaked from a previous test')
 })
