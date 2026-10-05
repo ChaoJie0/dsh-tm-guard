@@ -236,6 +236,14 @@ export const DEFAULT_CONFIG: TmGuardConfig = {
   // Zero-intervention: auto-answer dsh's approval prompts for ops that already
   // passed the (prepended) TM-Guard gate.
   autoApprove: true,
+  // Audit rotation. Values come from src/audit.ts so the single source of truth
+  // travels with the code that implements the steps. readAll() splices the
+  // generations, so rotation does not break rollback targeting — but the first
+  // rotation on a long-lived workspace does irreversibly cut old history once
+  // the retention window fills (see README "audit log rotation").
+  auditMaxBytes: AUDIT_DEFAULTS.maxBytes,
+  auditRetainFiles: AUDIT_DEFAULTS.retainFiles,
+  auditTotalMaxBytes: AUDIT_DEFAULTS.totalMaxBytes,
 }
 
 /* ------------------------------------------------------------------ */
