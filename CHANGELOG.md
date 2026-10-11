@@ -25,24 +25,10 @@ All notable changes to dsh-tm-guard will be documented in this file.
     (async) tmutil section is filled in afterwards and renders as an explicit
     "unknown — check `tm_status`" until it lands, never as a false "configured".
   - **Never fatal**: an unwritable report degrades to a `console.warn` and the
-    gate still loads (same rule as report pruning).
+    gate still loads (a display artifact never stops the safety mechanism).
   - `tm_status` 【Data sources】 now echoes the report path so it is discoverable
     from the diagnostic tool. New `src/baseline-report.ts`; new
     `probeGitSync` in `src/git.ts` (sync, read-only, test-seamed).
-- **`tm_git_bloat` — read-only `.git` bloat diagnosis (U-26)**. Ranks the
-  largest reachable blobs (`git rev-list --objects --all` piped into
-  `git cat-file --batch-check`), and for each reports the path, the size, and
-  the commit that introduced it (`git log --find-object`). Answers "why is this
-  repo slow to clone" without any risk to history. Parameters: `top`
-  (default 20, max 100) and `path`. A non-repository target returns an
-  explanatory message instead of throwing.
-  - **Hard read-only guarantee**: no `rm`/`mv`/`gc`/`prune`/`filter-repo`/BFG,
-    no history rewrite, no ref update. Cleanup is destructive (it invalidates
-    every clone and commit hash) and stays a manual, human decision — the tool
-    description and output say so explicitly. Covered by a test asserting that
-    only query subcommands are invoked and that HEAD, refs, and the work tree
-    are byte-identical after a scan.
-  - New `src/bloat.ts`; registered alongside `tm_audit`/`tm_status`.
 
 ### Changed
 - **`autoApprove` risk made explicit (U-25)**. `autoApprove` defaults to `true`,

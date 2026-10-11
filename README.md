@@ -163,7 +163,6 @@ Anything unrecognized is denied by default (conservative). For locally executed 
 | `tm_status` | Print TM health/destination/snapshot count, workspace protection, gate policy, and audit-log stats. |
 | `tm_backup` | Start a backup to the configured TM disk; background by default, `wait=true` blocks for a browsable restore point. |
 | `tm_backup_status` | Show whether a backup is running, percent complete, and current phase. |
-| `tm_git_bloat` | **Read-only** diagnosis of what makes a `.git` large: ranks the biggest reachable blobs with path, size, and the commit that introduced each. Never rewrites history — cleanup is a manual decision (see [Diagnosing .git bloat](#diagnosing-git-bloat)). |
 
 ### First-run baseline report
 
@@ -187,18 +186,6 @@ Three properties are worth stating explicitly:
 - **Never fatal.** If the report cannot be written, `apply()` logs a warning and the gate loads normally. A display artifact must never stop the safety mechanism it describes.
 
 `tm_status` echoes the path in its 【Data sources】 section, so the report is discoverable from the tool a user reaches for when something looks wrong.
-
-### Diagnosing .git bloat
-
-A repository that has been running for a while accumulates large blobs — datasets, tarballs, build output committed by mistake. Deleting such a file in a later commit frees **nothing**: the blob stays reachable in history, so every clone and fetch keeps paying for it. `tm_git_bloat` answers the three questions needed to act on that:
-
-1. Which blobs are the biggest? (`git rev-list --objects --all` piped into `git cat-file --batch-check`)
-2. Where do they live? (the path recorded next to the blob)
-3. Which commit introduced them? (`git log --find-object <oid>`)
-
-It accepts `top` (default 20, max 100) and `path` (a directory inside the repository; defaults to the workspace cwd), and prints a table of rank / size / path / introducing commit. Running it outside a git repository returns an explanatory message rather than an error.
-
-> **This tool is strictly read-only.** It never runs `rm`, `mv`, `gc`, `prune`, `filter-repo`, or BFG, and never rewrites history. Actually shrinking a repository is a destructive, history-rewriting operation — it invalidates every existing clone and commit hash, and requires a force-push — so it must be a deliberate human decision. `tm_git_bloat` diagnoses; it does not clean up.
 
 ### Auto-approval and its blast radius
 
@@ -232,8 +219,6 @@ The plugin accepts a `Partial<TmGuardConfig>` on its inserted row. Users normall
 | `failClosed` | `boolean` | `true` | Block writes when no rollback net exists (git baseline uncreatable **and** Time Machine unhealthy). |
 | `failClosedBlockReads` | `boolean` | `false` | Also block reads when the backstop is unhealthy. Left false so the agent can diagnose. |
 | `turnReports` | `boolean` | `true` | Write the per-turn Markdown report + acceptance check. |
-| `reportsRetainCount` | `number` | `200` | Keep at most this many turn reports under `.tm-guard/reports`. Intersected with `reportsRetainDays` (a report must exceed **both** to be deleted). |
-| `reportsRetainDays` | `number` | `30` | Minimum age in days before a turn report is eligible for deletion. Intersected with `reportsRetainCount` so lightly-used workspaces are never wiped merely for being old. |
 | `blockingBackupBeforeWrite` | `boolean` | `false` | Run a blocking full TM backup before each write (slow, SD-card-heavy) instead of an instant local snapshot. |
 | `requireGitBaseline` | `boolean` | `true` | Require a committed local-git baseline (auto-created) for file writes. |
 | `autoApprove` | `boolean` | `true` | Answer DSH approval requests `allowed-once` for calls already passed by the prepended gate. Prints a startup warning; **its safety depends on this plugin's `prepend` order** — see [Auto-approval and its blast radius](#auto-approval-and-its-blast-radius). Set false to let approval asks reach the user / fail closed. |

@@ -8,7 +8,6 @@
  * Extension points used:
  *   - tools/pre-execute  : permission gate (allow/deny) + audit logging
  *   - ctx.tools.register : tm_snapshot / tm_rollback / tm_audit / tm_status
- *                          / tm_git_bloat (read-only .git diagnosis)
  *   - ctx.systemPrompt   : injects operating-mode guidance + workflow
  *
  * Features (v0.1.0):
@@ -56,8 +55,7 @@ import {
   watermarkOf,
 } from './state.ts'
 import { ensureGitBaseline, commitCheckpoint } from './git.ts'
-import { diagnoseGitBloat, BLOAT_TOP_N } from './bloat.ts'
-import { buildTurnReport, pruneReports } from './report.ts'
+import { buildTurnReport } from './report.ts'
 import { renderStatusReport, RECENT_STATUS_ITEMS } from './status.ts'
 import {
   BASELINE_REPORT_FILE,
@@ -159,21 +157,6 @@ export interface TmGuardConfig {
    */
   turnReports: boolean
   /**
-   * How many turn reports to keep under `.tm-guard/reports` (default 200).
-   * Reports are pure derived display artifacts — the audit log remains the
-   * source of truth for `tm_rollback` — so pruning them is always safe. This
-   * threshold is ANDed with `reportsRetainDays`: a report is deleted only when
-   * it is both beyond this count and older than that age.
-   */
-  reportsRetainCount: number
-  /**
-   * Minimum age in days before a turn report becomes eligible for deletion
-   * (default 30). Intersected with `reportsRetainCount` so lightly-used
-   * workspaces are not wiped purely for being old. `0` disables the age gate
-   * (count alone decides).
-   */
-  reportsRetainDays: number
-  /**
    * When true, run a BLOCKING full Time Machine backup to the backup disk
    * (tm_backup, wait) before EVERY file write. This gives each write a
    * restore point that tm_rollback can read back WITHOUT root/sudo — at the
@@ -246,11 +229,6 @@ export const DEFAULT_CONFIG: TmGuardConfig = {
   failClosed: true,
   failClosedBlockReads: false,
   turnReports: true,
-  // Report retention: reports are derived display artifacts (no rollback
-  // dependency), so bounding them is safe. Count and age are ANDed — see
-  // pruneReports() in report.ts for why an intersection beats a union.
-  reportsRetainCount: 200,
-  reportsRetainDays: 30,
   // Default off: local git is the instant, root-free rollback mechanism (see the
   // system-prompt workflow). Set true to instead run a blocking (~1 min) TM backup
   // before every state-changing op for non-git directories.
@@ -377,8 +355,6 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     requireGitBaseline: normalizeBool(rawConfig?.requireGitBaseline, DEFAULT_CONFIG.requireGitBaseline),
     autoApprove: normalizeBool(rawConfig?.autoApprove, DEFAULT_CONFIG.autoApprove),
     turnReports: normalizeBool(rawConfig?.turnReports, DEFAULT_CONFIG.turnReports),
-    reportsRetainCount: normalizeNumber(rawConfig?.reportsRetainCount, DEFAULT_CONFIG.reportsRetainCount),
-    reportsRetainDays: normalizeNumber(rawConfig?.reportsRetainDays, DEFAULT_CONFIG.reportsRetainDays),
     blockingBackupBeforeWrite: normalizeBool(rawConfig?.blockingBackupBeforeWrite, DEFAULT_CONFIG.blockingBackupBeforeWrite),
     snapshotCooldownSeconds: normalizeNumber(rawConfig?.snapshotCooldownSeconds, DEFAULT_CONFIG.snapshotCooldownSeconds),
     auditMaxBytes: normalizeNumber(rawConfig?.auditMaxBytes, DEFAULT_CONFIG.auditMaxBytes),
@@ -489,28 +465,6 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     retainFiles: config.auditRetainFiles,
     totalMaxBytes: config.auditTotalMaxBytes,
   })
-
-  // Bounded report retention: delete reports that are BOTH beyond the newest
-  // `reportsRetainCount` AND older than `reportsRetainDays`. Reports are pure
-  // derived display artifacts (the audit log is the rollback source of truth),
-  // so this needs no snapshot and can never affect the gate. Wrapped because
-  // cleanup must never break plugin load (design R6).
-  try {
-    const pruned = pruneReports(join(audit.dirPath, 'reports'), {
-      retainCount: config.reportsRetainCount,
-      retainDays: config.reportsRetainDays,
-    })
-    if (pruned.deleted.length > 0) {
-      console.log(
-        `[tm-guard] Pruned ${pruned.deleted.length} old turn report(s); ` +
-        `${pruned.kept.length} kept (reportsRetainCount=${config.reportsRetainCount}, reportsRetainDays=${config.reportsRetainDays}).`,
-      )
-    }
-  } catch (err) {
-    console.warn(
-      `[tm-guard] Report pruning skipped: ${err instanceof Error ? err.message : String(err)}`,
-    )
-  }
 
   /* -------------------------------------------------------------- */
   /* First-run safety baseline self-check (U-27)                   */
@@ -1365,40 +1319,6 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
 
         const header = `=== TM-Guard Audit Log (${records.length} records, log: ${audit.path}) ===`
         return `${header}\n${lines.join('\n')}`
-      },
-    }),
-  )
-
-  // --- tm_git_bloat: read-only .git size diagnosis ---
-  ctx.tools.register(
-    defineTool({
-      name: 'tm_git_bloat',
-      description:
-        'READ-ONLY diagnosis of what makes a .git directory large: ranks the biggest ' +
-        'reachable blobs, and for each shows the path and the commit that introduced it. ' +
-        'Use when a repo is slow to clone or its .git has grown unexpectedly. ' +
-        'READ-ONLY: it never rewrites history, deletes objects, or runs gc/prune/filter-repo/BFG ' +
-        '— cleanup is a manual, destructive decision you must make yourself (see README). ' +
-        'Returns a clear message (not an error) when the target is not a git repository.',
-      parameters: {
-        top: {
-          type: 'number',
-          description: `How many blobs to rank (default ${BLOAT_TOP_N}, max 100).`,
-        },
-        path: {
-          type: 'string',
-          description:
-            'Directory inside the repository to analyse (default: the workspace cwd).',
-        },
-      },
-      output: {
-        schema: { type: 'string' },
-        render: (_args, value) => [{ type: 'text', text: value }],
-      },
-      async execute(args: { top?: number; path?: string }) {
-        const top = Math.max(1, Math.min(args.top ?? BLOAT_TOP_N, 100))
-        const target = args.path && args.path.trim() ? resolve(args.path) : process.cwd()
-        return diagnoseGitBloat(target, { topN: top })
       },
     }),
   )
