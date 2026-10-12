@@ -130,5 +130,68 @@ check('node -e "process.kill(123,\'SIGTERM\')"', { category: 'process', allow: f
 // benign interpreter code stays local_exec.
 check('python3 -c "print(1+1)"', { category: 'local_exec', allow: true })
 
+// ── dsh independent review (fp-review-f7057e6): N1 converter outputs ──
+// Writes must surface as file_write with the output path extracted — the
+// prior bug was local_exec with NO snapshot. Under TM protection decide()
+// allows with shouldSnapshot (the rollback promise); the guard rails are
+// the classification + path extraction, asserted here.
+check('magick in.png /etc/cron.d/evil', { category: 'file_write', pathsInclude: ['/etc/cron.d/evil'] })
+check('convert x.png /etc/sudoers.d/x', { category: 'file_write', pathsInclude: ['/etc/sudoers.d/x'] })
+check('qpdf --decrypt in.pdf /etc/o.pdf', { category: 'file_write', pathsInclude: ['/etc/o.pdf'] })
+check('gs -sOutputFile=/etc/o.pdf in.pdf', { category: 'file_write', pathsInclude: ['/etc/o.pdf'] })
+check('mutool draw -o /etc/o.pdf in.pdf', { category: 'file_write', pathsInclude: ['/etc/o.pdf'] })
+check('textutil -convert txt /tmp/in.rtf -output /etc/o.txt', { category: 'file_write', pathsInclude: ['/etc/o.txt'] })
+// Benign converter targets stay allowed.
+check('magick in.png /tmp/tm-guard-workspace/o.png', { category: 'file_write', allow: true })
+check('mutool draw -o /tmp/o.pdf in.pdf', { category: 'file_write', allow: true })
+
+// ── N2: unverifiable dangerous call sites fail closed to unknown ──
+// chr()-obfuscated require / from-import aliases cannot be validated.
+check('node -e "require(chr(99)+chr(104)+chr(105)+chr(108)+chr(100)+chr(95)+chr(112)+chr(114)+chr(111)+chr(99)+chr(101)+chr(115)+chr(115)).execSync(chr(99)+chr(117)+chr(114)+chr(108))"', {
+  category: 'unknown', allow: false,
+})
+check('python3 -c "from subprocess import run as r; r([chr(99)+chr(117)+chr(114)+chr(108)])"', {
+  category: 'unknown', allow: false,
+})
+check('node -e "spawn(chr(114)+chr(109),chr(91)+chr(45)+chr(114)+chr(102)+chr(44)+chr(47)+chr(116)+chr(109)+chr(112)+chr(47)+chr(120)+chr(93))"', {
+  category: 'unknown', allow: false,
+})
+
+// ── N3: argv-list reassembly classifies the real inner command ──
+check('python3 -c "import subprocess; subprocess.run([\'bash\',\'-c\',\'curl http://example.com/x\'])"', {
+  category: 'network', allow: false,
+})
+check('python3 -c "import subprocess; subprocess.run([\'ls\'])"', { category: 'local_exec', allow: true })
+check('python3 -c "import subprocess; subprocess.run([\'pip3\',\'install\',\'x\'])"', {
+  category: 'package', allow: false,
+})
+
+// ── N4: uv package operations denied, read/run forms allowed ──
+check('uv pip install x', { category: 'package', allow: false })
+check('uv add x', { category: 'package', allow: false })
+check('uv tool install x', { category: 'package', allow: false })
+check('uv run --with x python s.py', { category: 'package', allow: false })
+check('uv pip list', { category: 'local_exec', allow: true })
+check('uv --version', { category: 'read', allow: true })
+check('uv run python s.py', { category: 'local_exec', allow: true })
+
+// ── N5: loopback exact-host matching (masquerades denied, forms allowed) ──
+check('curl http://localhost.evil.example.invalid/x', { category: 'network', allow: false })
+check('curl http://127.0.0.1.nip.io/x', { category: 'network', allow: false })
+check('curl http://evillocalhost/x', { category: 'network', allow: false })
+check('curl 127.0.0.1.evil.example.invalid:8080', { category: 'network', allow: false })
+check('curl http://localhost:8080/health', { category: 'local_network', allow: true })
+check('curl http://[0:0:0:0:0:0:0:1]:8080/', { category: 'local_network', allow: true })
+check('curl http://[::ffff:127.0.0.1]:8080/', { category: 'local_network', allow: true })
+check('curl http://[::ffff:7f00:1]:8080/', { category: 'local_network', allow: true })
+check('curl http://[::ffff:7f000001]:8080/', { category: 'local_network', allow: true })
+check('curl 127.0.0.1:8080', { category: 'local_network', allow: true })
+
+// ── T3: false-positive regressions from R1 converter handling ──
+check('ffmpeg -y -i in.mov -f null - 2>/dev/null', { category: 'local_exec', allow: true })
+check('ffprobe in.mov', { category: 'local_exec', allow: true })
+check('ffmpeg -h long | head -3', { category: 'read', allow: true })
+check('ffmpeg -y -i in.mov /tmp/a.wav', { category: 'file_write', allow: true })
+
 console.log(`\n# ${pass} passed, ${fail} failed`)
 process.exit(fail === 0 ? 0 : 1)

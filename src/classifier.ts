@@ -378,15 +378,23 @@ function extractWritePaths(command: string): string[] {
   // R1: media/document converter outputs — the trailing non-flag token is the
   // output file (ffmpeg -y -i IN.m4a -ar 16000 OUT.wav; avconvert), while the
   // `-i` INPUT marker must be skipped. `-f null -` probes write nothing.
-  // soffice writes converted files into `--outdir DIR`.
-  if (cmd === 'ffmpeg' || cmd === 'ffprobe' || cmd === 'avconvert' || cmd === 'afconvert') {
+  // soffice writes converted files into `--outdir DIR`. ffprobe is a pure
+  // metadata probe (stdout only) and must NOT get an output extraction —
+  // `ffprobe in.mov` would otherwise mis-flag its input as a write target
+  // (review T3).
+  if (cmd === 'ffmpeg' || cmd === 'avconvert' || cmd === 'afconvert') {
+    // Help mode: no output file to extract (`ffmpeg -h long` must not yield
+    // a phantom write target — review T3).
+    if (tokens.some((t) => t === '-h' || t === '-help' || t === '--help')) return paths
     for (let i = 1; i < tokens.length; i++) {
       const tok = tokens[i]
       if (tok.startsWith('-')) continue
       if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) continue
       if (tokens[i - 1] === '-i') continue // ffmpeg input marker
       if (tok === '-') continue // stdout sink (`-f null -` probe)
-      if (/^(?:\d*[<>]&?\d*|\d*[<>]{1,2}|&[<>])$/.test(tok)) continue // redirection (2>&1, >, >>, &>, <)
+      // Any token carrying a redirection (<, >, &) is not an output file —
+      // covers `2>&1`, `2>/dev/null`, `>log` glued forms (review T3).
+      if (/[<>]/.test(tok)) continue
       // Last non-flag token is the output; earlier bare tokens are inputs
       // that are not write targets.
       if (i === tokens.length - 1) paths.push(tok)
@@ -419,6 +427,55 @@ function extractWritePaths(command: string): string[] {
       }
     }
   }
+  // R1 review N1: converters added to local_exec must expose their output
+  // paths or writes to /etc & co. would sail through as local_exec.
+  // - magick/convert/qpdf/mutool: positional output = trailing non-flag token
+  //   (only when ≥2 non-flag tokens, so a bare input probe stays a read).
+  // - gs: -sOutputFile=FILE and -o FILE.
+  // - textutil: -output FILE (;-stdout form writes nothing).
+  if (cmd === 'magick' || cmd === 'convert' || cmd === 'qpdf') {
+    const nonFlags = tokens.slice(1).filter(
+      (t) => !t.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) &&
+             !/[<>]/.test(t) && !/^(?:\d*[<>]&?\d*|\d*[<>]{1,2}|&[<>])$/.test(t),
+    )
+    if (nonFlags.length >= 2) paths.push(nonFlags[nonFlags.length - 1])
+  }
+  // mutool: `mutool draw -o OUT in.pdf` — the -o value is the output; the
+  // trailing positional is the INPUT. Positional fallback only when -o absent.
+  if (cmd === 'mutool') {
+    const oIdx = tokens.indexOf('-o')
+    if (oIdx !== -1 && tokens[oIdx + 1]) {
+      paths.push(tokens[oIdx + 1])
+    } else {
+      const nonFlags = tokens.slice(1).filter(
+        (t) => !t.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) &&
+               !/[<>]/.test(t) && !/^(?:\d*[<>]&?\d*|\d*[<>]{1,2}|&[<>])$/.test(t),
+      )
+      if (nonFlags.length >= 2) paths.push(nonFlags[nonFlags.length - 1])
+    }
+  }
+  if (cmd === 'gs') {
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i]
+      const eq = t.indexOf('=')
+      if (t.startsWith('-sOutputFile=') && t.slice(t.indexOf('=') + 1)) {
+        paths.push(t.slice(t.indexOf('=') + 1))
+      }
+      if (t === '-o' && tokens[i + 1]) {
+        paths.push(tokens[i + 1])
+        break
+      }
+      void eq
+    }
+  }
+  if (cmd === 'textutil') {
+    for (let i = 1; i < tokens.length; i++) {
+      if (tokens[i] === '-output' && tokens[i + 1]) {
+        paths.push(tokens[i + 1])
+        break
+      }
+    }
+  }
 
   return paths.filter(
     (p) => p.length > 0 && p !== '/dev/null' && p !== '/dev/stdout',
@@ -433,8 +490,15 @@ function extractWritePaths(command: string): string[] {
  * Pull the wrapped executable out of interpreter inline code so it is
  * classified on its own argv. Covers the bypass forms observed in the
  * production audit: python subprocess/os, node child_process, and
- * process.kill. Returns null when no wrapped executable is visible (plain
- * print/side-effect code stays local_exec).
+ * process.kill.
+ *
+ * N3 (review): array/list arguments are reassembled into a full command
+ * string and re-classified — `['bash','-c','curl …']` must classify as the
+ * inner curl, not as a safe `bash`.
+ *
+ * Returns null when no wrapped executable is visible (plain print/side-effect
+ * code stays local_exec); the caller then checks DANGEROUS_CALL_PATTERNS and
+ * fails closed to unknown when a dangerous call site cannot be verified.
  */
 function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 'kill' } | null {
   // python3 -m MODULE … — module mode runs a real command (python3 -m pip
@@ -454,7 +518,41 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
   const codeM = rest.match(/^(?:-c|-e|--eval|--input-type=module)\s*(?:=\s*)?(?:"([^"]*)"|'([^']*)'|(\S+))/)
   const code = codeM?.[1] ?? codeM?.[2] ?? codeM?.[3]
   if (!code) return null
-  // python: subprocess.run(['cmd', 'a']) / os.system('cmd') / os.popen('cmd')
+
+  // Reassemble a python list literal into a shell-ish command string:
+  // ['bash','-c','curl http://x'] → bash -c "curl http://x" (each element
+  // re-quoted so tokenize keeps embedded spaces inside one token).
+  const pyList = code.match(
+    /(?:subprocess\.(?:run|call|check_call|check_output|Popen)\s*\(\s*\[\s*)((?:"[^"]*"|'[^']*')(?:\s*,\s*(?:"[^"]*"|'[^']*'))*)\s*\]/,
+  )
+  if (pyList) {
+    const els = pyList[1].match(/["'][^"']*["']/g) ?? []
+    // First element is the executable (bare); flags stay bare (a quoted -c
+    // would not match the shell `-c` branch); the rest keep quotes so
+    // embedded spaces survive tokenize:
+    // ['bash','-c','curl http://x'] → bash -c "curl http://x"
+    const joined = els.length > 0
+      ? [els[0].slice(1, -1), ...els.slice(1).map((e) => {
+          const raw = e.slice(1, -1)
+          return raw.startsWith('-') ? raw : `"${raw}"`
+        })].join(' ')
+      : ''
+    if (joined) return { command: joined, kind: 'exec' }
+  }
+  // node spawn/execFile with separate args array: spawn('rm',['-rf','/tmp/x'])
+  const ndArgs = code.match(
+    /(?:child_process\.)?(?:execFileSync|execFile|spawn|spawnSync)\s*\(\s*["']([^"']+)["']\s*,\s*\[\s*((?:"[^"]*"|'[^']*')(?:\s*,\s*(?:"[^"]*"|'[^']*'))*)\s*\]/,
+  )
+  if (ndArgs) {
+    const els = ndArgs[2].match(/["'][^"']*["']/g) ?? []
+    const joined = [ndArgs[1], ...els.map((e) => {
+      const raw = e.slice(1, -1)
+      return raw.startsWith('-') ? raw : `"${raw}"`
+    })].join(' ')
+    return { command: joined, kind: 'exec' }
+  }
+  // python: subprocess.run(['cmd', 'a']) first-element fallback /
+  // os.system('cmd') / os.popen('cmd')
   const py = code.match(
     /(?:subprocess\.(?:run|call|check_call|check_output|Popen)\s*\(\s*\[\s*["']([^"']+)["']|os\.(?:system|popen)\s*\(\s*["']([^"']+)["'])/,
   )
@@ -468,18 +566,39 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
     const url = net[1] ?? net[2] ?? ''
     if (url) return { command: `curl ${url}`, kind: 'exec' }
   }
-  // node: child_process.execSync('cmd') / execFileSync('cmd', [...]) /
-  // spawn('cmd', [...])
+  // node: child_process.execSync('cmd') / exec('cmd') string forms
   const nd = code.match(
-    /(?:child_process\.(?:execSync|exec|execFileSync|execFile|spawn|spawnSync)\s*\(\s*\[\s*["']([^"']+)["']|child_process\.(?:execSync|exec|spawn|spawnSync)\s*\(\s*["']([^"']+)["'])/,
+    /child_process\.(?:execSync|exec|execFileSync|execFile|spawn|spawnSync)\s*\(\s*["']([^"']+)["']/,
   )
   if (nd) {
-    const cmd = nd[1] ?? nd[2] ?? ''
+    const cmd = nd[1] ?? ''
     if (cmd) return { command: cmd, kind: 'exec' }
   }
   if (/\bprocess\.kill\s*\(/.test(code)) return { command: 'kill', kind: 'kill' }
   return null
 }
+
+/**
+ * Call-site patterns that can execute/network from interpreter inline code
+ * but whose arguments may not be verifiable by extractWrappedCommand (aliases,
+ * require() returns, destructuring, string+shell=True, indirect member
+ * access — review N2). When any of these appears AND the wrapped command was
+ * not extracted, the interpreter code fails closed to unknown.
+ */
+const DANGEROUS_CALL_PATTERNS: RegExp[] = [
+  // python module member calls that run programs / hit network
+  /\b(?:subprocess|os|shutil|pathlib)\.\w+\s*\(/,
+  /\brequests\.(?:get|post|put|delete|head|patch|session)\s*\(/,
+  /\burllib\.(?:request|parse)\.\w+\s*\(/,
+  /\bfrom\s+(?:subprocess|os|requests|urllib)\s+import\b/,
+  // node: child_process usage via require/import/destructure
+  /\brequire\(\s*['"]child_process['"]\s*\)/,
+  /\bfrom\s+['"]child_process['"]\s+import\b/,
+  /\bchild_process\s*\./,
+  // bare dangerous call names (any receiver)
+  /\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen)\s*\(/,
+  /\b(?:exec|eval|fetch|new\s+Function)\s*\(/,
+]
 
 /* ------------------------------------------------------------------ */
 /* Sensitive-path read restriction (denyReadPaths)                     */
@@ -514,15 +633,54 @@ const LOOPBACK = /\[::1\]|::1(?=[:\s"'`]|$)|127\.0\.0\.1|localhost(?:\.[a-z]+)*|
  * Matches bare `curl localhost:3000` and URL forms; a single external URL or
  * host anywhere in the command makes it a real network command again.
  */
+/**
+ * Exact loopback-host check (R2 hardening, review N5). Rejects substring
+ * masquerades: `localhost.evil.example.invalid`, `127.0.0.1.nip.io`,
+ * `evillocalhost` must NOT be treated as loopback. Covers IPv6 literals
+ * (bracketed or not, full ::1 expansion, IPv4-mapped ::ffff:127.0.0.1 /
+ * ::ffff:7f00:1) and 127/8 IPv4 (dotted and shorthand 127.1).
+ */
+function isLoopbackHost(raw: string): boolean {
+  const t = raw.toLowerCase().replace(/^\[|\]$/g, '')
+  if (t === 'localhost' || t === 'localhost.localdomain') return true
+  if (t.includes(':')) {
+    if (t === '::1' || t === '0:0:0:0:0:0:0:1') return true
+    const mapped = t.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)
+    if (mapped) return isLoopbackHost(mapped[1])
+    const hex = t.match(/^::ffff:([0-9a-f:]+)$/)
+    if (hex) {
+      // Hex groups may be compressed (7f00:1) — pad each group to 4 hex
+      // digits before joining so the 32-bit value is right.
+      const full = hex[1].split(':').map((g) => g.padStart(4, '0')).join('')
+      const n = parseInt(full, 16)
+      return ((n >>> 24) & 0xff) === 127
+    }
+    return false
+  }
+  const parts = t.split('.')
+  if (parts.length >= 2 && parts.length <= 4 && parts.every((p) => /^\d+$/.test(p) && Number(p) <= 255)) {
+    return parts[0] === '127'
+  }
+  return false
+}
+
 function isLoopbackOnly(rest: string): boolean {
-  if (!LOOPBACK.test(rest)) return false
+  // No LOOPBACK prefilter: exact host checks below are the single source of
+  // truth, and the prefilter's substring match would wrongly exclude valid
+  // full-form IPv6 (0:0:0:0:0:0:0:1) while including masquerades.
   // Any explicit http(s) URL to a non-loopback host → external.
   const urls = rest.match(/https?:\/\/[^\s"'`]+/gi) ?? []
+  if (urls.length === 0) {
+    // Bare host:port / host forms (curl 127.0.0.1:8080) — exact-check the
+    // first token's host, so `curl 127.0.0.1.evil.example.invalid` is not
+    // exempted by substring matching.
+    const bare = rest.trim().split(/\s+/)[0]?.split(/[\/?#]/)[0].replace(/:\d+$/, '') ?? ''
+    return isLoopbackHost(bare)
+  }
   for (const u of urls) {
-    // Split on /?# only so an IPv6 literal keeps its brackets ([::1]:8080),
-    // then drop the :port suffix before matching the loopback patterns.
+    // Split on /?# so an IPv6 literal keeps its brackets, then drop :port.
     const host = u.replace(/^https?:\/\//i, '').split(/[\/?#]/)[0].replace(/:\d+$/, '')
-    if (host && !LOOPBACK.test(host)) return false
+    if (!isLoopbackHost(host)) return false
   }
   return true
 }
@@ -870,13 +1028,64 @@ function classifySingleCommand(command: string): ClassifyResult {
   // `help` probes of ANY command are read-only — `ffmpeg -version`,
   // `soffice --version`, `sips --help`, `avconvert --help`, `qpdf --version`.
   // Runs BEFORE the process/exec/network families so `sips --help` does not
-  // stay a process command. Deliberately excludes `-h`/`-v` (too ambiguous
-  // across tools: ls -h, curl -v).
-  if (subCmd !== '' && /^(?:-{1,2}version|-{1,2}help|version|help)$/i.test(subCmd)) {
+  // stay a process command. Deliberately excludes `-v` (ambiguous). `-h` is
+  // also ambiguous for some tools (ls -h = human-readable) but is unambiguously
+  // help for the converter/registry family, so it is whitelisted there
+  // (review T3: `ffmpeg -h long | head` must not be a file_write).
+  const UNIQUE_H_HELP = new Set([
+    'ffmpeg', 'ffprobe', 'avconvert', 'afconvert', 'soffice', 'libreoffice',
+    'textutil', 'qpdf', 'gs', 'mutool', 'magick', 'convert', 'sips', 'uv',
+    'swiftc', 'pdftotext', 'pdfinfo', 'otool', 'mdls', 'afinfo', 'pgrep',
+  ])
+  if (subCmd !== '' &&
+      (/^(?:-{1,2}version|-{1,2}help|version|help)$/i.test(subCmd) ||
+       (subCmd === '-h' && UNIQUE_H_HELP.has(firstWord)))) {
     return {
       category: 'read',
       reason: `Version/help probe: ${fullCmd}`,
       targetPaths: [],
+    }
+  }
+
+  // uv is a Python/tool package manager: install/add/remove/sync/tool install
+  // and `run --with` hit the network and must be denied; version/help/
+  // list/show/python/cache/init and plain `uv run script.py` are local
+  // (review N4 — previously every uv subcommand rode local_exec).
+  if (firstWord === 'uv') {
+    const uvSub = rest.split(/\s+/)[0]?.toLowerCase() ?? ''
+    if (uvSub === 'install' || uvSub === 'add' || uvSub === 'remove' ||
+        uvSub === 'sync' || uvSub === 'lock' || uvSub === 'build') {
+      return {
+        category: 'package',
+        reason: `uv package operation: ${fullCmd}`,
+        targetPaths: [],
+      }
+    }
+    if (uvSub === 'pip' && /^pip\s+(?:install|download|sync|uninstall|compile)\b/.test(rest)) {
+      return {
+        category: 'package',
+        reason: `uv pip network operation: ${fullCmd}`,
+        targetPaths: [],
+      }
+    }
+    if (uvSub === 'tool' && /^tool\s+install\b/.test(rest)) {
+      return {
+        category: 'package',
+        reason: `uv tool install: ${fullCmd}`,
+        targetPaths: [],
+      }
+    }
+    if (uvSub === 'run' && rest.includes('--with')) {
+      return {
+        category: 'package',
+        reason: `uv run --with (fetches deps): ${fullCmd}`,
+        targetPaths: [],
+      }
+    }
+    return {
+      category: 'local_exec',
+      reason: `uv local task: ${fullCmd}`,
+      targetPaths: extractWritePaths(trimmed),
     }
   }
 
@@ -967,6 +1176,20 @@ function classifySingleCommand(command: string): ClassifyResult {
           targetPaths: inner.targetPaths,
           forceDeny: inner.forceDeny,
           mutates: inner.mutates,
+        }
+      }
+    } else {
+      // N2 (review): a dangerous call site whose arguments we cannot verify
+      // (require('child_process').execSync(…), `from subprocess import run
+      // as r`, destructured/spawn aliases, shell=True strings) fails closed
+      // to unknown instead of riding local_exec.
+      const codeM2 = rest.match(/^(?:-c|-e|--eval|--input-type=module)\s*(?:=\s*)?(?:"([^"]*)"|'([^']*)'|(\S+))/)
+      const code2 = codeM2?.[1] ?? codeM2?.[2] ?? codeM2?.[3] ?? ''
+      if (code2 && DANGEROUS_CALL_PATTERNS.some((re) => re.test(code2))) {
+        return {
+          category: 'unknown',
+          reason: `Interpreter code with unverifiable dangerous call: ${fullCmd.slice(0, 60)}`,
+          targetPaths: [],
         }
       }
     }
