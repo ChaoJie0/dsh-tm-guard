@@ -267,6 +267,48 @@ check('node -e "const fs=require(\'fs\');fs.writeFileSync(\'/etc/guardtest/x\',\
 // ── W4: vm run* contexts are code-execution primitives ──
 check('node -e "require(\'vm\').runInNewContext(\'os.system(\'id\')\')"', { category: 'unknown', allow: false })
 
+// ── N1: dotted-submodule from-import source (urllib.request) ──
+check('python3 -c "from urllib.request import urlopen as u; u(\'http://example.invalid\')"', { category: 'unknown', allow: false })
+
+// ── N2: fs.promises namespace + ESM static named imports of node:fs ──
+check('node -e "const fs=require(\'fs\'); fs.promises.writeFile(\'/etc/guardtest/x\',\'a\')"', { category: 'unknown', allow: false })
+check('node -e "const fs=require(\'fs\'); fs.promises.rm(\'/etc/guardtest/x\')"', { category: 'unknown', allow: false })
+check('node -e "const fs=require(\'fs\'); fs.promises.unlink(\'/etc/guardtest/x\')"', { category: 'unknown', allow: false })
+check('node -e "const fs=require(\'fs\'); fs.promises.appendFile(\'/etc/guardtest/x\',\'a\')"', { category: 'unknown', allow: false })
+check('node -e "const fs=require(\'fs\'); fs.promises.chmod(\'/etc/guardtest/x\',0o777)"', { category: 'unknown', allow: false })
+check('node --input-type=module -e "import {writeFileSync} from \'node:fs\'; writeFileSync(\'/etc/guardtest/x\',\'a\')"', { category: 'unknown', allow: false })
+check('node --input-type=module -e "import fs from \'node:fs\'; fs.promises.writeFile(\'/etc/guardtest/x\',\'a\')"', { category: 'unknown', allow: false })
+// promises read-only stays allowed
+check('node -e "const fs=require(\'fs\'); fs.promises.readFile(\'/etc/hosts\',\'utf8\')"', { category: 'local_exec', allow: true })
+
+// ── N3: Path bound to a variable, then write method (variable-held form) ──
+check('python3 -c "from pathlib import Path as P; p=P(\'/etc/guardtest/x\'); p.write_text(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "from pathlib import Path as P\np=P(\'/etc/guardtest/x\')\np.write_text(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "from pathlib import Path as P; p=P(\'/etc/guardtest/x\'); p.unlink()"', { category: 'unknown', allow: false })
+// variable-held read-only stays allowed
+check('python3 -c "from pathlib import Path as P; p=P(\'.\'); print(p.resolve())"', { category: 'local_exec', allow: true })
+
+// ── N4: destructuring / array-binding / optional-chain receivers + exp flag ──
+check('node -e "const {fetch: fc}=globalThis; fc(\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node -e "const [f]=[globalThis.fetch]; f(\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node -e "const f=globalThis?.fetch; f(\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node --experimental-default-type=module -e "import(\'http\').then(h=>h.get(\'http://example.invalid/x\'))"', { category: 'unknown', allow: false })
+
+// ── W1: open r+ write mode ──
+check('python3 -c "open(\'/etc/guardtest/x\',\'r+\').write(\'a\')"', { category: 'unknown', allow: false })
+
+// ── W3: read-only names from high-risk sources stay allowed (dotted forms
+// already allowed; from-import must not be source-guilty for these) ──
+check('python3 -c "from os import getcwd; print(getcwd())"', { category: 'local_exec', allow: true })
+check('python3 -c "from os import getcwd as g; print(g())"', { category: 'local_exec', allow: true })
+check('python3 -c "from os import getenv; print(getenv(\'HOME\'))"', { category: 'local_exec', allow: true })
+check('python3 -c "from shutil import which as w; print(w(\'ls\'))"', { category: 'local_exec', allow: true })
+check('python3 -c "from os.path import join; print(join(\'a\',\'b\'))"', { category: 'local_exec', allow: true })
+
+// ── W4: fs destructuring with rename is read-only too ──
+check('node -e "const {readFileSync: r}=require(\'fs\'); console.log(r(\'/etc/hosts\',\'utf8\'))"', { category: 'local_exec', allow: true })
+check('node -e "const {readFileSync}=require(\'fs\'); console.log(readFileSync(\'/etc/hosts\',\'utf8\'))"', { category: 'local_exec', allow: true })
+
 // ── N4: uv package operations denied, read/run forms allowed ──
 check('uv pip install x', { category: 'package', allow: false })
 check('uv add x', { category: 'package', allow: false })

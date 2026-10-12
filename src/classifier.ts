@@ -511,10 +511,16 @@ function extractWritePaths(command: string): string[] {
  */
 function extractInlineCode(rest: string): string {
   let s = rest.trim()
+  // N4: strip ALL leading node flags (--flag or --flag=value) before the
+  // code-carrying flag. The whitelist of env flags (--input-type=, --no-*,
+  // --experimental-*) missed `--experimental-default-type=module` (equals
+  // form), reopening the H4 extraction hole via experimental flags. Only
+  // leading flags are removed so a `--flag` inside the -e code string is
+  // untouched.
   let prev = ''
   while (s !== prev) {
     prev = s
-    s = s.replace(/^(?:--input-type=\w+|--experimental-[\w-]+|--no-[\w-]+)\s+/, '')
+    s = s.replace(/^--[a-zA-Z-]+(?:=\S+)?\s+/, '')
   }
   const m = s.match(/^(?:-c|-e|--eval)\s*(?:=\s*)?(?:"([^"]*)"|'([^']*)'|(\S+))/)
   return m?.[1] ?? m?.[2] ?? m?.[3] ?? ''
@@ -635,7 +641,7 @@ function hasUnverifiableDanger(code: string): boolean {
   // read-only strip handles those). `[^;)]*` must swallow the path (string
   // or variable); a chr()-obfuscated argument can defeat it, but the literal
   // path is what the gate needs to catch.
-  if (/\bopen\s*\([^)]*['"][wax][bt+]*['"]/.test(code)) return true
+  if (/\bopen\s*\([^)]*['"](?:[wax]|r\+)[bt+]*['"]/.test(code)) return true
   if (/\b\w+\s*\([^;)]*\)\s*\.\s*(?:write_text|write_bytes|open|unlink|mkdir|rmdir|rename|replace|touch|chmod|symlink_to|hardlink_to)\s*\(/.test(code)) return true
 
   // 1) High-risk capability introduced into the block.
@@ -651,11 +657,16 @@ function hasUnverifiableDanger(code: string): boolean {
     // (import('child_process').then(m=>m.execSync(...))); read-only imports
     // (import('path')) are stripped below by the symmetric import() list.
     /\bimport\s*\(/,
+    // N2: ESM static named/default imports of fs / node:fs / node:child_process
+    // (import {writeFileSync} from 'node:fs' — never seen by require()/import()
+    // nets). child_process is also matched by \bchild_process\b; fs is not.
+    /\bfrom\s*['"]node:(?:fs|child_process)['"]/,
+    /\bfrom\s*['"]fs['"]/,
   ]
   if (!HIGH_RISK_IMPORT.some((re) => re.test(code))) {
     // No high-risk module: keep only the bare dangerous-name net
     // (exec/eval/fetch/spawn...) for inline code without imports.
-    return /\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function|runInNewContext|runInThisContext)\s*\(/.test(code)
+    return /\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function|runInNewContext|runInThisContext|writeFileSync|writeFile|appendFileSync|appendFile|rmSync|rm|unlinkSync|unlink|chmodSync|chmod|renameSync|rename|copyFileSync|copyFile|truncateSync|truncate)\s*\(/.test(code)
   }
 
   // 2) Strip provably read-only member calls first (M2).
@@ -671,12 +682,18 @@ function hasUnverifiableDanger(code: string): boolean {
     '\\bprocess\\.(?:env|argv|cwd|pid|ppid|version|platform|arch|title|exitCode|stdin|stdout|stderr|execPath|execArgv|versions|release|uptime|hrtime|memoryUsage)\\b',
     '\\bconsole\\.\\w+\\s*\\(',
     // node fs read-only methods — inline chain (require('fs').readFileSync…)
-    // AND variable-held forms (const fs=require('fs'); fs.existsSync(…)) (H7).
+    // AND variable-held forms (const fs=require('fs'); fs.existsSync(…)) (H7)
+    // AND promises-namespace read-only members (N2 symmetric blind spot).
     '\\b(?:require|import)\\s*\\(\\s*[\'"]fs[\'"]\\s*\\)\\s*\\.\\s*(?:readFileSync|readFile|existsSync|statSync|lstatSync|readdirSync|readdir|realpathSync|realpath|readlinkSync|readlink|accessSync|access|fstatSync|openSync|open|createReadStream|watch|watchFile|unwatchFile|constants)\\b',
     '\\bfs\\s*\\.\\s*(?:readFileSync|readFile|existsSync|statSync|lstatSync|readdirSync|readdir|realpathSync|realpath|readlinkSync|readlink|accessSync|access|fstatSync|openSync|open|createReadStream|watch|watchFile|unwatchFile|constants)\\b',
+    '\\bfs\\.promises\\.(?:readFile|readdir|stat|lstat|realpath|readlink|access|constants)\\b',
     // require('fs') bound to a variable is itself inert — the danger is in
     // the member call, which the fs read/write nets above/below adjudicate.
     '\\b(?:const|let|var)\\s+\\w+\\s*=\\s*require\\s*\\(\\s*[\'"]fs[\'"]\\s*\\)',
+    // W4: fs destructuring with rename — {readFileSync: r} = require('fs') is
+    // read-only too; strip it or r(...) gets denied while the non-renamed
+    // destructure is allowed.
+    '\\b(?:const|let|var)\\s*\\{\\s*(?:readFileSync|readFile|existsSync|statSync|lstatSync|readdirSync|readdir|realpathSync|realpath|readlinkSync|readlink|accessSync|access|fstatSync|openSync|open|createReadStream|watch|watchFile|unwatchFile|constants)\\s*(?::\\s*\\w+)?\\s*\\}\\s*=\\s*require\\s*\\(\\s*[\'"]fs[\'"]\\s*\\)',
     // node read-only stdlib requires. NOTE: networking modules (http/https/
     // net/tls/dns/worker_threads) are deliberately NOT here — require('http')
     // .request(...) would be stripped whole and ride local_exec. Symmetric
@@ -701,11 +718,40 @@ function hasUnverifiableDanger(code: string): boolean {
   for (const mod of modNames) {
     if (new RegExp(`\\b${mod}\\s*\\.\\s*\\w+\\s*\\(`).test(stripped)) return true
   }
-  // c) high-risk module member calls, incl. `import subprocess as s` aliases
-  // a member expression (globalThis.fetch, globalThis.process.kill, any
-  // dotted chain) — a bare-identifier-only RHS candidate was the hole.
+  // N2: fs.promises.<method>( two-hop member net — promises is the modern
+  // node write API and the single-hop regex let writeFile/rm/unlink/
+  // appendFile/chmod sail through.
+  if (/\bfs\.promises\s*\.\s*\w+\s*\(/.test(stripped)) return true
+  // N3: Path/PurePath family construction present → ANY identifier's
+  // write-method call denies (p=P('/etc/x'); p.write_text('a') — the
+  // variable-held form, the most common real style). Read-only members
+  // (resolve/exists) stay allowed; strict-chained forms are caught by the
+  // unconditional net in section 0.
+  const pathCtor =
+    /\b(?:Path|PurePath|pathlib\.\w+)\s*\(/.test(code) ||
+    /(?:from\s+pathlib\s+import\s+(?:Path|PurePath)\b|from\s+pathlib\s+import\s+\w+\s+as\s+\w+)/.test(code)
+  if (pathCtor && /\b\w+\.\s*(?:write_text|write_bytes|unlink|mkdir|rmdir|rename|replace|touch|chmod|symlink_to|hardlink_to|open)\s*\(/.test(stripped)) return true
+  // N4: destructuring / array-binding / optional-chain receivers of
+  // high-risk capabilities. const {fetch: fc}=globalThis; fc(URL),
+  // const [f]=[globalThis.fetch]; f(URL), const f=globalThis?.fetch; f(URL).
   for (const m of stripped.matchAll(
-    /\b(?:const|let|var)?\s*(\w+)\s*=\s*(?:(?:globalThis|global|window)\s*\.\s*)?(?:fetch|requests\.\w+|subprocess\.\w+|child_process\.\w+|process\.\w+|require\([^)]*\)|import\([^)]*\)|exec|eval|spawn|execSync|execFileSync|\w+(?:\.\w+)+)\b/g,
+    /\b(?:const|let|var)\s*\{\s*(\w+)\s*(?::\s*(\w+))?\s*\}\s*=\s*(?:(?:globalThis|global|window)|require\([^)]*\))\b/g,
+  )) {
+    const alias = m[2] || m[1]
+    if (alias && new RegExp(`\\b${alias}\\s*\\(`).test(stripped)) return true
+  }
+  for (const m of stripped.matchAll(
+    /\b(?:const|let|var)\s*\[\s*(\w+)\s*\]\s*=\s*\[\s*(?:(?:globalThis|global|window)\s*\.\s*)?(?:fetch|process|require\([^)]*\)|import\([^)]*\))\s*\]/g,
+  )) {
+    const name = m[1]
+    if (name && new RegExp(`\\b${name}\\s*\\(`).test(stripped)) return true
+  }
+  // d) aliased assignment calls: const f = fetch; f(URL). The RHS may be a
+  // member expression (globalThis.fetch, globalThis.process.kill, any dotted
+  // chain) — a bare-identifier-only RHS candidate was the hole. N4 adds the
+  // optional-chain form globalThis?.fetch.
+  for (const m of stripped.matchAll(
+    /\b(?:const|let|var)?\s*(\w+)\s*=\s*(?:(?:globalThis|global|window)\s*\?\s*\.\s*)?(?:(?:globalThis|global|window)\s*\.\s*)?(?:fetch|requests\.\w+|subprocess\.\w+|child_process\.\w+|process\.\w+|require\([^)]*\)|import\([^)]*\)|exec|eval|spawn|execSync|execFileSync|\w+(?:\.\w+)+)\b/g,
   )) {
     const name = m[1]
     if (name && new RegExp(`\\b${name}\\s*\\(`).test(stripped)) return true
@@ -727,20 +773,43 @@ function hasUnverifiableDanger(code: string): boolean {
   const HIGH_RISK_SOURCES = new Set(
     ['subprocess', 'os', 'shutil', 'pathlib', 'requests', 'urllib'],
   )
+  // W3: names that are read-only no matter their source (from os import
+  // getcwd; from shutil import which; from os.path import join — the same
+  // operation as their dotted forms, which are allowed). Judge by ORIGINAL
+  // name so `getcwd as g` still allows.
+  const FROM_IMPORT_READONLY = new Set([
+    'getcwd', 'getenv', 'listdir', 'stat', 'lstat', 'access', 'environ',
+    'getpid', 'getuid', 'getgid', 'geteuid', 'getegid', 'uname', 'sep',
+    'name', 'path', 'linesep', 'devnull', 'get_terminal_size', 'times',
+    'fwalk', 'walk', 'which', 'disk_usage', 'get_archive_formats',
+    'unpack_archive',
+    'join', 'basename', 'dirname', 'exists', 'isfile', 'isdir', 'islink',
+    'isabs', 'abspath', 'realpath', 'expanduser', 'expandvars', 'splitext',
+    'normpath', 'normcase', 'relpath', 'getsize', 'ismount', 'samefile',
+    'sameopenfile', 'commonpath', 'commonprefix', 'split', 'splitdrive',
+    'splitroot',
+  ])
   for (const m of stripped.matchAll(
-    /\bfrom\s+(\w+)\s+import\s+(\w+)(?:\s+as\s+(\w+))?\b/g,
+    /\bfrom\s+([\w.]+)\s+import\s+(\w+)(?:\s+as\s+(\w+))?\b/g,
   )) {
     const src = m[1]
     const orig = m[2]
     const alias = m[3] || m[2]
+    // N1: source may be a dotted submodule (urllib.request) — judge by its
+    // FIRST segment so `from urllib.request import urlopen as u` is covered
+    // (the single-\w+ source group silently dropped the dotted source).
+    const srcRoot = src.split('.')[0]
     if (src === 'pathlib' && (orig === 'Path' || orig === 'PurePath')) {
       continue // write-method net above adjudicates; construction is read-only
     }
-    if (HIGH_RISK_SOURCES.has(src) && new RegExp(`\\b${alias}\\s*\\(`).test(stripped)) return true
+    if (FROM_IMPORT_READONLY.has(orig)) continue
+    if (HIGH_RISK_SOURCES.has(srcRoot) && new RegExp(`\\b${alias}\\s*\\(`).test(stripped)) return true
     if (DANGEROUS_IMPORT_NAMES.has(orig) && new RegExp(`\\b${alias}\\s*\\(`).test(stripped)) return true
   }
-  // f) bare dangerous call names (any receiver)
-  if (/\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function|runInNewContext|runInThisContext)\s*\(/.test(stripped)) return true
+  // f) bare dangerous call names (any receiver). N2: write-file primitives
+  // join the net so ESM named imports (import {writeFileSync} from 'node:fs')
+  // and any unverified write-file call deny.
+  if (/\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function|runInNewContext|runInThisContext|writeFileSync|writeFile|appendFileSync|appendFile|rmSync|rm|unlinkSync|unlink|chmodSync|chmod|renameSync|rename|copyFileSync|copyFile|truncateSync|truncate)\s*\(/.test(stripped)) return true
   // g) dynamic import/require
   if (/\b(?:require|import)\s*\(/.test(stripped)) return true
 
