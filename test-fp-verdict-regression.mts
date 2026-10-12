@@ -209,6 +209,12 @@ check('node -e "console.log(\'m\')"', { category: 'local_exec', allow: true })
 check('node -e "process.env.PATH"', { category: 'local_exec', allow: true })
 check('node -e "require(\'path\').join(\'a\',\'b\')"', { category: 'local_exec', allow: true })
 check('node -e "require(\'fs\').readFileSync(\'/etc/hosts\',\'utf8\')"', { category: 'local_exec', allow: true })
+// Networking stdlib requires must NOT be whitelisted read-only (they would be
+// stripped whole and ride local_exec): require('http').request / https.get /
+// net.connect all deny.
+check('node -e "require(\'http\').request(\'http://example.invalid/x\',cb)"', { category: 'unknown', allow: false })
+check('node -e "require(\'https\').get(\'https://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node -e "require(\'net\').connect(\'1.2.3.4:443\')"', { category: 'unknown', allow: false })
 
 // ── N4: uv package operations denied, read/run forms allowed ──
 check('uv pip install x', { category: 'package', allow: false })

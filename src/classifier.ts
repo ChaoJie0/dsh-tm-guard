@@ -632,7 +632,10 @@ function hasUnverifiableDanger(code: string): boolean {
     '\\bconsole\\.\\w+\\s*\\(',
     // node fs read-only methods (require('fs').readFileSync...)
     '\\b(?:require|import)\\s*\\(\\s*[\'"]fs[\'"]\\s*\\)\\s*\\.\\s*(?:readFileSync|readFile|existsSync|statSync|lstatSync|readdirSync|readdir|realpathSync|realpath|readlinkSync|readlink|accessSync|access|fstatSync|openSync|open|createReadStream|watch|watchFile|unwatchFile|constants)\\b',
-    '\\brequire\\s*\\(\\s*[\'"](?:path|util|url|os|process|events|stream|crypto|zlib|buffer|string_decoder|querystring|timers|assert|perf_hooks|async_hooks|cluster|dns|domain|http|https|net|tls|worker_threads|v8|vm|wasi|repl|readline|module|punycode|sys|trace_events|inspector)["\']\\s*\\)',
+    // node read-only stdlib requires. NOTE: networking modules (http/https/
+    // net/tls/dns/worker_threads) are deliberately NOT here — require('http')
+    // .request(...) would be stripped whole and ride local_exec.
+    '\\brequire\\s*\\(\\s*[\'"](?:path|util|url|os|events|stream|crypto|zlib|buffer|string_decoder|querystring|timers|assert|perf_hooks|async_hooks|cluster|domain|v8|vm|wasi|repl|readline|module|punycode|sys|trace_events|inspector)["\']\\s*\\)',
   ]
   const stripped = code.replace(new RegExp(READONLY_MEMBERS.join('|'), 'g'), '')
 
