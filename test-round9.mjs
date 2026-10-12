@@ -1,0 +1,72 @@
+import { classifyBashCommand } from './lib/classifier.js'
+
+const cases = [
+  // ── Y1: wash-out PoCs must DENY (real single-quotes, real regex literals) ──
+  [`node --input-type=module -e "'//'; import {writeFileSync as w} from 'node:fs'; w('/etc/guardtest/x','a')"`, false],
+  [`node -e "const s='//'; require('fs').writeFileSync('/etc/guardtest/x','a')"`, false],
+  [`node --input-type=module -e "'//'; import {execSync as e} from 'node:child_process'; e('id')"`, false],
+  [`node --input-type=module -e "const s='a//b'; import {rmSync as r} from 'node:fs'; r('/etc/guardtest/x')"`, false],
+  [`node -e "const re=/\\/\\//; require('fs').writeFileSync('/etc/guardtest/x','a')"`, false],
+  [`node --input-type=module -e "const DOC='https://host/docs#x'; import {writeFileSync as w} from 'node:fs'; w('/etc/guardtest/x','a')"`, false],
+  [`node -e "const c='#'; require('fs').writeFileSync('/etc/guardtest/x','a')"`, false],
+  // ── Y1 legal forms stay ALLOW ──
+  [`node -e "const s='http://x'; console.log(s)"`, true],
+  [`node -e "const a=5//2; console.log(a)"`, true],
+  [`node -e "const re=/a\\/\\/b/; console.log(re)"`, true],
+  [`node -e "const c='#fff'; console.log(c)"`, true],
+  [`node -e "x=1 // real comment with writeFileSync('/x')\nconsole.log(x)"`, true],
+  [`python3 -c "s='a#b'; print(s)"`, true],
+  [`python3 -c "x=1  # Path('/etc/x').write_text('a')\nprint(x)"`, true],
+  [`python3 -c "# open('/etc/x','w')\nprint('hi')"`, true],
+  [`python3 -c "print('#')"`, true],
+  // ── Y2: commented os.system/urlopen allow; real forms deny ──
+  [`python3 -c "# os.system('id')\nprint(1)"`, true],
+  [`python3 -c "# from urllib.request import urlopen; urlopen('http://x')\nprint(1)"`, true],
+  [`python3 -c "import os  # os.system('rm -rf /')\nprint(os.getcwd())"`, true],
+  [`python3 -c "import os; os.system('id')"`, false],
+  [`python3 -c "from urllib.request import urlopen; urlopen('http://example.invalid')"`, false],
+  // ── Y3: rs+ deny / rs allow; root two-hop; builtins/io alias; call shapes ──
+  [`node -e "const fs=require('fs'); fs.openSync('/etc/guardtest/x','rs+')"`, false],
+  [`node --input-type=module -e "import {open as o} from 'node:fs'; o('/etc/guardtest/x','rs+',(e,fd)=>{})"`, false],
+  [`node --input-type=module -e "import {open as o} from 'node:fs'; o('/etc/hosts','rs',(e,fd)=>{})"`, true],
+  [`node -e "const fs=require('fs'); fs.openSync('/etc/hosts','rs')"`, true],
+  [`node -e "const g=globalThis; const h=g; h.fetch('http://example.invalid/x')"`, false],
+  [`node -e "const g=globalThis; const h=g; const [f]=[h.fetch]; f('http://example.invalid/x')"`, false],
+  [`node -e "const g=globalThis; const h=g; console.log(h.process.env.PATH)"`, true],
+  [`python3 -c "import io as ii; ii.open('/etc/guardtest/x','w').write('a')"`, false],
+  [`python3 -c "import builtins as b; b.open('/etc/guardtest/x','w')"`, false],
+  [`python3 -c "import io as ii; ii.open('/etc/hosts').read()"`, true],
+  [`node --input-type=module -e "import {writeFileSync as w} from 'node:fs'; (w)('/etc/guardtest/x','a')"`, false],
+  [`node --input-type=module -e "import {writeFileSync as w} from 'node:fs'; [w][0]('/etc/guardtest/x','a')"`, false],
+  [`node --input-type=module -e "import {execSync as e} from 'node:child_process'; e\`id\`"`, false],
+  // ── regressions (X1/X2/K1-K3) ──
+  [`node -e "const f=require('fs'); f.readFileSync('/etc/hosts','utf8')"`, true],
+  [`node --input-type=module -e "import f from 'node:fs/promises'; f.readFile('/etc/hosts','utf8')"`, true],
+  [`node --input-type=module -e "import {readFile} from 'node:fs/promises'; readFile('/etc/hosts','utf8')"`, true],
+  [`node --input-type=module -e "import {open as o} from 'node:fs'; o('/etc/hosts','r',(e,fd)=>{})"`, true],
+  [`node -e "const f=require('fs'); f.writeFileSync('/etc/guardtest/x','a')"`, false],
+  [`node -e "const f=require('fs'); f.openSync('/etc/guardtest/x','w')"`, false],
+  [`node --input-type=module -e "import {writeFileSync as w} from 'node:fs'; const w2=w; w2('/etc/guardtest/x','a')"`, false],
+  [`python3 -c "from os import system as s; s2=s; s2('id')"`, false],
+  [`node -e "const fs=require('fs'); fs.createWriteStream('/etc/guardtest/x')"`, false],
+  [`node -e "const fs=require('fs'); fs.openSync('/etc/hosts','r')"`, true],
+  [`node -e "Store().writeFileSync('/x','a')"`, true],
+  [`python3 -c "f=open('/etc/guardtest/x','w'); f.write('a')"`, false],
+  [`python3 -c "import urllib.request as u; u.urlopen('http://example.invalid/x')"`, false],
+  [`node -e "const {fetch:f}=globalThis; const hh=f; hh('http://example.invalid/x')"`, false],
+  [`node -e "const {promises:{readdir}}=require('fs'); readdir('.')"`, true],
+  [`git status`, true],
+  [`node -e "require('fs').writeFileSync('/etc/guardtest/x','a')"`, false],
+  [`node -e "const re=/\\/\\//; require('fs').writeFileSync('/etc/guardtest/x','a')"`, false],
+]
+
+let miss = 0
+for (const [c, wantAllow] of cases) {
+  const v = classifyBashCommand(c)
+  const ok = wantAllow ? v.category !== 'unknown' : v.category === 'unknown'
+  if (!ok) {
+    miss++
+    console.log(`${wantAllow ? 'ALLOW' : 'DENY'}-MISS ${v.category} | ${c.slice(0, 70)}`)
+  }
+}
+console.log(miss === 0 ? `ALL OK (${cases.length})` : `${miss} MISS / ${cases.length}`)

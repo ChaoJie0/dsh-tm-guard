@@ -509,6 +509,89 @@ function extractWritePaths(command: string): string[] {
  * code and the N2 gate never fired. Both call sites (extractWrappedCommand
  * and the N2 branch in classifyBashCommand) MUST use this same function.
  */
+/**
+ * Y1: string-aware comment masking (mini-lexer). The previous regex masks
+ * (`(^|[^:\w])//…` and `#[^\n]*`) ran on RAW code and any string literal
+ * containing `//` or `#` washed out the REST OF THE LINE — e.g.
+ * `const s='//'; import {writeFileSync as w} from 'node:fs'; w('/etc/x','a')`
+ * collapsed to `const s='//'` and the write sailed through as allow. A
+ * comment mask is lexical by nature: strings (single/double/backtick +
+ * python triple-quoted), JS regex literals, `//` and node block comments,
+ * plus `#` (python, only at line-start / after whitespace) must be told
+ * apart. The output keeps line structure (comments become spaces, not
+ * newlines) so line-anchored nets see unchanged positions.
+ */
+function maskComments(code: string): string {
+  const out: string[] = []
+  let i = 0
+  const n = code.length
+  const REGEX_PRECEDERS = /[=({\[,;:!&|?+\-*%^~<>]/
+  const KW_RE = /\b(?:return|case|typeof|instanceof|in|of|new|delete|void|do|else|yield|await)$/
+  while (i < n) {
+    const ch = code[i]
+    const prev = i > 0 ? code[i - 1] : ''
+    // 1) strings — content is APPENDED VERBATIM (the nets must still see
+    // 'node:fs', 'fs', mode strings etc.; only comments get blanked).
+    if (ch === '"' || ch === "'" || ch === '`') {
+      if (ch !== '`' && code.startsWith(ch.repeat(3), i)) {
+        const end = code.indexOf(ch.repeat(3), i + 3)
+        const stop = end === -1 ? n : end + 3
+        out.push(code.slice(i, stop))
+        i = stop
+        continue
+      }
+      let j = i + 1
+      while (j < n) {
+        if (code[j] === '\\') { j += 2; continue }
+        if (code[j] === ch) break
+        if (ch !== '`' && code[j] === '\n') break // unclosed single-line string
+        j++
+      }
+      const stop = j < n ? j + 1 : n
+      out.push(code.slice(i, stop))
+      i = stop
+      continue
+    }
+    // 2) JS regex literal — only when the preceding token admits an expression
+    if (ch === '/' && i + 1 < n && code[i + 1] !== '/' && code[i + 1] !== '*' &&
+      (i === 0 || REGEX_PRECEDERS.test(prev) || KW_RE.test(code.slice(0, i)))) {
+      let j = i + 1
+      let inClass = false
+      while (j < n) {
+        if (code[j] === '\\') { j += 2; continue }
+        if (code[j] === '[') inClass = true
+        else if (code[j] === ']') inClass = false
+        else if (code[j] === '/' && !inClass) break
+        j++
+      }
+      const stop = j < n ? j + 1 : n
+      out.push(code.slice(i, stop))
+      i = stop
+      continue
+    }
+    // 3) node line comment `//` (preceded by non-`:`, non-identifier)
+    if (ch === '/' && code[i + 1] === '/' && prev !== ':' && !/[A-Za-z0-9_$]/.test(prev)) {
+      while (i < n && code[i] !== '\n') { out.push(' '); i++ }
+      continue
+    }
+    // 4) node block comment `/* … */`
+    if (ch === '/' && code[i + 1] === '*') {
+      const end = code.indexOf('*/', i + 2)
+      const stop = end === -1 ? n : end + 2
+      for (; i < stop; i++) out.push(code[i] === '\n' ? '\n' : ' ')
+      continue
+    }
+    // 5) python line comment `#` — only at line start / after whitespace
+    if (ch === '#' && (i === 0 || /\s/.test(prev))) {
+      while (i < n && code[i] !== '\n') { out.push(' '); i++ }
+      continue
+    }
+    out.push(ch)
+    i++
+  }
+  return out.join('')
+}
+
 function extractInlineCode(rest: string): string {
   let s = rest.trim()
   // N4/J3: strip ALL leading node flags (--flag or --flag=value) before the
@@ -543,7 +626,7 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
     }
     return null
   }
-  const code = extractInlineCode(rest)
+  const code = maskComments(extractInlineCode(rest))
   if (!code) return null
 
   // Reassemble a python list literal into a shell-ish command string:
@@ -634,15 +717,11 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
  *     aliases, bare dangerous names, dynamic import/require) all deny.
  */
 function hasUnverifiableDanger(code: string): boolean {
-  // K3: mask comments BEFORE any net runs — a `# open('/etc/x','w')` or
-  // `// p.write_text('a')` comment must not trip the write nets. Line-START
-  // // (node) plus ANY # to end-of-line (python inline comments too —
-  // `x=1  # Path(...).write_text('a')` mis-fired); # is not a node comment.
-  // W2: inline `//` is masked too — `x=1 // p.write('a')` — but only when
-  // preceded by whitespace/start (not `:`), so URL schemas (http://x) and
-  // integer division (a=5//2) keep their slashes.
-  code = code.replace(/(^|[^:\w])\/\/[^\n]*/g, '$1\n')
-  code = code.replace(/#[^\n]*/g, '\n')
+  // K3/Y1: mask comments BEFORE any net runs with the string-aware lexer —
+  // a `# open('/etc/x','w')` or `// p.write_text('a')` comment must not trip
+  // the write nets, and a `'//'`/`'#'`/URL string must NOT wash out the rest
+  // of its line (the Y1 fail-open the regex masks introduced).
+  code = maskComments(code)
   // K1/J1-spill: constructor names — literal Path/PurePath plus aliases from
   // `from pathlib import Path as P` (used by the bound-writer net AND the
   // section-0 strict-chain net, so aliased P('/x').write_text( still denies).
@@ -663,6 +742,12 @@ function hasUnverifiableDanger(code: string): boolean {
     ...(code.matchAll(/\bimport\s*\*\s*as\s+(\w+)\s+from\s*['"](?:node:)?fs(?:\/promises)?['"]/g) || []),
   ].map((m) => m[1])
   const fsAliasesPart = fsVarAliases.length ? `|${fsVarAliases.join('|')}` : ''
+  // Y3: builtins/io import-as aliases (import io as ii; ii.open('/etc/x','w'))
+  // — the section-0 open-mode net only matched literal builtins./io./open.
+  const biAliases = [
+    ...(code.matchAll(/\bimport\s+(?:builtins|io)\s+as\s+(\w+)\b/g) || []),
+  ].map((m) => m[1])
+  const biAliasesPart = biAliases.length ? `|${biAliases.join('|')}` : ''
   // 0) UNCONDITIONAL shapes — these are dangerous with or without any import
   // (H3): python builtin open() in a WRITE mode (w/a/x, optional b/+/t)
   // writes arbitrary paths, and Path-family write methods (Path('/etc/x')
@@ -676,19 +761,19 @@ function hasUnverifiableDanger(code: string): boolean {
   // method) is NOT caught (W1 mis-fire); explicit `builtins.open` / `io.open`
   // module-prefix forms ARE caught (real write channels).
   if (/(?<![\w.$])\bopen\s*\([^)]*['"](?:[wax](?:[bt]\+?|[bt])?|r(?:[bt])?\+)[bt+]*['"]/.test(code)) return true
-  if (/\b(?:builtins|io)\s*\.\s*open\s*\([^)]*['"](?:[wax](?:[bt]\+?|[bt])?|r(?:[bt])?\+)[bt+]*['"]/.test(code)) return true
+  if (new RegExp(`\\b(?:builtins|io${biAliasesPart})\\s*\\.\\s*open\\s*\\([^)]*['"](?:[wax](?:[bt]\\+?|[bt])?|r(?:[bt])?\\+)[bt+]*['"]`).test(code)) return true
   // K1: node fs.open/openSync — the SECOND argument is a mode string, same
   // charset as python open; write modes must deny (they were in the fs
   // read-only strip table, so fs.openSync('/etc/x','w') rode local_exec).
   // X1: the prefix also covers renamed bindings (f=require('fs'), import f
   // from 'node:fs') — their write-mode open must deny exactly like `fs.`.
-  if (new RegExp(`\\b(?:fs${fsAliasesPart})\\.open(?:Sync)?\\s*\\([^)]*['"](?:[wax](?:[btx]\\+?|[btx])?|r(?:[bt])?\\+)[btx+]*['"]`).test(code)) return true
-  if (/\b(?:require|import)\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)\s*\.\s*open(?:Sync)?\s*\([^)]*['"](?:[wax](?:[btx]\+?|[btx])?|r(?:[bt])?\+)[btx+]*['"]/.test(code)) return true
+  if (new RegExp(`\\b(?:fs${fsAliasesPart})\\.open(?:Sync)?\\s*\\([^)]*['"](?:[wax](?:[btx]\\+?|[btx])?|r(?:[bt])?\\+|rs\\+)[btx+]*['"]`).test(code)) return true
+  if (/\b(?:require|import)\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)\s*\.\s*open(?:Sync)?\s*\([^)]*['"](?:[wax](?:[btx]\+?|[btx])?|r(?:[bt])?\+|rs\+)[btx+]*['"]/.test(code)) return true
   // J2: open() strict chain with a write method — the no-mode form
   // (open('/etc/x').write('a')) has no mode literal at all, so the mode
   // scan above misses it; the .write call itself is the danger.
   if (/(?<![\w.$])\bopen\s*\([^;)]*\)\s*\.\s*(?:write|truncate|writelines)\s*\(/.test(code)) return true
-  if (/\b(?:builtins|io)\s*\.\s*open\s*\([^;)]*\)\s*\.\s*(?:write|truncate|writelines)\s*\(/.test(code)) return true
+  if (new RegExp(`\\b(?:builtins|io${biAliasesPart})\\s*\\.\\s*open\\s*\\([^;)]*\\)\\s*\\.\\s*(?:write|truncate|writelines)\\s*\\(`).test(code)) return true
   // W2: the old ANY-identifier chain net (obj.writeFileSync( / Store()
   // .write_text() ) mis-denied unrelated classes — narrow it to Path-family
   // and open constructors only (aliased P(...) included via ctorNames).
@@ -860,6 +945,15 @@ function hasUnverifiableDanger(code: string): boolean {
   for (const m of stripped.matchAll(
     /\b(?:const|let|var)\s*(\w+)\s*=\s*(?:globalThis|global|window)\b/g,
   )) rootNames.add(m[1])
+  // Y3: root-name closure (const g=globalThis; const h=g; h.fetch(URL)) —
+  // two hops through plain re-binds.
+  for (let i = 0; i < 3; i++) {
+    for (const m of stripped.matchAll(
+      /\b(?:const|let|var)?\s*(\w+)\s*=\s*(\w+)\b/g,
+    )) {
+      if (rootNames.has(m[2])) rootNames.add(m[1])
+    }
+  }
   const rootRe = [...rootNames].join('|')
   for (const m of stripped.matchAll(
     new RegExp(`\\b(?:const|let|var)\\s*\\[\\s*([^\\]]*)\\s*\\]\\s*=\\s*\\[\\s*[^\\]]*\\b(?:${rootRe})\\s*\\.\\s*(?:fetch|process)\\b`, 'g'),
@@ -933,7 +1027,7 @@ function hasUnverifiableDanger(code: string): boolean {
     'watch', 'watchFile', 'unwatchFile', 'constants',
   ])
   const OPEN_MODE_RE =
-    /['"](?:[wax](?:[btx]\+?|[btx])?|r(?:[bt])?\+)[btx+]*['"]/
+    /['"](?:[wax](?:[btx]\+?|[btx])?|r(?:[bt])?\+|rs\+)[btx+]*['"]/
   for (const m of stripped.matchAll(
     /\bimport\s*\{\s*([^}]+)\s*\}\s*from\s*['"](?:node:)?(?:fs(?:\/promises)?|child_process)['"]/g,
   )) {
@@ -972,6 +1066,8 @@ function hasUnverifiableDanger(code: string): boolean {
   // X2/K2: transitive closure + unified alias-call check — runs AFTER every
   // alias source (N4 receivers, d) assignments, from-imports, ESM named
   // imports) has registered, so two-hop re-binds of ANY source deny.
+  // Y3: the call shape covers direct calls, (w)(…), [w][0](…), tagged
+  // templates (e`id`) and .call/.apply borrows.
   for (let i = 0; i < 3; i++) {
     for (const m of stripped.matchAll(
       /\b(?:const|let|var)?\s*(\w+)\s*=\s*(\w+)\b/g,
@@ -980,7 +1076,9 @@ function hasUnverifiableDanger(code: string): boolean {
     }
   }
   for (const n of dangerAliases) {
-    if (new RegExp(`\\b${n}\\s*(?:\\.\\s*(?:call|apply))?\\s*\\(`).test(stripped)) return true
+    if (new RegExp(
+      `\\b${n}\\s*(?:\\.\\s*(?:call|apply))?\\s*\\(|\\(\\s*${n}\\s*\\)\\s*\\(|\\[\\s*${n}\\s*\\]\\s*\\[\\s*0\\s*\\]\\s*\\(|\\b${n}\\s*\``,
+    ).test(stripped)) return true
   }
   // f) bare dangerous call names (any receiver). N2/J4: write-file primitives
   // (incl. promises-specific cp/mkdir/rmdir/symlink/link/chown) join the net
