@@ -13,7 +13,7 @@ const HOME = os.homedir()
 
 const MANIFEST = '/Volumes/SD/backup_manifest.plist'
 const HOST = '/Volumes/SD'
-const TARGET = `${HOME}/Claude Code/自治/README.md` // exists in backup AND locally
+const TARGET = `${HOME}/Self_Work/自治/README.md` // exists in backup AND locally
 
 function haveRealBackup(): boolean {
   // The guard must check what the tests actually depend on: the manifest

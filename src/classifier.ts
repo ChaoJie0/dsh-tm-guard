@@ -634,6 +634,23 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
  *     aliases, bare dangerous names, dynamic import/require) all deny.
  */
 function hasUnverifiableDanger(code: string): boolean {
+  // K3: mask comments BEFORE any net runs — a `# open('/etc/x','w')` or
+  // `// p.write_text('a')` comment must not trip the write nets. Line-START
+  // // (node) plus ANY # to end-of-line (python inline comments too —
+  // `x=1  # Path(...).write_text('a')` mis-fired); # is not a node comment
+  // and // inside strings is only masked at line start, so URLs survive.
+  code = code.replace(/(?:^|\n)\s*\/\/[^\n]*/g, '\n')
+  code = code.replace(/#[^\n]*/g, '\n')
+  // K1/J1-spill: constructor names — literal Path/PurePath plus aliases from
+  // `from pathlib import Path as P` (used by the bound-writer net AND the
+  // section-0 strict-chain net, so aliased P('/x').write_text( still denies).
+  const ctorNames = new Set(['Path', 'PurePath'])
+  for (const m of code.matchAll(
+    /\bfrom\s+pathlib\s+import\s+(?:Path|PurePath)(?:\s+as\s+(\w+))?\b/g,
+  )) {
+    if (m[1]) ctorNames.add(m[1])
+  }
+  const ctorReStr = [...ctorNames].join('|')
   // 0) UNCONDITIONAL shapes — these are dangerous with or without any import
   // (H3): python builtin open() in a WRITE mode (w/a/x, optional b/+/t)
   // writes arbitrary paths, and Path-family write methods (Path('/etc/x')
@@ -648,12 +665,20 @@ function hasUnverifiableDanger(code: string): boolean {
   // module-prefix forms ARE caught (real write channels).
   if (/(?<![\w.$])\bopen\s*\([^)]*['"](?:[wax](?:[bt]\+?|[bt])?|r(?:[bt])?\+)[bt+]*['"]/.test(code)) return true
   if (/\b(?:builtins|io)\s*\.\s*open\s*\([^)]*['"](?:[wax](?:[bt]\+?|[bt])?|r(?:[bt])?\+)[bt+]*['"]/.test(code)) return true
+  // K1: node fs.open/openSync — the SECOND argument is a mode string, same
+  // charset as python open; write modes must deny (they were in the fs
+  // read-only strip table, so fs.openSync('/etc/x','w') rode local_exec).
+  if (/\bfs\.open(?:Sync)?\s*\([^)]*['"](?:[wax](?:[btx]\+?|[btx])?|r(?:[bt])?\+)[btx+]*['"]/.test(code)) return true
+  if (/\b(?:require|import)\s*\(\s*['"]fs['"]\s*\)\s*\.\s*open(?:Sync)?\s*\([^)]*['"](?:[wax](?:[btx]\+?|[btx])?|r(?:[bt])?\+)[btx+]*['"]/.test(code)) return true
   // J2: open() strict chain with a write method — the no-mode form
   // (open('/etc/x').write('a')) has no mode literal at all, so the mode
   // scan above misses it; the .write call itself is the danger.
   if (/(?<![\w.$])\bopen\s*\([^;)]*\)\s*\.\s*(?:write|truncate|writelines)\s*\(/.test(code)) return true
   if (/\b(?:builtins|io)\s*\.\s*open\s*\([^;)]*\)\s*\.\s*(?:write|truncate|writelines)\s*\(/.test(code)) return true
-  if (/\b\w+\s*\([^;)]*\)\s*\.\s*(?:write_text|write_bytes|open|unlink|mkdir|rmdir|rename|replace|touch|chmod|symlink_to|hardlink_to)\s*\(/.test(code)) return true
+  // W2: the old ANY-identifier chain net (obj.writeFileSync( / Store()
+  // .write_text() ) mis-denied unrelated classes — narrow it to Path-family
+  // and open constructors only (aliased P(...) included via ctorNames).
+  if (new RegExp(`\\b(?:${ctorReStr}|pathlib\\.\\w+|(?<![\\w.$])open)\\s*\\([^;)]*\\)\\s*\\.\\s*(?:write_text|write_bytes|unlink|mkdir|rmdir|rename|replace|touch|chmod|symlink_to|hardlink_to|open|write|truncate|writelines)\\s*\\(`).test(code)) return true
 
   // 0.5) N3/J2/W1: variables bound from a Path-family constructor or open()
   // get a write-method net. N3's original "constructor present → ANY
@@ -666,14 +691,7 @@ function hasUnverifiableDanger(code: string): boolean {
   // variable-held open — lands here. Runs BEFORE the high-risk check so
   // import-less blocks (f=open(...); f.write('a')) are covered too.
   const boundWriters = new Set<string>()
-  const ctorNames = new Set(['Path', 'PurePath'])
-  // J1-spill: `from pathlib import Path as P` — P is a constructor alias.
-  for (const m of code.matchAll(
-    /\bfrom\s+pathlib\s+import\s+(?:Path|PurePath)(?:\s+as\s+(\w+))?\b/g,
-  )) {
-    if (m[1]) ctorNames.add(m[1])
-  }
-  const ctorRe = new RegExp(`\\b(?:const|let|var)?\\s*(\\w+)\\s*=\\s*(?:${[...ctorNames].join('|')}|\\w+\\.(?:Path|PurePath))\\s*\\(`, 'g')
+  const ctorRe = new RegExp(`\\b(?:const|let|var)?\\s*(\\w+)\\s*=\\s*(?:${ctorReStr}|\\w+\\.(?:Path|PurePath))\\s*\\(`, 'g')
   for (const m of code.matchAll(ctorRe)) boundWriters.add(m[1])
   for (const m of code.matchAll(
     /\b(?:const|let|var)?\s*(\w+)\s*=\s*open\s*\([^;)]*\)/g,
@@ -718,7 +736,11 @@ function hasUnverifiableDanger(code: string): boolean {
   if (!HIGH_RISK_IMPORT.some((re) => re.test(code))) {
     // No high-risk module: keep only the bare dangerous-name net
     // (exec/eval/fetch/spawn...) for inline code without imports.
-    return /\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function|runInNewContext|runInThisContext|writeFileSync|writeFile|appendFileSync|appendFile|rmSync|rm|unlinkSync|unlink|chmodSync|chmod|renameSync|rename|copyFileSync|copyFile|truncateSync|truncate|cp|mkdir|mkdirSync|rmdir|rmdirSync|symlink|symlinkSync|link|linkSync|chown|chownSync)\s*\(/.test(code)
+    // W2/K3: bare-name net must not catch MEMBER calls (Store().writeFileSync
+    // ( — unrelated object methods mis-denied). (?<![\w.$]) keeps the net for
+    // true bare calls; member forms are adjudicated by the module/binding
+    // nets.
+    return /(?<![\w.$])\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function|runInNewContext|runInThisContext|writeFileSync|writeFile|appendFileSync|appendFile|rmSync|rm|unlinkSync|unlink|chmodSync|chmod|renameSync|rename|copyFileSync|copyFile|truncateSync|truncate|cp|mkdir|mkdirSync|rmdir|rmdirSync|symlink|symlinkSync|link|linkSync|chown|chownSync|createWriteStream|writeSync|fsyncSync|fsync|fdatasyncSync|fdatasync|futimesSync|futimes|fchmodSync|fchmod|fchownSync|fchown|ftruncateSync|ftruncate)\s*\(/.test(code)
   }
 
   // 2) Strip provably read-only member calls first (M2).
@@ -746,6 +768,10 @@ function hasUnverifiableDanger(code: string): boolean {
     // read-only too; strip it or r(...) gets denied while the non-renamed
     // destructure is allowed.
     '\\b(?:const|let|var)\\s*\\{\\s*(?:readFileSync|readFile|existsSync|statSync|lstatSync|readdirSync|readdir|realpathSync|realpath|readlinkSync|readlink|accessSync|access|fstatSync|openSync|open|createReadStream|watch|watchFile|unwatchFile|constants)\\s*(?::\\s*\\w+)?\\s*\\}\\s*=\\s*require\\s*\\(\\s*[\'"]fs[\'"]\\s*\\)',
+    // read-only dotted import alias: import os.path as op — os.path has no
+    // write surface; without stripping, the alias would land in the member
+    // net and op.join(...) would mis-deny.
+    '\\bimport\\s+os\\.path\\s+as\\s+\\w+\\b',
     // W3: two-level destructure {promises:{readdir}} = require('fs') — the
     // modern read API nests under promises.
     '\\b(?:const|let|var)\\s*\\{\\s*promises\\s*:\\s*\\{\\s*(?:readFile|readdir|stat|lstat|realpath|readlink|access|readFileSync|readdirSync|statSync|lstatSync|realpathSync|readlinkSync|accessSync)\\s*(?::\\s*\\w+)?\\s*\\}\\s*\\}\\s*=\\s*require\\s*\\(\\s*[\'"]fs[\'"]\\s*\\)',
@@ -765,11 +791,22 @@ function hasUnverifiableDanger(code: string): boolean {
   // b) dynamic getattr
   if (/\bgetattr\s*\(/.test(stripped)) return true
   // c) high-risk module member calls, incl. `import subprocess as s` aliases
+  // and DOTTED python imports (`import urllib.request as u` — the .urlopen
+  // member call was riding the bare-name net until the W2 lookbehind).
   const moduleAliases = [
-    ...(stripped.matchAll(/\bimport\s+(\w+)\s+as\s+(\w+)\b/g) || []),
-  ].map((m) => m[2])
+    ...(stripped.matchAll(/\bimport\s+[\w.]+(?:\s+as\s+(\w+))?\b/g) || []),
+  ].map((m) => m[1]).filter((x): x is string => !!x)
+  // K1/W2-spill: fs bound to a RENAMED variable (const f=require('fs'),
+  // import f from 'node:fs', import * as f) — the read-only strip removes
+  // the binding itself, and with the bare-net lookbehind the member call
+  // f.writeFileSync(...) must be adjudicated by the module member net.
+  const fsVarAliases = [
+    ...(code.matchAll(/\b(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"]fs['"]\s*\)/g) || []),
+    ...(code.matchAll(/\bimport\s+(\w+)\s+from\s*['"](?:node:)?fs(?:\/promises)?['"]/g) || []),
+    ...(code.matchAll(/\bimport\s*\*\s*as\s+(\w+)\s+from\s*['"](?:node:)?fs(?:\/promises)?['"]/g) || []),
+  ].map((m) => m[1])
   const modNames = ['subprocess', 'os', 'shutil', 'pathlib', 'requests',
-    'urllib', 'child_process', 'fs', ...moduleAliases]
+    'urllib', 'child_process', 'fs', ...moduleAliases, ...fsVarAliases]
   for (const mod of modNames) {
     if (new RegExp(`\\b${mod}\\s*\\.\\s*\\w+\\s*\\(`).test(stripped)) return true
   }
@@ -777,32 +814,39 @@ function hasUnverifiableDanger(code: string): boolean {
   // node write API and the single-hop regex let writeFile/rm/unlink/
   // appendFile/chmod sail through.
   if (/\bfs\.promises\s*\.\s*\w+\s*\(/.test(stripped)) return true
-  // N4: destructuring / array-binding / optional-chain receivers of
-  // high-risk capabilities. const {fetch: fc}=globalThis; fc(URL),
-  // const [f]=[globalThis.fetch]; f(URL), const f=globalThis?.fetch; f(URL).
+  // N4/K2: destructuring / array-binding / optional-chain receivers of
+  // high-risk capabilities. All alias registrations go into one set, then a
+  // transitive-closure pass (same as boundWriters) chases two-hop re-binds
+  // (const {fetch:f}=globalThis; const hh=f; hh(URL)) — the per-net immediate
+  // check let hh through.
+  const dangerAliases = new Set<string>()
   for (const m of stripped.matchAll(
     /\b(?:const|let|var)\s*\{\s*(\w+)\s*(?::\s*(\w+))?\s*\}\s*=\s*(?:(?:globalThis|global|window)|require\([^)]*\))\b/g,
   )) {
-    const alias = m[2] || m[1]
-    if (alias && new RegExp(`\\b${alias}\\s*(?:\\.\\s*(?:call|apply))?\\s*\\(`).test(stripped)) return true
+    dangerAliases.add(m[2] || m[1])
   }
   // J3: nested destructuring {process:{kill:k}} — one more brace level than
   // the net above; the rename slips the one-level pattern.
   for (const m of stripped.matchAll(
     /\b(?:const|let|var)\s*\{\s*\w+\s*:\s*\{\s*\w+\s*(?::\s*(\w+))?\s*\}\s*\}\s*=\s*(?:(?:globalThis|global|window)|require\([^)]*\))\b/g,
   )) {
-    const alias = m[1]
-    if (alias && new RegExp(`\\b${alias}\\s*(?:\\.\\s*(?:call|apply))?\\s*\\(`).test(stripped)) return true
+    dangerAliases.add(m[1])
   }
   // N4/J3: array binding with the target at ANY position (const [x,f]=
-  // [1,globalThis.fetch] — the single-element net anchors [f]= and the
+  // [1,globalThis.fetch] — the single-element net anchored [f]= and the
   // comma form [,f] slipped). Every name in the left bracket is checked.
-  const arrRe =
-    /\b(?:const|let|var)\s*\[\s*([^\]]*)\s*\]\s*=\s*\[\s*[^\]]*\b(?:globalThis|global|window)\s*\.\s*(?:fetch|process)\b/g
-  for (const m of stripped.matchAll(arrRe)) {
-    for (const name of (m[1].match(/\w+/g) ?? [])) {
-      if (new RegExp(`\\b${name}\\s*(?:\\.\\s*(?:call|apply))?\\s*\\(`).test(stripped)) return true
-    }
+  // K2: the right side may reach the capability through a ROOT variable
+  // (const g=globalThis; const [f]=[g.fetch]) — roots = the literals plus
+  // any identifier assigned from them.
+  const rootNames = new Set(['globalThis', 'global', 'window'])
+  for (const m of stripped.matchAll(
+    /\b(?:const|let|var)\s*(\w+)\s*=\s*(?:globalThis|global|window)\b/g,
+  )) rootNames.add(m[1])
+  const rootRe = [...rootNames].join('|')
+  for (const m of stripped.matchAll(
+    new RegExp(`\\b(?:const|let|var)\\s*\\[\\s*([^\\]]*)\\s*\\]\\s*=\\s*\\[\\s*[^\\]]*\\b(?:${rootRe})\\s*\\.\\s*(?:fetch|process)\\b`, 'g'),
+  )) {
+    for (const name of (m[1].match(/\w+/g) ?? [])) dangerAliases.add(name)
   }
   // d) aliased assignment calls: const f = fetch; f(URL). The RHS may be a
   // member expression (globalThis.fetch, globalThis.process.kill, any dotted
@@ -813,8 +857,18 @@ function hasUnverifiableDanger(code: string): boolean {
   for (const m of stripped.matchAll(
     /\b(?:const|let|var)?\s*(\w+)\s*=\s*(?:(?:globalThis|global|window)\s*\.\s*)?(?:fetch|requests\.\w+|subprocess\.\w+|child_process\.\w+|process\.\w+|require\([^)]*\)|import\([^)]*\)|exec|eval|spawn|execSync|execFileSync|\w+(?:\?\.\w+|\.\w+)+|\w+\s*\[\s*[^\]\s]*['"]\w+['"][^\]\s]*\s*\])(?=[^$\w]|$)/g,
   )) {
-    const name = m[1]
-    if (name && new RegExp(`\\b${name}\\s*(?:\\.\\s*(?:call|apply))?\\s*\\(`).test(stripped)) return true
+    if (m[1]) dangerAliases.add(m[1])
+  }
+  // K2: transitive closure over simple re-binds (hh=f / g2=g1).
+  for (let i = 0; i < 3; i++) {
+    for (const m of stripped.matchAll(
+      /\b(?:const|let|var)?\s*(\w+)\s*=\s*(\w+)\b/g,
+    )) {
+      if (dangerAliases.has(m[2])) dangerAliases.add(m[1])
+    }
+  }
+  for (const n of dangerAliases) {
+    if (new RegExp(`\\b${n}\\s*(?:\\.\\s*(?:call|apply))?\\s*\\(`).test(stripped)) return true
   }
   // J3: .call/.apply borrow WITHOUT an assignment — globalThis.fetch.call(
   // globalThis, URL) rides a member expression, so no alias net ever sees
@@ -834,6 +888,8 @@ function hasUnverifiableDanger(code: string): boolean {
     'appendFileSync', 'rename', 'renameSync', 'symlink', 'symlinkSync',
     'copyfile', 'move', 'shutil', 'rm', 'truncate', 'link', 'linkSync',
     'cp', 'mkdir', 'mkdirSync', 'rmdir', 'rmdirSync', 'chown', 'chownSync',
+    'createWriteStream', 'writeSync', 'fsync', 'fsyncSync', 'fdatasync',
+    'futimes', 'fchmod', 'fchmodSync', 'fchown', 'fchownSync', 'ftruncate',
   ])
   const HIGH_RISK_SOURCES = new Set(
     ['subprocess', 'os', 'shutil', 'pathlib', 'requests', 'urllib'],
@@ -875,25 +931,34 @@ function hasUnverifiableDanger(code: string): boolean {
   // (incl. promises-specific cp/mkdir/rmdir/symlink/link/chown) join the net
   // so ESM named imports (import {writeFileSync} from 'node:fs') and any
   // unverified write-file call deny.
-  if (/\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function|runInNewContext|runInThisContext|writeFileSync|writeFile|appendFileSync|appendFile|rmSync|rm|unlinkSync|unlink|chmodSync|chmod|renameSync|rename|copyFileSync|copyFile|truncateSync|truncate|cp|mkdir|mkdirSync|rmdir|rmdirSync|symlink|symlinkSync|link|linkSync|chown|chownSync)\s*\(/.test(stripped)) return true
+  if (/(?<![\w.$])\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function|runInNewContext|runInThisContext|writeFileSync|writeFile|appendFileSync|appendFile|rmSync|rm|unlinkSync|unlink|chmodSync|chmod|renameSync|rename|copyFileSync|copyFile|truncateSync|truncate|cp|mkdir|mkdirSync|rmdir|rmdirSync|symlink|symlinkSync|link|linkSync|chown|chownSync|createWriteStream|writeSync|fsyncSync|fsync|fdatasyncSync|fdatasync|futimesSync|futimes|fchmodSync|fchmod|fchownSync|fchown|ftruncateSync|ftruncate)\s*\(/.test(stripped)) return true
   // J1: ESM named imports with `as` aliases — import {writeFileSync as w}
   // from 'node:fs' renames the primitive, so the bare-name net (keyed on
   // ORIGINAL names) misses w(...). Classify per capability: write/exec
   // primitives → register the alias as dangerous; read-only → strip.
+  // K1: fd-family and stream-family write APIs (writeSync/createWriteStream
+  // /fsync/fchmod/fchown/ftruncate...) join the write table; open/openSync
+  // leave the read table (their second arg is a MODE string — 'w' writes);
+  // and the default policy flips: a named import from fs/child_process that
+  // is NOT on the read table denies its alias call (fail-closed) — future
+  // write APIs can't silently sail through.
   const FS_WRITE_PRIMS = [
     'writeFileSync', 'writeFile', 'appendFileSync', 'appendFile', 'rmSync',
     'rm', 'unlinkSync', 'unlink', 'chmodSync', 'chmod', 'renameSync',
     'rename', 'copyFileSync', 'copyFile', 'truncateSync', 'truncate', 'cp',
     'mkdir', 'mkdirSync', 'rmdir', 'rmdirSync', 'symlink', 'symlinkSync',
-    'link', 'linkSync', 'chown', 'chownSync',
+    'link', 'linkSync', 'chown', 'chownSync', 'createWriteStream',
+    'writeSync', 'write', 'fsyncSync', 'fsync', 'fdatasyncSync',
+    'fdatasync', 'futimesSync', 'futimes', 'fchmodSync', 'fchmod',
+    'fchownSync', 'fchown', 'ftruncateSync', 'ftruncate',
   ]
   const CP_EXEC_PRIMS = ['execSync', 'execFileSync', 'spawn', 'spawnSync',
     'fork', 'exec']
   const FS_READ_PRIMS = new Set([
     'readFileSync', 'readFile', 'existsSync', 'statSync', 'lstatSync',
     'readdirSync', 'readdir', 'realpathSync', 'realpath', 'readlinkSync',
-    'readlink', 'accessSync', 'access', 'fstatSync', 'openSync', 'open',
-    'createReadStream', 'watch', 'watchFile', 'unwatchFile', 'constants',
+    'readlink', 'accessSync', 'access', 'fstatSync', 'createReadStream',
+    'watch', 'watchFile', 'unwatchFile', 'constants', 'createReadStream',
   ])
   for (const m of stripped.matchAll(
     /\bimport\s*\{\s*([^}]+)\s*\}\s*from\s*['"](?:node:)?(?:fs(?:\/promises)?|child_process)['"]/g,
@@ -903,10 +968,16 @@ function hasUnverifiableDanger(code: string): boolean {
       if (!sm) continue
       const orig = sm[1]
       const alias = sm[2] || sm[1]
-      if (FS_READ_PRIMS.has(orig)) continue // read-only import stays allowed
-      if ((FS_WRITE_PRIMS.includes(orig) || CP_EXEC_PRIMS.includes(orig)) &&
+      // K1 policy flip: NOT on the read table → deny when the alias is
+      // called (fs/child_process named imports are capability surface).
+      if (!FS_READ_PRIMS.has(orig) &&
         new RegExp(`\\b${alias}\\s*(?:\\.\\s*(?:call|apply))?\\s*\\(`).test(stripped)) return true
     }
+  }
+  // K2: root-variable member calls (const g=globalThis; g.fetch(URL)) —
+  // root names act as a capability namespace, same as module aliases.
+  for (const r of rootNames) {
+    if (new RegExp(`\\b${r}\\s*\\.\\s*(?:fetch|process\\.\\w+|require\\s*\\(|import\\s*\\()`).test(stripped)) return true
   }
   // g) dynamic import/require
   if (/\b(?:require|import)\s*\(/.test(stripped)) return true
