@@ -500,7 +500,27 @@ function extractWritePaths(command: string): string[] {
  * code stays local_exec); the caller then checks DANGEROUS_CALL_PATTERNS and
  * fails closed to unknown when a dangerous call site cannot be verified.
  */
-function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 'kill' } | null {
+/**
+ * Shared inline-code extraction (H4): strip environment-style flags that do
+ * NOT carry code (--input-type=module/commonjs, --experimental-*, --no-*)
+ * BEFORE matching `-c/-e/--eval CODE`. The old regex matched
+ * `--input-type=module` as a code-carrying flag, so
+ * `node --input-type=module -e "import('child_process')…"` took `-e` as the
+ * code and the N2 gate never fired. Both call sites (extractWrappedCommand
+ * and the N2 branch in classifyBashCommand) MUST use this same function.
+ */
+function extractInlineCode(rest: string): string {
+  let s = rest.trim()
+  let prev = ''
+  while (s !== prev) {
+    prev = s
+    s = s.replace(/^(?:--input-type=\w+|--experimental-[\w-]+|--no-[\w-]+)\s+/, '')
+  }
+  const m = s.match(/^(?:-c|-e|--eval)\s*(?:=\s*)?(?:"([^"]*)"|'([^']*)'|(\S+))/)
+  return m?.[1] ?? m?.[2] ?? m?.[3] ?? ''
+}
+
+function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 'kill'; shellString?: boolean } | null {
   // python3 -m MODULE … — module mode runs a real command (python3 -m pip
   // install x is package management, python3 -m http.server is a local server).
   const moduleM = rest.match(/^(?:-m|-m=|--module)\s*([A-Za-z0-9_.-]+)/)
@@ -515,8 +535,7 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
     }
     return null
   }
-  const codeM = rest.match(/^(?:-c|-e|--eval|--input-type=module)\s*(?:=\s*)?(?:"([^"]*)"|'([^']*)'|(\S+))/)
-  const code = codeM?.[1] ?? codeM?.[2] ?? codeM?.[3]
+  const code = extractInlineCode(rest)
   if (!code) return null
 
   // Reassemble a python list literal into a shell-ish command string:
@@ -558,7 +577,12 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
   )
   if (py) {
     const cmd = py[1] ?? py[2] ?? ''
-    if (cmd) return { command: cmd, kind: 'exec' }
+    // H1: os.system/os.popen are shell-string execution primitives — the
+    // string can hold ANY command and a benign-looking literal cannot be
+    // proven safe against concatenation, so mark it shellString and let the
+    // caller fail closed even when the inner string classifies local/read.
+    const shellString = py[2] != null
+    if (cmd) return { command: cmd, kind: 'exec', shellString }
   }
   // python requests/urllib direct network calls in inline code
   const net = code.match(/(?:requests\.(?:get|post|put|delete|head)\s*\(\s*["'](https?:\/\/[^"']+)["']|urllib\.request\.urlopen\s*\(\s*["'](https?:\/\/[^"']+)["'])/)
@@ -602,6 +626,18 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
  *     aliases, bare dangerous names, dynamic import/require) all deny.
  */
 function hasUnverifiableDanger(code: string): boolean {
+  // 0) UNCONDITIONAL shapes — these are dangerous with or without any import
+  // (H3): python builtin open() in a WRITE mode (w/a/x, optional b/+/t)
+  // writes arbitrary paths, and Path-family write methods (Path('/etc/x')
+  // .write_text(...), aliased P(...) from `from pathlib import Path as P`,
+  // or an unimported call) write too. Read-mode open('/etc/hosts').read()
+  // and Path(...).resolve()/exists() read-only calls stay allowed (the
+  // read-only strip handles those). `[^;)]*` must swallow the path (string
+  // or variable); a chr()-obfuscated argument can defeat it, but the literal
+  // path is what the gate needs to catch.
+  if (/\bopen\s*\([^)]*['"][wax][bt+]*['"]/.test(code)) return true
+  if (/\b\w+\s*\([^;)]*\)\s*\.\s*(?:write_text|write_bytes|open|unlink|mkdir|rmdir|rename|replace|touch|chmod|symlink_to|hardlink_to)\s*\(/.test(code)) return true
+
   // 1) High-risk capability introduced into the block.
   const HIGH_RISK_IMPORT = [
     /\b(?:import|from)\s+(?:subprocess|os|shutil|pathlib|requests|urllib)\b/,
@@ -611,11 +647,15 @@ function hasUnverifiableDanger(code: string): boolean {
     /\bprocess\b/,
     /\bfetch\b/,
     /\brequire\s*\(/,
+    // H4: dynamic import() of ANY module is a capability injection point
+    // (import('child_process').then(m=>m.execSync(...))); read-only imports
+    // (import('path')) are stripped below by the symmetric import() list.
+    /\bimport\s*\(/,
   ]
   if (!HIGH_RISK_IMPORT.some((re) => re.test(code))) {
     // No high-risk module: keep only the bare dangerous-name net
     // (exec/eval/fetch/spawn...) for inline code without imports.
-    return /\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function)\s*\(/.test(code)
+    return /\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function|runInNewContext|runInThisContext)\s*\(/.test(code)
   }
 
   // 2) Strip provably read-only member calls first (M2).
@@ -630,12 +670,20 @@ function hasUnverifiableDanger(code: string): boolean {
     // node process read-only surface
     '\\bprocess\\.(?:env|argv|cwd|pid|ppid|version|platform|arch|title|exitCode|stdin|stdout|stderr|execPath|execArgv|versions|release|uptime|hrtime|memoryUsage)\\b',
     '\\bconsole\\.\\w+\\s*\\(',
-    // node fs read-only methods (require('fs').readFileSync...)
+    // node fs read-only methods — inline chain (require('fs').readFileSync…)
+    // AND variable-held forms (const fs=require('fs'); fs.existsSync(…)) (H7).
     '\\b(?:require|import)\\s*\\(\\s*[\'"]fs[\'"]\\s*\\)\\s*\\.\\s*(?:readFileSync|readFile|existsSync|statSync|lstatSync|readdirSync|readdir|realpathSync|realpath|readlinkSync|readlink|accessSync|access|fstatSync|openSync|open|createReadStream|watch|watchFile|unwatchFile|constants)\\b',
+    '\\bfs\\s*\\.\\s*(?:readFileSync|readFile|existsSync|statSync|lstatSync|readdirSync|readdir|realpathSync|realpath|readlinkSync|readlink|accessSync|access|fstatSync|openSync|open|createReadStream|watch|watchFile|unwatchFile|constants)\\b',
+    // require('fs') bound to a variable is itself inert — the danger is in
+    // the member call, which the fs read/write nets above/below adjudicate.
+    '\\b(?:const|let|var)\\s+\\w+\\s*=\\s*require\\s*\\(\\s*[\'"]fs[\'"]\\s*\\)',
     // node read-only stdlib requires. NOTE: networking modules (http/https/
     // net/tls/dns/worker_threads) are deliberately NOT here — require('http')
-    // .request(...) would be stripped whole and ride local_exec.
+    // .request(...) would be stripped whole and ride local_exec. Symmetric
+    // import() list for H4 so import('path') stays local while
+    // import('http')/import('child_process') trip the dynamic-import net.
     '\\brequire\\s*\\(\\s*[\'"](?:path|util|url|os|events|stream|crypto|zlib|buffer|string_decoder|querystring|timers|assert|perf_hooks|async_hooks|cluster|domain|v8|vm|wasi|repl|readline|module|punycode|sys|trace_events|inspector)["\']\\s*\\)',
+    '\\bimport\\s*\\(\\s*[\'"](?:path|util|url|os|events|stream|crypto|zlib|buffer|string_decoder|querystring|timers|assert|perf_hooks|async_hooks|cluster|domain|v8|vm|wasi|repl|readline|module|punycode|sys|trace_events|inspector)["\']\\s*\\)',
   ]
   const stripped = code.replace(new RegExp(READONLY_MEMBERS.join('|'), 'g'), '')
 
@@ -653,14 +701,21 @@ function hasUnverifiableDanger(code: string): boolean {
   for (const mod of modNames) {
     if (new RegExp(`\\b${mod}\\s*\\.\\s*\\w+\\s*\\(`).test(stripped)) return true
   }
-  // d) aliased assignment calls: const f = fetch; f(URL)
+  // c) high-risk module member calls, incl. `import subprocess as s` aliases
+  // a member expression (globalThis.fetch, globalThis.process.kill, any
+  // dotted chain) — a bare-identifier-only RHS candidate was the hole.
   for (const m of stripped.matchAll(
-    /\b(?:const|let|var)?\s*(\w+)\s*=\s*(?:fetch|requests\.\w+|subprocess\.\w+|child_process\.\w+|process\.\w+|require\([^)]*\)|import\([^)]*\)|exec|eval|spawn|execSync|execFileSync)\b/g,
+    /\b(?:const|let|var)?\s*(\w+)\s*=\s*(?:(?:globalThis|global|window)\s*\.\s*)?(?:fetch|requests\.\w+|subprocess\.\w+|child_process\.\w+|process\.\w+|require\([^)]*\)|import\([^)]*\)|exec|eval|spawn|execSync|execFileSync|\w+(?:\.\w+)+)\b/g,
   )) {
     const name = m[1]
     if (name && new RegExp(`\\b${name}\\s*\\(`).test(stripped)) return true
   }
   // e) dangerous from-import aliases: from shutil import rmtree as r; r(...)
+  // H3.3/H6: constrain by SOURCE module — an import name from a high-risk
+  // module (subprocess/os/shutil/pathlib/requests/urllib) is a dangerous
+  // alias no matter how generic the name (chmod/remove from os, get from
+  // requests). pathlib Path is handled by the write-method net above
+  // (construction itself is read-only).
   const DANGEROUS_IMPORT_NAMES = new Set([
     'run', 'call', 'check_call', 'check_output', 'Popen', 'system', 'popen',
     'urlopen', 'exec', 'eval', 'spawn', 'execSync', 'execFileSync',
@@ -669,15 +724,23 @@ function hasUnverifiableDanger(code: string): boolean {
     'appendFileSync', 'rename', 'renameSync', 'symlink', 'symlinkSync',
     'copyfile', 'move', 'shutil', 'rm', 'truncate', 'link', 'linkSync',
   ])
+  const HIGH_RISK_SOURCES = new Set(
+    ['subprocess', 'os', 'shutil', 'pathlib', 'requests', 'urllib'],
+  )
   for (const m of stripped.matchAll(
     /\bfrom\s+(\w+)\s+import\s+(\w+)(?:\s+as\s+(\w+))?\b/g,
   )) {
+    const src = m[1]
     const orig = m[2]
     const alias = m[3] || m[2]
+    if (src === 'pathlib' && (orig === 'Path' || orig === 'PurePath')) {
+      continue // write-method net above adjudicates; construction is read-only
+    }
+    if (HIGH_RISK_SOURCES.has(src) && new RegExp(`\\b${alias}\\s*\\(`).test(stripped)) return true
     if (DANGEROUS_IMPORT_NAMES.has(orig) && new RegExp(`\\b${alias}\\s*\\(`).test(stripped)) return true
   }
   // f) bare dangerous call names (any receiver)
-  if (/\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function)\s*\(/.test(stripped)) return true
+  if (/\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function|runInNewContext|runInThisContext)\s*\(/.test(stripped)) return true
   // g) dynamic import/require
   if (/\b(?:require|import)\s*\(/.test(stripped)) return true
 
@@ -1152,10 +1215,26 @@ function classifySingleCommand(command: string): ClassifyResult {
         targetPaths: [],
       }
     }
-    if (uvSub === 'tool' && /^tool\s+install\b/.test(rest)) {
+    if (uvSub === 'tool' && /^tool\s+(?:install|run|upgrade|uninstall)\b/.test(rest)) {
       return {
         category: 'package',
-        reason: `uv tool install: ${fullCmd}`,
+        reason: `uv tool ${rest.split(/\s+/)[1] ?? 'op'} (fetches packages): ${fullCmd}`,
+        targetPaths: [],
+      }
+    }
+    // H5: `uv python install <ver>` downloads a Python build,
+    // `uv self update` pulls a new uv binary — both are network package ops.
+    if (uvSub === 'python' && /^python\s+(?:install|uninstall|download)\b/.test(rest)) {
+      return {
+        category: 'package',
+        reason: `uv python install/download: ${fullCmd}`,
+        targetPaths: [],
+      }
+    }
+    if (uvSub === 'self' && /^self\s+update\b/.test(rest)) {
+      return {
+        category: 'package',
+        reason: `uv self update: ${fullCmd}`,
         targetPaths: [],
       }
     }
@@ -1262,13 +1341,23 @@ function classifySingleCommand(command: string): ClassifyResult {
           mutates: inner.mutates,
         }
       }
+      if (wrapped.shellString) {
+        // H1: os.system/os.popen execute arbitrary shell. A local/read inner
+        // string ('id', 'echo hi') must NOT vouch for the primitive — the
+        // caller cannot see data flow (os.system(user_input) with a benign
+        // literal at rest is indistinguishable). Fail closed.
+        return {
+          category: 'unknown',
+          reason: `Shell-string exec via os.system/os.popen (unverifiable): ${wrapped.command.slice(0, 60)}`,
+          targetPaths: [],
+        }
+      }
     } else {
       // N2 (review): a dangerous call site whose arguments we cannot verify
       // (require('child_process').execSync(…), `from subprocess import run
       // as r`, destructured/spawn aliases, shell=True strings) fails closed
       // to unknown instead of riding local_exec.
-      const codeM2 = rest.match(/^(?:-c|-e|--eval|--input-type=module)\s*(?:=\s*)?(?:"([^"]*)"|'([^']*)'|(\S+))/)
-      const code2 = codeM2?.[1] ?? codeM2?.[2] ?? codeM2?.[3] ?? ''
+      const code2 = extractInlineCode(rest)
       if (code2 && hasUnverifiableDanger(code2)) {
         return {
           category: 'unknown',

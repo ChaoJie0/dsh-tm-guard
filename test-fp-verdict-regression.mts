@@ -215,6 +215,57 @@ check('node -e "require(\'fs\').readFileSync(\'/etc/hosts\',\'utf8\')"', { categ
 check('node -e "require(\'http\').request(\'http://example.invalid/x\',cb)"', { category: 'unknown', allow: false })
 check('node -e "require(\'https\').get(\'https://example.invalid/x\')"', { category: 'unknown', allow: false })
 check('node -e "require(\'net\').connect(\'1.2.3.4:443\')"', { category: 'unknown', allow: false })
+// Symmetric dynamic-import() entries (H4): read-only import('path') allowed,
+// networking/child_process dynamic imports denied.
+check('node -e "import(\'path\').then(p=>console.log(p.join(\'a\',\'b\')))"', { category: 'local_exec', allow: true })
+check('node --input-type=module -e "import(\'child_process\').then(m=>m.execSync(\'curl https://example.invalid/x\'))"', { category: 'unknown', allow: false })
+check('node --input-type=module -e "import(\'http\').then(h=>h.get(\'http://example.invalid/x\'))"', { category: 'unknown', allow: false })
+
+// ── H1: os.system/os.popen are shell-string exec primitives — fail closed ──
+check('python3 -c "import os; os.system(\'id\')"', { category: 'unknown', allow: false })
+check('python3 -c "import os; os.system(\'bash -i\')"', { category: 'unknown', allow: false })
+check('python3 -c "import os; print(os.system(\'id\'))"', { category: 'unknown', allow: false })
+check('python3 -c "import os; os.system(\'id\') # comment"', { category: 'unknown', allow: false })
+check('python3 -c "import os; os.popen(\'id\')"', { category: 'unknown', allow: false })
+
+// ── H2/H6: member-expression RHS aliases & requests from-import ──
+check('node -e "const f=globalThis.fetch;f(\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node -e "const f=globalThis.fetch\nf(\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node -e "const k=globalThis.process.kill;k(123)"', { category: 'unknown', allow: false })
+check('python3 -c "from requests import get as g; g(\'http://example.invalid\')"', { category: 'unknown', allow: false })
+
+// ── H3: builtin open() write modes / Path-family write methods / from-import
+// source-constrained aliases ──
+check('python3 -c "open(\'/etc/guardtest/x\',\'w\').write(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "with open(\'/etc/cron.d/gx\',\'w\') as f: f.write(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "from pathlib import Path as P; P(\'/etc/guardtest/x\').write_text(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "from pathlib import Path as P\nP(\'/etc/guardtest/x\').write_text(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "Path(\'/etc/guardtest/x\').write_text(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "from os import chmod; chmod(\'/etc/guardtest/x\',0o777)"', { category: 'unknown', allow: false })
+check('python3 -c "from os import remove; remove(\'/etc/guardtest/x\')"', { category: 'unknown', allow: false })
+// read-mode open / aliased-Path read-only stay allowed
+check('python3 -c "open(\'/etc/hosts\').read()"', { category: 'local_exec', allow: true })
+check('python3 -c "open(\'/etc/hosts\',\'rb\').read()"', { category: 'local_exec', allow: true })
+check('python3 -c "from pathlib import Path as P; print(P(\'.\').resolve())"', { category: 'local_exec', allow: true })
+
+// ── H5: uv python install/uninstall, tool run/upgrade, self update ──
+check('uv python install 3.12', { category: 'package', allow: false })
+check('uv python uninstall 3.11', { category: 'package', allow: false })
+check('uv tool run ruff', { category: 'package', allow: false })
+check('uv tool upgrade ruff', { category: 'package', allow: false })
+check('uv self update', { category: 'package', allow: false })
+check('uv python list', { category: 'local_exec', allow: true })
+check('uv tool list', { category: 'local_exec', allow: true })
+check('uv self version', { category: 'local_exec', allow: true })
+
+// ── H7: fs held in a variable — read-only members allowed, write members
+// still denied via the fs module-member net ──
+check('node -e "const fs=require(\'fs\');console.log(fs.existsSync(\'/tmp/x\'))"', { category: 'local_exec', allow: true })
+check('node -e "const fs=require(\'fs\');fs.statSync(\'/tmp\')"', { category: 'local_exec', allow: true })
+check('node -e "const fs=require(\'fs\');fs.writeFileSync(\'/etc/guardtest/x\',\'a\')"', { category: 'unknown', allow: false })
+
+// ── W4: vm run* contexts are code-execution primitives ──
+check('node -e "require(\'vm\').runInNewContext(\'os.system(\'id\')\')"', { category: 'unknown', allow: false })
 
 // ── N4: uv package operations denied, read/run forms allowed ──
 check('uv pip install x', { category: 'package', allow: false })
