@@ -77,6 +77,11 @@ const READ_COMMANDS = new Set([
   'readlink', 'realpath', 'dirname', 'basename',
   'shasum', 'md5', 'md5sum', 'sha1sum', 'sha256sum', 'sha512sum',
   'checksum', 'sum', 'cksum', 'strings', 'filepath',
+  // Read-only process / binary / metadata inspection (R1)
+  'pgrep', // find processes by name/pattern — read-only query
+  'otool', // inspect Mach-O binaries (linked libraries) — read-only
+  'mdls', // Spotlight metadata queries — read-only
+  'afinfo', // audio file metadata — read-only
 ])
 
 const FILE_WRITE_COMMANDS = new Set([
@@ -114,7 +119,9 @@ const NETWORK_COMMANDS = new Set([
   'svn checkout', 'svn co', 'svn update', 'svn up', 'svn commit',
   'svn ci', 'svn import', 'svn switch', 'svn merge',
   'npm install', 'npm i', 'npm update', 'npm uninstall', 'npm rm',
-  'npm publish', 'npm cache', 'npm audit', 'npm view', 'npm search',
+  'npm publish', 'npm cache', 'npm audit',
+  // NOTE: 'npm view' / 'npm search' are NOT here — they are read-only
+  // registry lookups handled as read by the package block below (R1).
   'yarn', 'yarn add', 'yarn remove', 'yarn upgrade', 'yarn install',
   'pnpm add', 'pnpm install', 'pnpm remove', 'pnpm update',
   'pip install', 'pip3 install', 'pip uninstall', 'pip download',
@@ -157,6 +164,16 @@ const LOCAL_EXEC_COMMANDS = new Set([
   'oxlint', 'standard', 'gofmt', 'goimports', 'golangci-lint', 'rustfmt',
   // Local servers / CLIs that only touch local files
   'flask', 'uvicorn', 'gunicorn',
+  // Local media / document converters and inspectors (R1): writing is
+  // decided by the OUTPUT path via extractWritePaths, so conversion within
+  // protected roots is allowed while /tmp or other unprotected outputs are
+  // denied. `-version`/`--help` probes fall under the read-only rule below.
+  'ffmpeg', 'ffprobe',
+  'avconvert', 'afconvert',
+  'soffice', 'libreoffice', 'textutil',
+  'qpdf', 'gs', 'mutool', 'magick', 'convert',
+  'uv', // uv version/help/init are local; `uv run --with` still hits network via LOCAL_PKG_SUBCOMMANDS absence → package
+  'swiftc',
 ])
 
 /** Package-manager subcommands that are LOCAL (build/test) vs network (install/fetch). */
@@ -283,7 +300,7 @@ function extractWritePaths(command: string): string[] {
       i++
       continue
     }
-    const glued = t.match(/^(?:\d?>>?|&>>?)(.+)$/)
+    const glued = t.match(/^(?:\d?>>?|&>>?)(?![&\d])(.+)$/)
     if (glued && glued[1]) paths.push(glued[1])
   }
 
@@ -358,9 +375,110 @@ function extractWritePaths(command: string): string[] {
     }
   }
 
+  // R1: media/document converter outputs — the trailing non-flag token is the
+  // output file (ffmpeg -y -i IN.m4a -ar 16000 OUT.wav; avconvert), while the
+  // `-i` INPUT marker must be skipped. `-f null -` probes write nothing.
+  // soffice writes converted files into `--outdir DIR`.
+  if (cmd === 'ffmpeg' || cmd === 'ffprobe' || cmd === 'avconvert' || cmd === 'afconvert') {
+    for (let i = 1; i < tokens.length; i++) {
+      const tok = tokens[i]
+      if (tok.startsWith('-')) continue
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) continue
+      if (tokens[i - 1] === '-i') continue // ffmpeg input marker
+      if (tok === '-') continue // stdout sink (`-f null -` probe)
+      if (/^(?:\d*[<>]&?\d*|\d*[<>]{1,2}|&[<>])$/.test(tok)) continue // redirection (2>&1, >, >>, &>, <)
+      // Last non-flag token is the output; earlier bare tokens are inputs
+      // that are not write targets.
+      if (i === tokens.length - 1) paths.push(tok)
+    }
+  }
+  if (cmd === 'soffice' || cmd === 'libreoffice') {
+    for (let i = 1; i < tokens.length; i++) {
+      if (tokens[i] === '--outdir' && tokens[i + 1]) {
+        paths.push(tokens[i + 1])
+        break
+      }
+    }
+  }
+  // pdftotext IN OUT: with an explicit output file the trailing non-flag
+  // token is the write target; a bare `pdftotext -layout IN` writes to stdout
+  // (only 1 non-flag token → nothing extracted).
+  if (cmd === 'pdftotext') {
+    const nonFlags = tokens.slice(1).filter(
+      (t) => !t.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) &&
+             !/^(?:\d*[<>]&?\d*|\d*[<>]{1,2}|&[<>])$/.test(t),
+    )
+    if (nonFlags.length >= 2) paths.push(nonFlags[nonFlags.length - 1])
+  }
+  // swiftc -o OUT: the compile output path decides write permission.
+  if (cmd === 'swiftc' || cmd === 'rustc' || cmd === 'javac' || cmd === 'kotlinc') {
+    for (let i = 1; i < tokens.length; i++) {
+      if (tokens[i] === '-o' && tokens[i + 1]) {
+        paths.push(tokens[i + 1])
+        break
+      }
+    }
+  }
+
   return paths.filter(
     (p) => p.length > 0 && p !== '/dev/null' && p !== '/dev/stdout',
   )
+}
+
+/* ------------------------------------------------------------------ */
+/* Interpreter-wrapped argv extraction (R5)                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Pull the wrapped executable out of interpreter inline code so it is
+ * classified on its own argv. Covers the bypass forms observed in the
+ * production audit: python subprocess/os, node child_process, and
+ * process.kill. Returns null when no wrapped executable is visible (plain
+ * print/side-effect code stays local_exec).
+ */
+function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 'kill' } | null {
+  // python3 -m MODULE … — module mode runs a real command (python3 -m pip
+  // install x is package management, python3 -m http.server is a local server).
+  const moduleM = rest.match(/^(?:-m|-m=|--module)\s*([A-Za-z0-9_.-]+)/)
+  if (moduleM) {
+    const mod = moduleM[1]
+    if (mod === 'pip' || mod === 'pip3') {
+      const args = rest.replace(/^(?:-m|-m=|--module)\s*[A-Za-z0-9_.-]+\s*/, '').trim()
+      return { command: `pip3 ${args}`.trim(), kind: 'exec' }
+    }
+    if (mod === 'http.server' || mod === 'SimpleHTTPServer') {
+      return { command: 'python3 http.server', kind: 'exec' }
+    }
+    return null
+  }
+  const codeM = rest.match(/^(?:-c|-e|--eval|--input-type=module)\s*(?:=\s*)?(?:"([^"]*)"|'([^']*)'|(\S+))/)
+  const code = codeM?.[1] ?? codeM?.[2] ?? codeM?.[3]
+  if (!code) return null
+  // python: subprocess.run(['cmd', 'a']) / os.system('cmd') / os.popen('cmd')
+  const py = code.match(
+    /(?:subprocess\.(?:run|call|check_call|check_output|Popen)\s*\(\s*\[\s*["']([^"']+)["']|os\.(?:system|popen)\s*\(\s*["']([^"']+)["'])/,
+  )
+  if (py) {
+    const cmd = py[1] ?? py[2] ?? ''
+    if (cmd) return { command: cmd, kind: 'exec' }
+  }
+  // python requests/urllib direct network calls in inline code
+  const net = code.match(/(?:requests\.(?:get|post|put|delete|head)\s*\(\s*["'](https?:\/\/[^"']+)["']|urllib\.request\.urlopen\s*\(\s*["'](https?:\/\/[^"']+)["'])/)
+  if (net) {
+    const url = net[1] ?? net[2] ?? ''
+    if (url) return { command: `curl ${url}`, kind: 'exec' }
+  }
+  // node: child_process.execSync('cmd') / execFileSync('cmd', [...]) /
+  // spawn('cmd', [...])
+  const nd = code.match(
+    /(?:child_process\.(?:execSync|exec|execFileSync|execFile|spawn|spawnSync)\s*\(\s*\[\s*["']([^"']+)["']|child_process\.(?:execSync|exec|spawn|spawnSync)\s*\(\s*["']([^"']+)["'])/,
+  )
+  if (nd) {
+    const cmd = nd[1] ?? nd[2] ?? ''
+    if (cmd) return { command: cmd, kind: 'exec' }
+  }
+  if (/\bprocess\.kill\s*\(/.test(code)) return { command: 'kill', kind: 'kill' }
+  return null
 }
 
 /* ------------------------------------------------------------------ */
@@ -389,7 +507,7 @@ function toAbsolute(path: string, baseDir: string = process.cwd()): string {
 }
 
 // Loopback hosts that count as local development targets, not external egress.
-const LOOPBACK = /\[::1\]|127\.0\.0\.1|localhost|0\.0\.0\.0/i
+const LOOPBACK = /\[::1\]|::1(?=[:\s"'`]|$)|127\.0\.0\.1|localhost(?:\.[a-z]+)*|0\.0\.0\.0/i
 
 /**
  * True when every network target in a command resolves to loopback.
@@ -401,7 +519,9 @@ function isLoopbackOnly(rest: string): boolean {
   // Any explicit http(s) URL to a non-loopback host → external.
   const urls = rest.match(/https?:\/\/[^\s"'`]+/gi) ?? []
   for (const u of urls) {
-    const host = u.replace(/^https?:\/\//i, '').split(/[:\/?#]/)[0]
+    // Split on /?# only so an IPv6 literal keeps its brackets ([::1]:8080),
+    // then drop the :port suffix before matching the loopback patterns.
+    const host = u.replace(/^https?:\/\//i, '').split(/[\/?#]/)[0].replace(/:\d+$/, '')
     if (host && !LOOPBACK.test(host)) return false
   }
   return true
@@ -641,9 +761,35 @@ function classifySingleCommand(command: string): ClassifyResult {
     return classifySingleCommand(inner)
   }
 
+  // `env CMD` runs CMD with an adjusted environment — classify the INNER
+  // command. Previously `env` sat in READ_COMMANDS, so `env curl https://…`
+  // (and `env uv --version`) sailed through as a read (R5 bypass #80/#81).
+  if (/^env\s+/i.test(trimmed)) {
+    let inner = trimmed.replace(/^env\s+/i, '').trim()
+    // Strip env flags and VAR=value assignments: env -i PATH=x CMD → CMD
+    while (/^-\w+(\s+\S+)?\s+/.test(inner)) inner = inner.replace(/^-\w+(\s+\S+)?\s+/, '').trim()
+    while (/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/.test(inner)) inner = inner.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/, '').trim()
+    if (!inner || /^-\w/.test(inner)) {
+      return { category: 'read', reason: 'env help/flag', targetPaths: [] }
+    }
+    return classifySingleCommand(inner)
+  }
+
   // Check catastrophic patterns first
   const catastrophic = matchCatastrophic(trimmed)
   if (catastrophic) return catastrophic
+
+  const segPart = trimmed.replace(/\s*[;&]\s*$/, '')
+  const segFirst = segPart.split(/\s+/)[0]?.toLowerCase() ?? ''
+
+  // Pure assignment segments (`VAR=hello` / `VAR=$(ls)` arriving as their own
+  // segment after `;`/`&&` splitting) have no side effects — read. Without
+  // this, `VAR=x; cmd` mis-classified the assignment half as unknown (R1
+  // tokenization fix, audit #9/#21/#65/#108). Only matches a single-token
+  // segment, so `NODE_USE_ENV_PROXY=1 npx …` keeps its env-strip path.
+  if (!/\s/.test(segPart.trim()) && /^[A-Za-z_][A-Za-z0-9_]*=/.test(segFirst)) {
+    return { category: 'read', reason: `Variable assignment: ${segPart}`, targetPaths: [] }
+  }
 
   // A pipeline hidden inside a paren group becomes visible after stripping;
   // classify each command and keep the most restrictive result. Splitting is
@@ -681,6 +827,7 @@ function classifySingleCommand(command: string): ClassifyResult {
   const rawFirst = cmdPart.split(/\s+/)[0]?.toLowerCase() ?? ''
   const firstWord = rawFirst.split('/').pop() ?? rawFirst
   const rest = cmdPart.slice(cmdPart.split(/\s+/)[0]?.length ?? 0).trim()
+  const subCmd = rest.split(/\s+/)[0]?.toLowerCase() ?? ''
 
   // Check subcommands (git, svn, brew, npm, etc.)
   const fullCmd = `${firstWord} ${rest.split(/\s+/)[0]?.toLowerCase() ?? ''}`.trim()
@@ -719,6 +866,20 @@ function classifySingleCommand(command: string): ClassifyResult {
     }
   }
 
+  // Read-only subcommand rule (R1): `--version` / `--help` / `version` /
+  // `help` probes of ANY command are read-only — `ffmpeg -version`,
+  // `soffice --version`, `sips --help`, `avconvert --help`, `qpdf --version`.
+  // Runs BEFORE the process/exec/network families so `sips --help` does not
+  // stay a process command. Deliberately excludes `-h`/`-v` (too ambiguous
+  // across tools: ls -h, curl -v).
+  if (subCmd !== '' && /^(?:-{1,2}version|-{1,2}help|version|help)$/i.test(subCmd)) {
+    return {
+      category: 'read',
+      reason: `Version/help probe: ${fullCmd}`,
+      targetPaths: [],
+    }
+  }
+
   // Process commands
   if (PROCESS_COMMANDS.has(firstWord) || PROCESS_COMMANDS.has(fullCmd)) {
     return {
@@ -728,16 +889,104 @@ function classifySingleCommand(command: string): ClassifyResult {
     }
   }
 
+  // Shell interpreters: `bash -c "CODE"` must classify the CODE string, not
+  // ride on the interpreter; `bash -n` is a pure syntax check; running a
+  // local script is local execution (outputs decided by path).
+  if (['bash', 'sh', 'zsh', 'dash'].includes(firstWord)) {
+    if (subCmd === '-c') {
+      const m = rest.match(/^-c\s+(?:"([^"]*)"|'([^']*)'|(\S+))/)
+      const code = m?.[1] ?? m?.[2] ?? m?.[3]
+      if (code) {
+        const inner = classifyBashCommand(code, [])
+        return inner
+      }
+      return {
+        category: 'mixed',
+        reason: `Shell -c without extractable code: ${fullCmd}`,
+        targetPaths: [],
+      }
+    }
+    if (subCmd === '-n') {
+      return {
+        category: 'read',
+        reason: `Shell syntax check: ${fullCmd}`,
+        targetPaths: [],
+      }
+    }
+    return {
+      category: 'local_exec',
+      reason: `Shell execution: ${fullCmd}`,
+      targetPaths: extractWritePaths(trimmed),
+    }
+  }
+
+  // xargs executes its inner command on stdin lines — classify that command
+  // so `xargs -I{} sh -c "curl …"` / `xargs curl https://…` do not ride on
+  // an unknown/local placeholder (R5, audit #60/#88/#120).
+  if (firstWord === 'xargs') {
+    const shellM = rest.match(/(?:^|\s)(?:sh|bash|zsh|dash)\s+-c\s+(?:"([^"]*)"|'([^']*)')/)
+    if (shellM) {
+      const code = shellM[1] ?? shellM[2] ?? ''
+      if (code) return classifyBashCommand(code, [])
+    }
+    const toks = rest.split(/\s+/)
+    const first = toks.find((t) => !t.startsWith('-') && t !== '{}')
+    if (first) {
+      const idx = toks.indexOf(first)
+      return classifyBashCommand(toks.slice(idx).join(' '), [])
+    }
+    return {
+      category: 'local_exec',
+      reason: `xargs without extractable command: ${fullCmd}`,
+      targetPaths: [],
+    }
+  }
+
   // Local code execution / build / test / lint — local effects, rollback-able.
   // Checked BEFORE the network/package blocks so package-manager LOCAL
   // subcommands (npm test, cargo test, go run…) are allowed while install/fetch
   // (which hit the network) stay blocked.
-  const subCmd = rest.split(/\s+/)[0]?.toLowerCase() ?? ''
   if (LOCAL_EXEC_COMMANDS.has(firstWord) || LOCAL_EXEC_COMMANDS.has(fullCmd)) {
+    // R5: interpreters with inline code — classify the wrapped argv so
+    // `python3 -c "subprocess.run(['pip3','install',x])"` and
+    // `node -e "process.kill(pid)"` cannot ride on local_exec.
+    const wrapped = extractWrappedCommand(rest)
+    if (wrapped) {
+      if (wrapped.kind === 'kill') {
+        return {
+          category: 'process',
+          reason: `Interpreter process.kill: ${fullCmd}`,
+          targetPaths: [],
+        }
+      }
+      const inner = classifySingleCommand(wrapped.command)
+      if (inner.category !== 'local_exec' && inner.category !== 'read') {
+        return {
+          ...inner,
+          reason: `Interpreter-wrapped ${inner.category}: ${wrapped.command.slice(0, 60)}`,
+          targetPaths: inner.targetPaths,
+          forceDeny: inner.forceDeny,
+          mutates: inner.mutates,
+        }
+      }
+    }
+    // A local-exec command carrying explicit write targets is a file write
+    // for decide() purposes: TM-protected paths are allowed (snapshot),
+    // temp dirs allowed, anything else denied. Without this, ffmpeg/swiftc
+    // conversions to /etc or another unprotected dir would sail through
+    // (regression risk when widening LOCAL_EXEC_COMMANDS in R1).
+    const writes = extractWritePaths(trimmed)
+    if (writes.length > 0) {
+      return {
+        category: 'file_write',
+        reason: `Local command with write target: ${fullCmd}`,
+        targetPaths: writes,
+      }
+    }
     return {
       category: 'local_exec',
       reason: `Local execution/build/test: ${fullCmd}`,
-      targetPaths: extractWritePaths(trimmed),
+      targetPaths: [],
     }
   }
   const localPkgSubs = LOCAL_PKG_SUBCOMMANDS[firstWord]
@@ -938,6 +1187,34 @@ function classifySingleCommand(command: string): ClassifyResult {
         category: 'read',
         reason: `Package-manager read-only query: ${fullCmd}`,
         targetPaths: [],
+      }
+    }
+    // R1: npm read-only metadata queries are not package management —
+    // `npm pack --dry-run` (zero-write manifest check), `npm config get`
+    // (local config inspection), `npm view` / `npm search` (registry
+    // lookups with no local side effects). Denying them caused real false
+    // positives in production (audit #52/#54/#55/#56/#86/#109/#117).
+    if (firstWord === 'npm') {
+      if (sub === 'pack' && rest.includes('--dry-run')) {
+        return {
+          category: 'read',
+          reason: `npm pack --dry-run (zero-write manifest check): ${fullCmd}`,
+          targetPaths: [],
+        }
+      }
+      if (sub === 'config' && /^config\s+get\b/.test(rest)) {
+        return {
+          category: 'read',
+          reason: `npm config get (local config query): ${fullCmd}`,
+          targetPaths: [],
+        }
+      }
+      if (sub === 'view' || sub === 'search') {
+        return {
+          category: 'read',
+          reason: `npm ${sub} (registry lookup, read-only): ${fullCmd}`,
+          targetPaths: [],
+        }
       }
     }
     return {

@@ -125,10 +125,11 @@ check('npm install lodash', { category: 'network', allow: false })
 check('pnpm add lodash', { category: 'network', allow: false })
 check('brew install jq', { category: 'network', allow: false })
 check('pip install requests', { category: 'network', allow: false })
-check('npm view lodash', { category: 'network', allow: false }) // registry query = network
+check('npm view lodash', { category: 'read', allow: true }) // registry lookup = read-only (R1)
 // subshell-grouped pipeline classified by inner command
-// (xargs kill stays denied — unknown, still safe; lsof read part allowed)
-check('(lsof -ti:3000 | xargs kill)', { category: 'unknown', allow: false })
+// (xargs kill now resolves to the inner kill → process, still denied;
+// lsof read part allowed)
+check('(lsof -ti:3000 | xargs kill)', { category: 'process', allow: false })
 check('(cat a.txt | grep x) && echo ok', { category: 'read', allow: true })
 // grep patterns containing | must NOT be treated as pipelines
 check('grep -E "✔|✖|# (tests|pass|fail)"', { category: 'read', allow: true })
@@ -309,9 +310,9 @@ const html=fs.readFileSync('racing-game.html','utf8');
 const code=html.match(/<script>([\\s\\S]*?)<\\/script>/)[1];
 NODE`, { category: 'local_exec', allow: true })
 
-// nohup 包装命令按内层命令分类
+// nohup 包装命令按内层命令分类（内层带写目标 → file_write，temp 豁免放行）
 check('cd "/tmp/tm-guard-fixtures/app-server" && nohup node tests/all-templates-live.mjs > /tmp/tpl-live.log 2>&1 & echo "pid $!"', {
-  category: 'local_exec', allow: true,
+  category: 'file_write', allow: true,
 })
 
 // : > file 清空重定向 = file_write
