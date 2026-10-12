@@ -579,26 +579,107 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
 }
 
 /**
- * Call-site patterns that can execute/network from interpreter inline code
- * but whose arguments may not be verifiable by extractWrappedCommand (aliases,
- * require() returns, destructuring, string+shell=True, indirect member
- * access — review N2). When any of these appears AND the wrapped command was
- * not extracted, the interpreter code fails closed to unknown.
+ * N2 fail-closed gate (review M1/M2 rewrite).
+ *
+ * The previous regex list had symmetric holes and overreach at once:
+ * aliased/indirect call forms (`process['kill'](`, `const f=fetch; f(URL)`,
+ * `getattr(s,'run')(...)`, `import subprocess as s; s.run(...)`) sailed
+ * through, while plain read-only stdlib calls (`os.getcwd()`,
+ * `shutil.which()`, `pathlib.Path('.').exists()`) were denied. This rewrite
+ * flips the semantics:
+ *
+ *  1. When a HIGH-RISK module/capability (subprocess/os/shutil/pathlib/
+ *     requests/urllib + node child_process/process/fetch/require) enters the
+ *     code block in ANY form (import x as / from x import / require() /
+ *     destructure / bare identifier), the block is treated as untrusted:
+ *     every call that the extractor did NOT successfully verify is
+ *     fail-closed unknown.
+ *  2. Provably read-only member calls (os.getcwd, os.path.join, shutil.which,
+ *     pathlib.Path(...).exists, process.env, fs.readFileSync, console.log...)
+ *     are stripped FIRST so normal agent behavior is not denied (M2).
+ *  3. Dynamic/indirect shapes (subscript `m['run'](`, getattr, module alias
+ *     member calls, aliased const = fetch/requests..., dangerous from-import
+ *     aliases, bare dangerous names, dynamic import/require) all deny.
  */
-const DANGEROUS_CALL_PATTERNS: RegExp[] = [
-  // python module member calls that run programs / hit network
-  /\b(?:subprocess|os|shutil|pathlib)\.\w+\s*\(/,
-  /\brequests\.(?:get|post|put|delete|head|patch|session)\s*\(/,
-  /\burllib\.(?:request|parse)\.\w+\s*\(/,
-  /\bfrom\s+(?:subprocess|os|requests|urllib)\s+import\b/,
-  // node: child_process usage via require/import/destructure
-  /\brequire\(\s*['"]child_process['"]\s*\)/,
-  /\bfrom\s+['"]child_process['"]\s+import\b/,
-  /\bchild_process\s*\./,
-  // bare dangerous call names (any receiver)
-  /\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen)\s*\(/,
-  /\b(?:exec|eval|fetch|new\s+Function)\s*\(/,
-]
+function hasUnverifiableDanger(code: string): boolean {
+  // 1) High-risk capability introduced into the block.
+  const HIGH_RISK_IMPORT = [
+    /\b(?:import|from)\s+(?:subprocess|os|shutil|pathlib|requests|urllib)\b/,
+    /\brequire\(\s*['"](?:child_process|fs)['"]\s*\)/,
+    /\bimport\(\s*['"](?:child_process|fs)['"]\s*\)/,
+    /\bchild_process\b/,
+    /\bprocess\b/,
+    /\bfetch\b/,
+    /\brequire\s*\(/,
+  ]
+  if (!HIGH_RISK_IMPORT.some((re) => re.test(code))) {
+    // No high-risk module: keep only the bare dangerous-name net
+    // (exec/eval/fetch/spawn...) for inline code without imports.
+    return /\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function)\s*\(/.test(code)
+  }
+
+  // 2) Strip provably read-only member calls first (M2).
+  const READONLY_MEMBERS = [
+    // python os / os.path (read-only surface)
+    '\\bos\\.(?:getcwd|listdir|stat|lstat|access|getenv|getpid|getuid|getgid|geteuid|getegid|uname|environ|sep|name|path|linesep|devnull|curdir|pardir|altsep|extsep|pathsep|get_terminal_size|times|fwalk|walk)\\b',
+    '\\bos\\.path\\.(?:join|basename|dirname|exists|isfile|isdir|islink|isabs|abspath|realpath|expanduser|expandvars|splitext|normpath|normcase|relpath|getsize|ismount|samefile|sameopenfile|samefile|commonpath|commonprefix|split|splitdrive|splitroot)\\b',
+    '\\bshutil\\.(?:which|disk_usage|get_terminal_size|get_archive_formats|unpack_archive)\\b',
+    // pathlib Path construction + read-only methods
+    '\\bPath\\s*\\([^;\\n]*?\\)\\s*\\.\\s*(?:exists|is_file|is_dir|is_symlink|is_socket|is_fifo|is_block_device|is_char_device|stat|lstat|resolve|absolute|read_text|read_bytes|glob|rglob|iterdir|name|parent|parents|stem|suffix|suffixes|home|cwd|expanduser|joinpath|with_name|with_suffix|parts|anchor|drive|root|as_posix|as_uri|owner|group|match|samefile)\\b',
+    '\\bpathlib\\.\\w+\\s*\\([^)]*\\)\\s*\\.\\s*(?:exists|is_file|is_dir|stat|lstat|resolve|absolute|read_text|read_bytes|glob|rglob|iterdir|name|parent|stem|suffix|home|cwd|expanduser|joinpath|parts|as_posix|samefile)\\b',
+    // node process read-only surface
+    '\\bprocess\\.(?:env|argv|cwd|pid|ppid|version|platform|arch|title|exitCode|stdin|stdout|stderr|execPath|execArgv|versions|release|uptime|hrtime|memoryUsage)\\b',
+    '\\bconsole\\.\\w+\\s*\\(',
+    // node fs read-only methods (require('fs').readFileSync...)
+    '\\b(?:require|import)\\s*\\(\\s*[\'"]fs[\'"]\\s*\\)\\s*\\.\\s*(?:readFileSync|readFile|existsSync|statSync|lstatSync|readdirSync|readdir|realpathSync|realpath|readlinkSync|readlink|accessSync|access|fstatSync|openSync|open|createReadStream|watch|watchFile|unwatchFile|constants)\\b',
+    '\\brequire\\s*\\(\\s*[\'"](?:path|util|url|os|process|events|stream|crypto|zlib|buffer|string_decoder|querystring|timers|assert|perf_hooks|async_hooks|cluster|dns|domain|http|https|net|tls|worker_threads|v8|vm|wasi|repl|readline|module|punycode|sys|trace_events|inspector)["\']\\s*\\)',
+  ]
+  const stripped = code.replace(new RegExp(READONLY_MEMBERS.join('|'), 'g'), '')
+
+  // 3) Unverified dangerous call shapes.
+  // a) subscript member call: m['run']( / process['kill'](
+  if (/\b\w+\s*\[\s*['"]\w+['"]\s*\]\s*\(/.test(stripped)) return true
+  // b) dynamic getattr
+  if (/\bgetattr\s*\(/.test(stripped)) return true
+  // c) high-risk module member calls, incl. `import subprocess as s` aliases
+  const moduleAliases = [
+    ...(stripped.matchAll(/\bimport\s+(\w+)\s+as\s+(\w+)\b/g) || []),
+  ].map((m) => m[2])
+  const modNames = ['subprocess', 'os', 'shutil', 'pathlib', 'requests',
+    'urllib', 'child_process', 'fs', ...moduleAliases]
+  for (const mod of modNames) {
+    if (new RegExp(`\\b${mod}\\s*\\.\\s*\\w+\\s*\\(`).test(stripped)) return true
+  }
+  // d) aliased assignment calls: const f = fetch; f(URL)
+  for (const m of stripped.matchAll(
+    /\b(?:const|let|var)?\s*(\w+)\s*=\s*(?:fetch|requests\.\w+|subprocess\.\w+|child_process\.\w+|process\.\w+|require\([^)]*\)|import\([^)]*\)|exec|eval|spawn|execSync|execFileSync)\b/g,
+  )) {
+    const name = m[1]
+    if (name && new RegExp(`\\b${name}\\s*\\(`).test(stripped)) return true
+  }
+  // e) dangerous from-import aliases: from shutil import rmtree as r; r(...)
+  const DANGEROUS_IMPORT_NAMES = new Set([
+    'run', 'call', 'check_call', 'check_output', 'Popen', 'system', 'popen',
+    'urlopen', 'exec', 'eval', 'spawn', 'execSync', 'execFileSync',
+    'spawnSync', 'kill', 'rmtree', 'remove', 'unlink', 'unlinkSync',
+    'chmod', 'chmodSync', 'writeFile', 'writeFileSync', 'appendFile',
+    'appendFileSync', 'rename', 'renameSync', 'symlink', 'symlinkSync',
+    'copyfile', 'move', 'shutil', 'rm', 'truncate', 'link', 'linkSync',
+  ])
+  for (const m of stripped.matchAll(
+    /\bfrom\s+(\w+)\s+import\s+(\w+)(?:\s+as\s+(\w+))?\b/g,
+  )) {
+    const orig = m[2]
+    const alias = m[3] || m[2]
+    if (DANGEROUS_IMPORT_NAMES.has(orig) && new RegExp(`\\b${alias}\\s*\\(`).test(stripped)) return true
+  }
+  // f) bare dangerous call names (any receiver)
+  if (/\b(?:execSync|execFileSync|spawnSync|spawn|Popen|check_call|check_output|urlopen|kill|system|popen|exec|eval|fetch|new\s+Function)\s*\(/.test(stripped)) return true
+  // g) dynamic import/require
+  if (/\b(?:require|import)\s*\(/.test(stripped)) return true
+
+  return false
+}
 
 /* ------------------------------------------------------------------ */
 /* Sensitive-path read restriction (denyReadPaths)                     */
@@ -1185,7 +1266,7 @@ function classifySingleCommand(command: string): ClassifyResult {
       // to unknown instead of riding local_exec.
       const codeM2 = rest.match(/^(?:-c|-e|--eval|--input-type=module)\s*(?:=\s*)?(?:"([^"]*)"|'([^']*)'|(\S+))/)
       const code2 = codeM2?.[1] ?? codeM2?.[2] ?? codeM2?.[3] ?? ''
-      if (code2 && DANGEROUS_CALL_PATTERNS.some((re) => re.test(code2))) {
+      if (code2 && hasUnverifiableDanger(code2)) {
         return {
           category: 'unknown',
           reason: `Interpreter code with unverifiable dangerous call: ${fullCmd.slice(0, 60)}`,

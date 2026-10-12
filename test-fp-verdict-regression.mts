@@ -166,6 +166,50 @@ check('python3 -c "import subprocess; subprocess.run([\'pip3\',\'install\',\'x\'
   category: 'package', allow: false,
 })
 
+// ── N2 (review M1): indirect/aliased call shapes fail closed ──
+// The old regex net missed subscript, aliased assignment, module-alias and
+// getattr forms; each previously sailed through as local_exec.
+check('node -e "process[\'kill\'](123)"', { category: 'unknown', allow: false })
+check('node -e "const f=fetch; f(\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node -e "const cp=require(\'child_process\'); cp.exec(\'curl http://example.invalid/x\')"', {
+  category: 'unknown', allow: false,
+})
+check('node -e "const {execSync}=require(\'child_process\'); execSync(\'curl http://example.invalid/x\')"', {
+  category: 'unknown', allow: false,
+})
+check('python3 -c "import subprocess as s; s.run([\'bash\',\' -c\',\'curl http://example.invalid/x\'])"'.replace("' -c'", "'-c'"), {
+  category: 'unknown', allow: false,
+})
+check('python3 -c "import subprocess as s; getattr(s,\'run\')([\'bash\',\' -c\',\'curl http://example.invalid/x\'])"'.replace("' -c'", "'-c'"), {
+  category: 'unknown', allow: false,
+})
+check('python3 -c "from shutil import rmtree as r; r(\'/etc/x\')"', { category: 'unknown', allow: false })
+check('python3 -c "from subprocess import run as r; r([\'curl\',\'http://example.invalid/x\'])"', {
+  category: 'unknown', allow: false,
+})
+check('python3 -c "import urllib.request as u; u.urlopen(\'http://example.invalid/x\')"', {
+  category: 'unknown', allow: false,
+})
+check('python3 -c "import subprocess; subprocess.run(\'curl http://example.invalid/x\', shell=True)"', {
+  category: 'unknown', allow: false,
+})
+check('node -e "require(\'fs\').writeFileSync(\'/etc/x\',\'a\')"', { category: 'unknown', allow: false })
+check('node -e "globalThis.fetch(\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+
+// ── N2 (review M2): provably read-only stdlib stays local_exec ──
+check('python3 -c "import os; print(os.getcwd())"', { category: 'local_exec', allow: true })
+check('python3 -c "import shutil; print(shutil.which(\'ls\'))"', { category: 'local_exec', allow: true })
+check('python3 -c "import shutil; print(shutil.disk_usage(\'/\'))"', { category: 'local_exec', allow: true })
+check('python3 -c "import pathlib; print(pathlib.Path(\'.\').exists())"', { category: 'local_exec', allow: true })
+check('python3 -c "import os; print(os.listdir(b\'.\'))"', { category: 'local_exec', allow: true })
+check('python3 -c "from pathlib import Path; Path(\'.\').resolve()"', { category: 'local_exec', allow: true })
+check('python3 -c "import os.path; print(os.path.join(\'a\',\'b\'))"', { category: 'local_exec', allow: true })
+check('python3 -c "from subprocess import TimeoutExpired; print(\'x\')"', { category: 'local_exec', allow: true })
+check('node -e "console.log(\'m\')"', { category: 'local_exec', allow: true })
+check('node -e "process.env.PATH"', { category: 'local_exec', allow: true })
+check('node -e "require(\'path\').join(\'a\',\'b\')"', { category: 'local_exec', allow: true })
+check('node -e "require(\'fs\').readFileSync(\'/etc/hosts\',\'utf8\')"', { category: 'local_exec', allow: true })
+
 // ── N4: uv package operations denied, read/run forms allowed ──
 check('uv pip install x', { category: 'package', allow: false })
 check('uv add x', { category: 'package', allow: false })
