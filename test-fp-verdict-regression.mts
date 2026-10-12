@@ -336,5 +336,61 @@ check('ffprobe in.mov', { category: 'local_exec', allow: true })
 check('ffmpeg -h long | head -3', { category: 'read', allow: true })
 check('ffmpeg -y -i in.mov /tmp/a.wav', { category: 'file_write', allow: true })
 
+// ── J1: ESM named imports with `as` aliases (write/exec primitives) ──
+check('node --input-type=module -e "import {writeFileSync as w} from \'node:fs\'; w(\'/etc/guardtest/x\',\'a\')"', { category: 'unknown', allow: false })
+check('node --input-type=module -e "import {execSync as e} from \'node:child_process\'; e(\'id\')"', { category: 'unknown', allow: false })
+check('node --input-type=module -e "import {rmSync as r} from \'node:fs\'; r(\'/etc/guardtest/x\')"', { category: 'unknown', allow: false })
+check('node --input-type=module -e "import {writeFileSync as writeFileOut} from \'node:fs\'; writeFileOut(\'/etc/guardtest/x\',\'a\')"', { category: 'unknown', allow: false })
+check('node --input-type=module -e "import {rmSync as r,chmodSync as c} from \'node:fs\'; r(\'/etc/guardtest/x\')"', { category: 'unknown', allow: false })
+check('node --input-type=module -e "import {spawnSync as s} from \'node:child_process\'; s(\'id\')"', { category: 'unknown', allow: false })
+// J1 read-only alias stays allowed
+check('node --input-type=module -e "import {readFileSync as r} from \'node:fs\'; console.log(r(\'/etc/hosts\',\'utf8\'))"', { category: 'local_exec', allow: true })
+
+// ── J2: open() no-mode / variable-held / rb+/rt+/a+b + builtins/io prefix ──
+check('python3 -c "open(\'/etc/guardtest/x\').write(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "f=open(\'/etc/guardtest/x\',\'w\'); f.write(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "f=open(\'/etc/guardtest/x\'); f.write(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "with open(\'/etc/guardtest/x\',\'w\') as f: f.write(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "open(\'/etc/guardtest/x\',\'rb+\').write(b\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "open(\'/etc/guardtest/x\',\'rt+\').write(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "open(\'/etc/guardtest/x\',\'a+b\').write(b\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "import io; io.open(\'/etc/guardtest/x\',\'w\').write(\'a\')"', { category: 'unknown', allow: false })
+// J2 read-only stays allowed
+check('python3 -c "open(\'/etc/hosts\').read()"', { category: 'local_exec', allow: true })
+check('python3 -c "f=open(\'/etc/hosts\'); print(f.read())"', { category: 'local_exec', allow: true })
+check('python3 -c "open(\'/etc/hosts\',\'rb\').read()"', { category: 'local_exec', allow: true })
+
+// ── J3: deep receivers (multi-hop optional chain / nested destructure /
+// array any-position / subscript / .call borrow) + --eval space form ──
+check('node -e "const f=globalThis?.process?.kill; f(123)"', { category: 'unknown', allow: false })
+check('node -e "const {process:{kill:k}}=globalThis; k(123)"', { category: 'unknown', allow: false })
+check('node -e "const [x,f]=[1,globalThis.fetch]; f(\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node -e "const [,f]=[,globalThis.fetch]; f(\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node -e "const f=globalThis[(\'fetch\')]; f(\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node -e "globalThis.fetch.call(globalThis,\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node -e "const f=globalThis.fetch; f.call(globalThis,\'http://example.invalid/x\')"', { category: 'unknown', allow: false })
+check('node --input-type=module --eval "import(\'http\').then(x=>x.get(\'http://example.invalid/x\'))"', { category: 'unknown', allow: false })
+
+// ── J4: fs/promises as ESM source (named import, incl. as alias) ──
+check('node --input-type=module -e "import {cp} from \'node:fs/promises\'; cp(\'/tmp/a\',\'/etc/guardtest/b\')"', { category: 'unknown', allow: false })
+check('node --input-type=module -e "import {mkdir as md} from \'node:fs/promises\'; md(\'/etc/guardtest/x\')"', { category: 'unknown', allow: false })
+
+// ── W1: Path bindings (incl. alias constructor P / dotted pathlib.Path) deny
+// writes; unrelated object methods stay local ──
+check('python3 -c "from pathlib import Path; p=Path(\'/etc/guardtest/x\'); p.write_text(\'a\')"', { category: 'unknown', allow: false })
+check('python3 -c "import pathlib; q=pathlib.Path(\'/etc/guardtest/x\'); q.unlink()"', { category: 'unknown', allow: false })
+check('python3 -c "import pathlib; obj=Other(); obj.open(\'w\')"', { category: 'local_exec', allow: true })
+check('python3 -c "from pathlib import Path as P; p=P(\'.\'); print(p.resolve())"', { category: 'local_exec', allow: true })
+
+// ── W2: expanded os read-only surface (scandir/fstat/statvfs/cpu_count) ──
+check('python3 -c "import os; print(os.scandir(\'.\'))"', { category: 'local_exec', allow: true })
+check('python3 -c "import os; print(os.cpu_count())"', { category: 'local_exec', allow: true })
+check('python3 -c "import os; print(os.statvfs(\'.\'))"', { category: 'local_exec', allow: true })
+check('python3 -c "from os import scandir; print(scandir(\'.\'))"', { category: 'local_exec', allow: true })
+
+// ── W3: two-level fs destructure {promises:{readdir}} is read-only ──
+check('node -e "const {promises:{readdir}}=require(\'fs\'); readdir(\'.\')"', { category: 'local_exec', allow: true })
+check('node -e "const {promises:{readFile: rf}}=require(\'fs\'); rf(\'/etc/hosts\',\'utf8\')"', { category: 'local_exec', allow: true })
+
 console.log(`\n# ${pass} passed, ${fail} failed`)
 process.exit(fail === 0 ? 0 : 1)
