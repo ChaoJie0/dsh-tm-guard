@@ -1259,8 +1259,12 @@ function expandShortOptionClusters(cmd: string): string {
   return cmd.replace(
     /(^|\s)-([A-Za-z][A-Za-z0-9]{1,})(?=\s|$)/g,
     (_m, lead: string, cluster: string) => {
-      const oIdx = cluster.indexOf('o', 1) // `-o` inside the cluster: value follows
-      if (oIdx === 0) return lead + '-' + cluster
+      // `-o` at position 0: whole cluster is `-o` + filename (`-oT` = output
+      // to file `T`). Never expand — would fabricate blocked flags.
+      if (cluster.startsWith('o')) return lead + '-' + cluster
+      // `-o` INSIDE the cluster (`-sodata` = `-s -o data`): expand the
+      // leading benign flags, then keep `-o` + the rest as the filename.
+      const oIdx = cluster.indexOf('o', 1)
       if (oIdx !== -1) {
         const flags = [...cluster.slice(0, oIdx)].map((ch) => `-${ch}`).join(' ')
         return lead + flags + ' -' + cluster.slice(oIdx)
@@ -1271,7 +1275,18 @@ function expandShortOptionClusters(cmd: string): string {
 }
 
 function isReadonlyCurlDownload(rest: string): boolean {
-  const s = expandShortOptionClusters(rest)
+  // Quote-strip BEFORE flag detection: `curl "-HX:y"` / `curl "--insecure"`
+  // are shell syntax — curl receives the bare option. The token-based checks
+  // below split on whitespace, so a leading quote would make the token look
+  // like a non-option and hide the flag entirely (dsh review B-4). The write
+  // path extraction already works on quote-stripped tokens; flag detection
+  // must use the same view.
+  const s = expandShortOptionClusters(
+    rest
+      .split(/\s+/)
+      .map((t) => t.replace(/^['"]|['"]$/g, ''))
+      .join(' '),
+  )
   // Must target at least one http(s) URL.
   if (!/https?:\/\/[^\s"'`]+/.test(s)) return false
   // Must write output to a local file (not stdout, not piped).

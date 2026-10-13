@@ -27,9 +27,11 @@ All notable changes to dsh-tm-guard will be documented in this file.
 - **放行封口（危险短选项任意位置）**：危险短选项识别改为 **token 级任意位置**
   ——危险字母前粘良性簇前缀（`-sHX:y`、`-sLdsecret=1`、`-suadmin:pw`、
   `-sFkey=@f`、`-sehttp://r`、`-sK./cfg`、`-sk./x`、`-XPOST`）同样
-  network/deny（含 `-K` 配置注入与 `-k` TLS 绕过形态）；`-o` 在任意位置
-  均视为带参选项，其值为本地文件名（`-odata`/`-sodata`/`-soxH:y`），不参与
-  危险判定、不误拦合法下载。分隔/粘连/簇内/任意前缀形态全部 network/deny。
+  network/deny（含 `-K` 配置注入与 `-k` TLS 绕过形态）；**引号整体包裹的
+  选项**（`"-HX:y"`、`"--insecure"`、`"--config"`）检测前统一剥引号，短/长
+  选项均不因引号逃逸。`-o` 在任意位置（token 首位或簇中段）均视为带参选项、
+  其余为本地文件名（`-oT`/`-odata`/`-sodata`/`-soxH:y`），不参与危险判定、
+  不误拦合法下载。分隔/粘连/簇内/任意前缀/引号包裹形态全部 network/deny。
 
 ### Changed
 - **审计轮转运行时日志**：审计日志轮转发生时输出
