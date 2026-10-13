@@ -4,6 +4,27 @@ All notable changes to dsh-tm-guard will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-13
+
+### Security (important)
+- **解释器内联代码全链进危险网（R10–R15）**。十五轮独立对抗复核驱动下的
+  allow 侧封口，全部为真实 fail-open 修复：
+  - 版本化/ABI 解释器名（`python3.12`、`python3.12m/t/d`、`pypy3`、
+    `-dbg`）与裸名共享 `-c` 内联代码的危险网与敏感路径扫描，不再因名单
+    缺字面量而漏（R10/R11）。
+  - `uv run <解释器> -c "<危险码>"` 递归进入解释器危险网：`python`/`node`/
+    `ruby`/`bash` 等包装均不再整体放行（R12/R13）。
+  - uv flag 按真实语法 token 化：布尔 flag（`--no-sync/--frozen/--locked/
+    --offline/--no-dev/--no-project` 等）不再吞掉解释器名；`--x=y`、`-p 3.12`、
+    `--` 分隔符全部正确处理；`uv run <伪造解释器名>` fail-closed（R13 阻断）。
+  - `denyReadPaths`（敏感路径 forceDeny）沿全部递归边界透传：uv、bash -c、
+    xargs、nohup/env/管道/子 shell/裸赋值前缀，`-c` 代码内读
+    `.ssh/id_rsa` 等一律 forceDeny（R13/R14 阻断 + W1）。
+  - 转义感知引号提取：`bash -c "python3 -c \"…\""` 双层嵌套不再被 `\"`
+    截断而漏敏感扫描。
+  - 仓库卫生：文档与源码清除本机用户名路径，host 矩阵脚本移出版本库，
+    dsh 复核工作目录 ignore（发布物隐私净化延续）。
+
 ### Added
 - **First-run safety baseline report (U-27)**. The first `apply()` in a
   workspace writes `.tm-guard/baseline-report.md` and prints a one-line pointer
