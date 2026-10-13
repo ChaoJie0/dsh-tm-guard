@@ -63,3 +63,10 @@ dsh-tm-guard-v0.2.0-test-report.md
 
 # Test coverage scratch
 coverage/
+
+# Local host-matrix test scripts (hardcode /Users/<you> paths; not part of package)
+scripts/verify-host-matrix-*.py
+scripts/verify-host-matrix-rpc.py
+
+# DSH adversarial-review working dirs
+.r[0-9]*/
