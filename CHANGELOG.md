@@ -60,6 +60,19 @@ All notable changes to dsh-tm-guard will be documented in this file.
   `failClosed=false` + `autoApprove=true`, which leaves no human confirmation
   step and no rollback gate. No behaviour change — announcements only.
 
+### Known UX notes（发布说明，非缺陷）
+- **解释器内联代码里再包本地开发命令会被拦（R15 起新增 deny 面）**：
+  `python3 -c "import subprocess; subprocess.run(['npm','test'])"`、
+  `node -e "execFileSync('git',['status'])"` 这类写法会按
+  package/vcs_remote/unknown 类别拒绝——请**直接运行** `npm test`/`git status`/
+  `cargo test`/`go run` 等命令，或写成脚本文件执行（`node x.js`/`python x.py`
+  文件形态不受内联码网限制）。直接形式不受影响。
+- **`uv run --with <pkg> script.py` / `--with-requirements` 按包操作拒绝**：
+  属于既有"包操作默认拒绝"立场（profile 定向放行即可）；可先 `uv sync` 再
+  `uv run`，或去掉 `--with` 直接运行。`--with` 精确 token 化留待下个版本。
+- 上述均为安全方向的收紧，被拦命令不会执行；误拦面估计为全量命令的
+  1–3%，均有低成本改写。
+
 ## [0.2.4] - 2026-10-03
 
 ### Changed
