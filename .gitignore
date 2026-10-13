@@ -70,3 +70,11 @@ scripts/verify-host-matrix-rpc.py
 
 # DSH adversarial-review working dirs
 .r[0-9]*/
+
+# Review/research artifacts kept locally, never published
+# (docs/ holds fp-review/poc/rh-*/revalue reports; .reval-* are dsh worktree copies;
+#  scratch-*.mts are debug drafts — all must stay out of the public repo and out of
+#  tm-guard checkpoint auto-adds)
+docs/
+.reval-*/
+scratch-*.mts
