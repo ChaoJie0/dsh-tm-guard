@@ -288,6 +288,13 @@ export class AuditLog {
     truncateSync(this.logPath, 0)
 
     this.rotatedCount++
+    const mb = this.rotation.maxBytes / 1048576
+    const perFile = mb >= 1 ? `${mb.toFixed(0)} MiB` : `${(this.rotation.maxBytes / 1024).toFixed(0)} KiB`
+    console.warn(
+      `[tm-guard] audit rotated → .1 (retained ${retainFiles} gen, ` +
+        `≈${perFile}/file, ` +
+        `${(totalMaxBytes / 1048576).toFixed(0)} MiB cap)`,
+    )
     this.enforceTotalLimit(totalMaxBytes)
     return true
   }

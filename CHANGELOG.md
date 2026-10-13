@@ -4,6 +4,25 @@ All notable changes to dsh-tm-guard will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.6] - unreleased
+
+### Fixed (edges promised in 0.2.5)
+- **存量边界 1 修复（temp 前缀穿越）**：写门控的 temp 豁免现在与敏感读/写保护
+  使用同一规范化（`normalizeForMatch` 折叠 `//`、`.`、`..` 并 lowercase）。
+  `echo x > /tmp/../etc/evil.txt` 之前被按 temp 放行（实际落点在 `/tmp` 之外），
+  现在正确解析为 `/etc/evil.txt` → 非 temp、非保护 → BLOCKED。补穿越单测。
+- **存量边界 2 修复（curl 捆绑短选项）**：curl 判定新增短选项簇展开
+  （`-sLk` → `-s -L -k`），`curl -sLk -o a …` / `-sLd x=y` / `-sLH "X:y"` 中的
+  `-k`/`-d`/`-H` 不再被捆绑隐藏 → 恢复 network/deny（不再降级为 file_write）。
+- **误拦修复（curl -o 分离值提取）**：`curl -o /tmp/x https://…` 的下载目标路径
+  之前提取为空（temp 豁免不触发 → 合法下载被 BLOCKED）；现在提取 `-o/--output`
+  分离值，合法 `/tmp` 下载恢复 temp 豁免放行。
+
+### Changed
+- **审计轮转运行时日志**：审计日志轮转发生时输出
+  `[tm-guard] audit rotated → .1 (retained N gen, ≈X MiB/file, Y MiB cap)`，
+  运行时可自解释（之前静默轮转，用户翻审计时可能误以为旧记录丢失）。
+
 ## [0.2.5] - 2026-10-13
 
 ### Security (important)

@@ -342,6 +342,21 @@ function extractWritePaths(command: string): string[] {
     }
   }
 
+  // curl -o/--output SEPARATE values (`-o /tmp/x`): the download lands on a
+  // local path, so it must be extracted or legitimate `curl -o /tmp/x`
+  // downloads get blocked as unprotected writes (0.2.6 edge 2 fix side).
+  if (cmd === 'curl') {
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i]
+      if (t !== '-o' && t !== '--output' && t !== '--output-file' && t !== '--outfile') continue
+      const v = tokens[i + 1]
+      if (v && !v.startsWith('-') && !/^https?:\/\//.test(v)) {
+        paths.push(v)
+        i++
+      }
+    }
+  }
+
   if (['rm', 'mv', 'cp', 'touch', 'mkdir', 'rmdir', 'chmod', 'chown',
        'truncate', 'dd', 'install', 'ln', 'unlink', 'trash'].includes(cmd)) {
     for (let i = 1; i < tokens.length; i++) {
@@ -1224,8 +1239,24 @@ function isLoopbackOnly(rest: string): boolean {
  * and no request body, upload, custom method, auth/credential header,
  * TLS-bypass, proxy or referer flag. Anything else must remain network/deny.
  */
+/**
+ * Expand glued single-char short-option clusters so per-flag matchers see
+ * every flag: `curl -sLk -o a https://…` → `-s -L -k -o a …`. A cluster is a
+ * single-dash run of 2+ flag letters (`-sLk`); single-char options (`-o`,
+ * `-O`, `-X`) and long options (`--output`) are left untouched. Expansion is
+ * conservative for safety: `-data` (not a real curl short cluster) expands to
+ * `-d -a -t -a`, which trips the `-d` block and stays network/deny.
+ */
+function expandShortOptionClusters(cmd: string): string {
+  return cmd.replace(
+    /(^|\s)-([A-Za-z][A-Za-z0-9]{1,})(?=\s|$)/g,
+    (_m, lead: string, cluster: string) =>
+      lead + [...cluster].map((ch) => `-${ch}`).join(' '),
+  )
+}
+
 function isReadonlyCurlDownload(rest: string): boolean {
-  const s = rest
+  const s = expandShortOptionClusters(rest)
   // Must target at least one http(s) URL.
   if (!/https?:\/\/[^\s"'`]+/.test(s)) return false
   // Must write output to a local file (not stdout, not piped).
@@ -2871,8 +2902,13 @@ const TEMP_PREFIXES = [
 
 function isTempPath(abs: string): boolean {
   if (!abs.startsWith('/')) abs = toAbsolute(abs)
+  // Same normalization as the sensitive-read / write-protection sides
+  // (normalizeForMatch collapses `//`, `.`, `..` and lowercases): a path like
+  // `/tmp/../etc/evil.txt` resolves to `/etc/evil.txt` and must NOT be treated
+  // as temp — the OS lands it outside /tmp.
+  const norm = normalizeForMatch(abs)
   return TEMP_PREFIXES.some(
-    (p) => abs === p || abs.startsWith(p + '/'),
+    (p) => norm === p || norm.startsWith(p + '/'),
   )
 }
 

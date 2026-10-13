@@ -8,7 +8,7 @@ import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { AuditLog } from './src/audit.ts'
 import {
-  appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync,
+  appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
 
@@ -111,4 +111,31 @@ test('clear: write failure is ignored (does not throw)', () => {
   a.record({ tool: 'x', category: 'read', decision: 'allow', reason: 'r', targetPaths: [] })
   rmSync(a.dirPath, { recursive: true, force: true })
   a.clear() // must not throw
+})
+
+test('rotation: emits a runtime log line ([tm-guard] audit rotated …)', () => {
+  const d = tmpDir('rotlog')
+  const a = new AuditLog(d, { maxBytes: 1024 }) // tiny threshold -> fast rotate
+  const captured: string[] = []
+  const origWarn = console.warn
+  console.warn = (m: unknown, ...rest: unknown[]) => {
+    captured.push(String(m) + (rest.length ? ' ' + rest.map(String).join(' ') : ''))
+  }
+  try {
+    let rotated = false
+    for (let i = 0; i < 500 && !rotated; i++) {
+      a.record({
+        tool: 'bash', category: 'read', decision: 'allow',
+        reason: 'r'.repeat(96), targetPaths: [],
+      })
+      rotated = captured.some((s) => s.includes('audit rotated'))
+    }
+    // The file really rotated (log line matches observable state).
+    assert.equal(rotated, true, 'rotation should emit [tm-guard] audit rotated …')
+    assert.equal(existsSync(join(a.dirPath, 'audit.jsonl.1')), true)
+    const line = captured.find((s) => s.includes('audit rotated'))!
+    assert.match(line, /\[tm-guard\] audit rotated → \.1 \(retained 5 gen, ≈1 KiB\/file, 100 MiB cap\)/)
+  } finally {
+    console.warn = origWarn
+  }
 })

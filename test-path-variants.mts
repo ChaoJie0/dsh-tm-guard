@@ -3,7 +3,7 @@
 // non-false-positives.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { classifyBashCommand, classifyToolCall } from './src/classifier.ts'
+import { classifyBashCommand, classifyToolCall, decide } from './src/classifier.ts'
 import os from 'node:os'
 
 const HOME = os.homedir()
@@ -119,4 +119,21 @@ test('unquoted space-path redirection → conservative deny (shell splits args)'
     (p) => `${HOME}/Claude`.startsWith(p.replace(/\/+$/, '') + '/'),
   ))
   assert.equal(under, false) // not protected → decide() denies
+})
+
+test('dot-segment escape from /tmp is NOT temp-exempt (write lands outside)', () => {
+  // 0.2.6 (edge 1): /tmp/../etc/evil.txt normalizes to /etc/evil.txt — the OS
+  // lands the write OUTSIDE /tmp, so the temp exemption must not apply.
+  const c = classifyBashCommand('echo x > /tmp/../etc/evil.txt', DENY_READ)
+  assert.equal(c.category, 'file_write')
+  const d = decide(c, false) // no TM protection → must be BLOCKED, not temp-allowed
+  assert.equal(d.allow, false)
+  assert.match(d.reason, /BLOCKED/)
+})
+
+test('plain /tmp writes stay temp-exempt (no regression)', () => {
+  const c = classifyBashCommand('echo x > /tmp/ok.txt', DENY_READ)
+  assert.equal(c.category, 'file_write')
+  const d = decide(c, false)
+  assert.equal(d.allow, true) // genuine /tmp scratch still allowed
 })
