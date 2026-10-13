@@ -1442,6 +1442,20 @@ function classifySingleCommand(command: string, denyReadPaths: string[] = []): C
     return { category: 'read', reason: 'Empty command', targetPaths: [] }
   }
 
+  // R14 W1: bare leading env-assignment prefixes (`FOO=bar python3 -c "…"`)
+  // are shell wrappers — strip them and classify the inner command so the
+  // -c danger/sensitive scans still apply (previously firstWord was FOO=bar
+  // and no branch matched the inner interpreter).
+  if (/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/.test(trimmed)) {
+    let inner = trimmed
+    while (/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/.test(inner)) {
+      inner = inner.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/, '').trim()
+    }
+    if (inner && inner !== trimmed) {
+      return classifySingleCommand(inner, denyReadPaths)
+    }
+  }
+
   // Command wrappers whose inner command decides the classification
   // (`nohup node x &` is a background launch of a local command — local).
   if (/^nohup\s+/i.test(trimmed)) {
