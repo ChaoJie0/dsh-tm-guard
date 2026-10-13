@@ -125,8 +125,10 @@ let miss = 0
 for (const [c, wantAllow, denyReadPaths] of cases) {
   const v = classifyBashCommand(c, denyReadPaths ?? [])
   // deny = unknown (unverifiable danger) OR forceDeny (sensitive-path block
-  // surfaces as category 'read' + forceDeny:true)
-  const denied = v.category === 'unknown' || v.forceDeny === true
+  // surfaces as category 'read' + forceDeny:true) OR network/package
+  // (explicit deny categories)
+  const denied = v.category === 'unknown' || v.forceDeny === true ||
+    v.category === 'network' || v.category === 'package'
   const ok = wantAllow ? !denied : denied
   if (!ok) {
     miss++
