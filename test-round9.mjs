@@ -80,15 +80,38 @@ const cases = [
   [`python3.12 -c "import os; os.system('id')"`, false],
   [`python3.12 -c "from io import open as op; op('/etc/guardtest/x','w').write('a')"`, false],
   [`pypy3 -c "import os; os.system('id')"`, false],
+  // ── round-11 followup: ABI/build suffixes ──
+  [`python3.12m -c "print(1)"`, true],
+  [`python3.12t -c "print(1)"`, true],
+  [`python3.12d -c "print(1)"`, true],
+  [`python3.12-dbg -c "print(1)"`, true],
+  [`/usr/bin/python3.12-dbg -c "print(1)"`, true],
+  [`pypy3m -c "print(1)"`, true],
+  [`python3.12m -c "x=1#os.system('id')\nprint(x)"`, true],
+  [`python3.12m -c "import os; os.system('id')"`, false],
+  [`python3.12t -c "from io import open as op; op('/etc/guardtest/x','w').write('a')"`, false],
+  // 伪造名不得放行
+  [`python3.12x -c "print(1)"`, false],
+  [`python3.12-config -c "print(1)"`, false],
+  [`python3.12m-dbg -c "print(1)"`, false],
+  [`pypy3x -c "print(1)"`, false],
+  // 敏感路径层：versioned 名也要吃 -c 扫描
+  [`python3.12 -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
+  [`python3.12m -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
+  [`pypy3 -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
+  [`python3.12 -c "print(open('/Users/x/notes.txt').read())"`, true, ['/Users/x/.ssh']],
 ]
 
 let miss = 0
-for (const [c, wantAllow] of cases) {
-  const v = classifyBashCommand(c)
-  const ok = wantAllow ? v.category !== 'unknown' : v.category === 'unknown'
+for (const [c, wantAllow, denyReadPaths] of cases) {
+  const v = classifyBashCommand(c, denyReadPaths ?? [])
+  // deny = unknown (unverifiable danger) OR forceDeny (sensitive-path block
+  // surfaces as category 'read' + forceDeny:true)
+  const denied = v.category === 'unknown' || v.forceDeny === true
+  const ok = wantAllow ? !denied : denied
   if (!ok) {
     miss++
-    console.log(`${wantAllow ? 'ALLOW' : 'DENY'}-MISS ${v.category} | ${c.slice(0, 70)}`)
+    console.log(`${wantAllow ? 'ALLOW' : 'DENY'}-MISS ${v.category}${v.forceDeny ? '(forceDeny)' : ''} | ${c.slice(0, 70)}`)
   }
 }
 console.log(miss === 0 ? `ALL OK (${cases.length})` : `${miss} MISS / ${cases.length}`)

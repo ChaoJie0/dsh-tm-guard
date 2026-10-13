@@ -183,7 +183,12 @@ const LOCAL_EXEC_COMMANDS = new Set([
 // the exact literal set; this regex widens the accept for `pythonX.Y` /
 // `pypyX` while the interpreter-with-inline-code nets below still classify
 // the wrapped argv (a `python3.12 -c "os.system('id')"` still denies).
-const PY_INTERPRETER_RE = /^(?:python(?:\d+(?:\.\d+)*)?|pypy(?:\d+(?:\.\d+)*)?)$/
+// R11-followup: ABI/build suffixes `m`/`t`/`d` and `-dbg` are real
+// executable names (python3.12m, python3.12t free-threading, python3.12-dbg)
+// — accepted here, still fail-closed for anything else (python3.12x,
+// python3.12-config stay unknown).
+const PY_INTERPRETER_RE =
+  /^(?:python(?:\d+(?:\.\d+)*)?(?:[mtd]|-dbg)?|pypy(?:\d+(?:\.\d+)*)?(?:[mtd]|-dbg)?)$/
 
 /** Package-manager subcommands that are LOCAL (build/test) vs network (install/fetch). */
 const LOCAL_PKG_SUBCOMMANDS: Record<string, Set<string>> = {
@@ -2433,7 +2438,13 @@ export function classifyBashCommand(
     // Interpreter -c/-e code strings: scan for sensitive path references the
     // token extractor cannot see (python3 -c "print(open('/Users/alice/.ssh/id_rsa').read())").
     const firstWordCode = s.trim().split(/\s+/)[0]?.toLowerCase().split('/').pop() ?? ''
-    const codeFlags = INTERPRETER_CODE_FLAGS[firstWordCode]
+    // R11-followup: versioned/ABI python names (python3.12, python3.12m,
+    // pypy3) share python3's -c inline-code surface — the hardcoded map only
+    // knows the bare literals, so mirror PY_INTERPRETER_RE here or a
+    // `python3.12 -c "print(open('/Users/x/.ssh/id_rsa').read())"` would
+    // slip the sensitive-path scan entirely.
+    const codeFlags =
+      PY_INTERPRETER_RE.test(firstWordCode) ? ['-c'] : INTERPRETER_CODE_FLAGS[firstWordCode]
     if (codeFlags) {
       for (const flag of codeFlags) {
         const fm = new RegExp(`\\s${flag}(?:=|\\s)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(s)
