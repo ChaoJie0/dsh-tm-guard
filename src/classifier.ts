@@ -1247,18 +1247,24 @@ function isLoopbackOnly(rest: string): boolean {
  * conservative for safety: `-data` (not a real curl short cluster) expands to
  * `-d -a -t -a`, which trips the `-d` block and stays network/deny.
  *
- * Exception: a cluster starting with `-o` is NOT expanded — `-o` is a
- * value-taking short option, so `-oout` / `-osLk` mean `-o out` / `-o sLk`
- * (the value is a filename), NOT a flag cluster `-o -u -t …`. Expanding it
- * would fabricate blocked flags (`-u`, `-d`, …) out of the filename and
- * false-deny legitimate `curl -oNAME` downloads. Left intact, the value is
- * invisible to the flag matchers and the write-gate still applies.
+ * Exception: `-o` is a value-taking short option, so `-oout` / `-osLk` mean
+ * `-o out` / `-o sLk` (the value is a filename), NOT a flag cluster
+ * `-o -u -t …`. Expanding it would fabricate blocked flags (`-u`, `-d`, …)
+ * out of the filename and false-deny legitimate `curl -oNAME` downloads.
+ * The same applies when `-o` appears INSIDE a cluster (`-sodata` = `-s -o
+ * data`): the option letter is followed by its value, so expansion stops
+ * there — the remaining characters stay glued to `-o` as the filename.
  */
 function expandShortOptionClusters(cmd: string): string {
   return cmd.replace(
     /(^|\s)-([A-Za-z][A-Za-z0-9]{1,})(?=\s|$)/g,
     (_m, lead: string, cluster: string) => {
-      if (cluster.startsWith('o')) return lead + '-' + cluster
+      const oIdx = cluster.indexOf('o', 1) // `-o` inside the cluster: value follows
+      if (oIdx === 0) return lead + '-' + cluster
+      if (oIdx !== -1) {
+        const flags = [...cluster.slice(0, oIdx)].map((ch) => `-${ch}`).join(' ')
+        return lead + flags + ' -' + cluster.slice(oIdx)
+      }
       return lead + [...cluster].map((ch) => `-${ch}`).join(' ')
     },
   )
@@ -1275,24 +1281,38 @@ function isReadonlyCurlDownload(rest: string): boolean {
     /(?:^|\s)-O\b/.test(s) || /(?:^|\s)--remote-name\b/.test(s)
   if (!hasOutput) return false
   // Any of these flags makes it not a read-only download.
-  const blocked: RegExp[] = [
-    /(?:^|\s)-X\s*\S?/, /(?:^|\s)--request\b/,
-    // Value-taking short options: match the glued form too (-HX:y, -dsecret,
-    // -ua:b, -Fkey=@f, -Tfile, -ehttp://r) — `\b` misses the letter-to-letter
-    // boundary, so use "not followed by another `-`" (long options are matched
-    // by their own `--…` rules and never hit these, because (?:^|\s) requires
-    // a space/start before the single dash).
-    /(?:^|\s)-d(?!-)/, /(?:^|\s)--data\b/, /(?:^|\s)--data-raw\b/, /(?:^|\s)--data-binary\b/, /(?:^|\s)--data-urlencode\b/,
-    /(?:^|\s)-T(?!-)/, /(?:^|\s)--upload-file\b/,
-    /(?:^|\s)-F(?!-)/, /(?:^|\s)--form\b/,
-    /(?:^|\s)-H(?!-)/, /(?:^|\s)--header\b/,
-    /(?:^|\s)-u(?!-)/, /(?:^|\s)--user\b/, /(?:^|\s)--basic\b/, /(?:^|\s)--digest\b/, /(?:^|\s)--anyauth\b/, /(?:^|\s)--bearer\b/,
-    /(?:^|\s)-k(?!-)/, /(?:^|\s)--insecure\b/,
-    /(?:^|\s)-K(?!-)/, /(?:^|\s)--config\b/,
-    /(?:^|\s)--proxy\b/, /(?:^|\s)-e(?!-)/, /(?:^|\s)--referer\b/,
+  //
+  // Short options are checked TOKEN-wise so a dangerous letter is caught at
+  // ANY position inside the token (cluster prefix, glued value, punctuation
+  // value): `-sHX:y`, `-sLdsecret=1`, `-suadmin:pw`, `-sFkey=@f`,
+  // `-sehttp://r`, `-sK./cfg`, `-sk./x`, `-XPOST` — a single benign prefix
+  // letter must not hide them (dsh review B-3). `-o` is exempted at any
+  // position: it is a value-taking option whose value is a local filename
+  // (`-odata`, `-sodata` = `-s -o data`), so the option letter and everything
+  // after it never participate in the danger check.
+  const shortOptionTokens = s.split(/\s+/)
+  for (const tok of shortOptionTokens) {
+    if (!tok.startsWith('-') || tok.startsWith('--')) continue
+    const oIdx = tok.indexOf('o')
+    const head = oIdx === -1 ? tok.slice(1) : tok.slice(1, oIdx)
+    if (/[HdXuFTekK]/.test(head)) return false
+  }
+  // Long options (each matched by its own `--…` rule; never hit by the
+  // single-dash check above because (?:^|\s) requires a space/start before
+  // the dash and `--` starts with a dash).
+  const blockedLong: RegExp[] = [
+    /(?:^|\s)--request\b/,
+    /(?:^|\s)--data\b/, /(?:^|\s)--data-raw\b/, /(?:^|\s)--data-binary\b/, /(?:^|\s)--data-urlencode\b/,
+    /(?:^|\s)--upload-file\b/,
+    /(?:^|\s)--form\b/,
+    /(?:^|\s)--header\b/,
+    /(?:^|\s)--user\b/, /(?:^|\s)--basic\b/, /(?:^|\s)--digest\b/, /(?:^|\s)--anyauth\b/, /(?:^|\s)--bearer\b/,
+    /(?:^|\s)--insecure\b/,
+    /(?:^|\s)--config\b/,
+    /(?:^|\s)--proxy\b/, /(?:^|\s)--referer\b/,
     /(?:^|\s)--post\d*\b/, /(?:^|\s)--head\b/,
   ]
-  for (const re of blocked) if (re.test(s)) return false
+  for (const re of blockedLong) if (re.test(s)) return false
   return true
 }
 

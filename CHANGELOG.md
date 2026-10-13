@@ -24,11 +24,12 @@ All notable changes to dsh-tm-guard will be documented in this file.
 - **误拦封口（curl -o 粘值误拆）**：`-o` 是带参短选项，`curl -oout`/`-odata`
   是「选项+文件名」而非 flag 簇——簇展开对 `-o` 开头的粘值不展开，避免从
   文件名拆出虚构的 `-u`/`-d` 等 blocked flag 把合法下载误判为 network。
-- **放行封口（危险短选项粘连值）**：`-HX:y`、`-dsecret=1`、`-ua:b`、
-  `-Fkey=@f`、`-ehttp://r`、`-Tfile` 等「危险短选项+值不空格粘连」是 curl
-  合法语法，但 `\b` 词边界在字母-字母间不成立导致漏检、被降级为只读下载并
-  temp 豁免放行（外发头/POST body/凭据/文件上传）；blocked 表取值型短选项
-  改用「后不紧跟 `-`」匹配，分隔/粘连/簇内形态全部 network/deny。
+- **放行封口（危险短选项任意位置）**：危险短选项识别改为 **token 级任意位置**
+  ——危险字母前粘良性簇前缀（`-sHX:y`、`-sLdsecret=1`、`-suadmin:pw`、
+  `-sFkey=@f`、`-sehttp://r`、`-sK./cfg`、`-sk./x`、`-XPOST`）同样
+  network/deny（含 `-K` 配置注入与 `-k` TLS 绕过形态）；`-o` 在任意位置
+  均视为带参选项，其值为本地文件名（`-odata`/`-sodata`/`-soxH:y`），不参与
+  危险判定、不误拦合法下载。分隔/粘连/簇内/任意前缀形态全部 network/deny。
 
 ### Changed
 - **审计轮转运行时日志**：审计日志轮转发生时输出
