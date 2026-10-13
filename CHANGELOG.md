@@ -21,6 +21,9 @@ All notable changes to dsh-tm-guard will be documented in this file.
   配置文件注入可携带 `-k/-d/-H/--output` 任意参数（配置内容 curl 真实执行）；
   `-K`/`--config` 已加入危险 flag 表 → `curl -K cfg / -K - / -Kcfg` 一律
   network/deny（不再降级为只读下载）。
+- **误拦封口（curl -o 粘值误拆）**：`-o` 是带参短选项，`curl -oout`/`-odata`
+  是「选项+文件名」而非 flag 簇——簇展开对 `-o` 开头的粘值不展开，避免从
+  文件名拆出虚构的 `-u`/`-d` 等 blocked flag 把合法下载误判为 network。
 
 ### Changed
 - **审计轮转运行时日志**：审计日志轮转发生时输出

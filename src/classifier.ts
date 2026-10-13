@@ -1246,12 +1246,21 @@ function isLoopbackOnly(rest: string): boolean {
  * `-O`, `-X`) and long options (`--output`) are left untouched. Expansion is
  * conservative for safety: `-data` (not a real curl short cluster) expands to
  * `-d -a -t -a`, which trips the `-d` block and stays network/deny.
+ *
+ * Exception: a cluster starting with `-o` is NOT expanded — `-o` is a
+ * value-taking short option, so `-oout` / `-osLk` mean `-o out` / `-o sLk`
+ * (the value is a filename), NOT a flag cluster `-o -u -t …`. Expanding it
+ * would fabricate blocked flags (`-u`, `-d`, …) out of the filename and
+ * false-deny legitimate `curl -oNAME` downloads. Left intact, the value is
+ * invisible to the flag matchers and the write-gate still applies.
  */
 function expandShortOptionClusters(cmd: string): string {
   return cmd.replace(
     /(^|\s)-([A-Za-z][A-Za-z0-9]{1,})(?=\s|$)/g,
-    (_m, lead: string, cluster: string) =>
-      lead + [...cluster].map((ch) => `-${ch}`).join(' '),
+    (_m, lead: string, cluster: string) => {
+      if (cluster.startsWith('o')) return lead + '-' + cluster
+      return lead + [...cluster].map((ch) => `-${ch}`).join(' ')
+    },
   )
 }
 

