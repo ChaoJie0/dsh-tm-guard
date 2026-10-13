@@ -70,6 +70,16 @@ const cases = [
   [`python3 -c "import os; os.system('id')#trailing\nprint(1)"`, false],
   [`node -e "class A { #x = 1; #w(){} }; console.log(1)"`, true],
   [`node -e "const fs=require('fs'); fs.openSync('/etc/guardtest/x','rs+')#x\nconsole.log(1)"`, false],
+  // ── round-10: versioned/pypy interpreters ──
+  [`python3.12 -c "print(1)"`, true],
+  [`/usr/bin/python3.12 -c "print(1)"`, true],
+  [`python312 -c "print(1)"`, true],
+  [`pypy3 -c "print(1)"`, true],
+  [`pypy3.10 -c "print(1)"`, true],
+  [`python3.12 -c "x=1#os.system('id')\nprint(x)"`, true],
+  [`python3.12 -c "import os; os.system('id')"`, false],
+  [`python3.12 -c "from io import open as op; op('/etc/guardtest/x','w').write('a')"`, false],
+  [`pypy3 -c "import os; os.system('id')"`, false],
 ]
 
 let miss = 0

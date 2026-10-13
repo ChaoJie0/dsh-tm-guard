@@ -176,6 +176,15 @@ const LOCAL_EXEC_COMMANDS = new Set([
   'swiftc',
 ])
 
+// R10: versioned/pypy python interpreters — `python3.12 -c 'print(1)'` is a
+// daily reality on macOS/Homebrew and must ride local_exec like `python3`,
+// not fail closed as unverifiable. isPython mirrors the SAME names so the
+// python `#` comment channel applies to them too. LOCAL_EXEC_COMMANDS keeps
+// the exact literal set; this regex widens the accept for `pythonX.Y` /
+// `pypyX` while the interpreter-with-inline-code nets below still classify
+// the wrapped argv (a `python3.12 -c "os.system('id')"` still denies).
+const PY_INTERPRETER_RE = /^(?:python(?:\d+(?:\.\d+)*)?|pypy(?:\d+(?:\.\d+)*)?)$/
+
 /** Package-manager subcommands that are LOCAL (build/test) vs network (install/fetch). */
 const LOCAL_PKG_SUBCOMMANDS: Record<string, Set<string>> = {
   npm: new Set(['test', 'run', 'run-script', 't']),
@@ -1690,11 +1699,11 @@ function classifySingleCommand(command: string): ClassifyResult {
   // Checked BEFORE the network/package blocks so package-manager LOCAL
   // subcommands (npm test, cargo test, go run…) are allowed while install/fetch
   // (which hit the network) stay blocked.
-  if (LOCAL_EXEC_COMMANDS.has(firstWord) || LOCAL_EXEC_COMMANDS.has(fullCmd)) {
+  if (LOCAL_EXEC_COMMANDS.has(firstWord) || PY_INTERPRETER_RE.test(firstWord) || LOCAL_EXEC_COMMANDS.has(fullCmd)) {
     // R5: interpreters with inline code — classify the wrapped argv so
     // `python3 -c "subprocess.run(['pip3','install',x])"` and
     // `node -e "process.kill(pid)"` cannot ride on local_exec.
-    const isPython = /^python(\d+(\.\d+)*)?$/.test(firstWord)
+    const isPython = PY_INTERPRETER_RE.test(firstWord)
     const wrapped = extractWrappedCommand(rest, isPython)
     if (wrapped) {
       if (wrapped.kind === 'kill') {
