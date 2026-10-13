@@ -521,7 +521,7 @@ function extractWritePaths(command: string): string[] {
  * apart. The output keeps line structure (comments become spaces, not
  * newlines) so line-anchored nets see unchanged positions.
  */
-function maskComments(code: string): string {
+function maskComments(code: string, isPython = false): string {
   const out: string[] = []
   let i = 0
   const n = code.length
@@ -581,8 +581,11 @@ function maskComments(code: string): string {
       for (; i < stop; i++) out.push(code[i] === '\n' ? '\n' : ' ')
       continue
     }
-    // 5) python line comment `#` — only at line start / after whitespace
-    if (ch === '#' && (i === 0 || /\s/.test(prev))) {
+    // 5) python line comment `#` — in python any `#` outside a string starts
+    // a comment (x=1#os.system('id') is legal python); in node `#` is a
+    // private-field/shebang marker, so node keeps the whitespace/line-start
+    // rule (round-9: no-space inline python comments were still denied).
+    if (ch === '#' && (isPython || i === 0 || /\s/.test(prev))) {
       while (i < n && code[i] !== '\n') { out.push(' '); i++ }
       continue
     }
@@ -611,7 +614,7 @@ function extractInlineCode(rest: string): string {
   return m?.[1] ?? m?.[2] ?? m?.[3] ?? ''
 }
 
-function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 'kill'; shellString?: boolean } | null {
+function extractWrappedCommand(rest: string, isPython = false): { command: string; kind: 'exec' | 'kill'; shellString?: boolean } | null {
   // python3 -m MODULE … — module mode runs a real command (python3 -m pip
   // install x is package management, python3 -m http.server is a local server).
   const moduleM = rest.match(/^(?:-m|-m=|--module)\s*([A-Za-z0-9_.-]+)/)
@@ -626,7 +629,7 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
     }
     return null
   }
-  const code = maskComments(extractInlineCode(rest))
+  const code = maskComments(extractInlineCode(rest), isPython)
   if (!code) return null
 
   // Reassemble a python list literal into a shell-ish command string:
@@ -716,12 +719,12 @@ function extractWrappedCommand(rest: string): { command: string; kind: 'exec' | 
  *     member calls, aliased const = fetch/requests..., dangerous from-import
  *     aliases, bare dangerous names, dynamic import/require) all deny.
  */
-function hasUnverifiableDanger(code: string): boolean {
+function hasUnverifiableDanger(code: string, isPython = false): boolean {
   // K3/Y1: mask comments BEFORE any net runs with the string-aware lexer —
   // a `# open('/etc/x','w')` or `// p.write_text('a')` comment must not trip
   // the write nets, and a `'//'`/`'#'`/URL string must NOT wash out the rest
   // of its line (the Y1 fail-open the regex masks introduced).
-  code = maskComments(code)
+  code = maskComments(code, isPython)
   // K1/J1-spill: constructor names — literal Path/PurePath plus aliases from
   // `from pathlib import Path as P` (used by the bound-writer net AND the
   // section-0 strict-chain net, so aliased P('/x').write_text( still denies).
@@ -748,6 +751,26 @@ function hasUnverifiableDanger(code: string): boolean {
     ...(code.matchAll(/\bimport\s+(?:builtins|io)\s+as\s+(\w+)\b/g) || []),
   ].map((m) => m[1])
   const biAliasesPart = biAliases.length ? `|${biAliases.join('|')}` : ''
+  // Round-9 blocker: `from io import open as op; op('/etc/x','w')` (NAME
+  // rename, unlike the MODULE renames above) still sailed through — op is a
+  // bare call, not a member. Collect from-import open aliases + module
+  // aliases + two-hop rebinds (o2=op) into the BARE open nets below; the
+  // mode/chain checks keep read-only uses allowed (op('/etc/hosts').read()).
+  const openAliases = new Set<string>()
+  for (const m of code.matchAll(
+    /\bfrom\s+(?:io|builtins)\s+import\s+open(?:\s+as\s+(\w+))?\b/g,
+  )) {
+    if (m[1]) openAliases.add(m[1])
+  }
+  for (const m of code.matchAll(/\bimport\s+(?:builtins|io)\s+as\s+(\w+)\b/g)) {
+    openAliases.add(m[1])
+  }
+  for (let i = 0; i < 3; i++) {
+    for (const m of code.matchAll(/\b(?:const|let|var)?\s*(\w+)\s*=\s*(\w+)\b/g)) {
+      if (openAliases.has(m[2])) openAliases.add(m[1])
+    }
+  }
+  const openAliasesPart = [...openAliases].length ? `|${[...openAliases].join('|')}` : ''
   // 0) UNCONDITIONAL shapes — these are dangerous with or without any import
   // (H3): python builtin open() in a WRITE mode (w/a/x, optional b/+/t)
   // writes arbitrary paths, and Path-family write methods (Path('/etc/x')
@@ -760,7 +783,7 @@ function hasUnverifiableDanger(code: string): boolean {
   // NOTE: `(?<![\w.$])` on open means `obj.open('w')` (an unrelated object
   // method) is NOT caught (W1 mis-fire); explicit `builtins.open` / `io.open`
   // module-prefix forms ARE caught (real write channels).
-  if (/(?<![\w.$])\bopen\s*\([^)]*['"](?:[wax](?:[bt]\+?|[bt])?|r(?:[bt])?\+)[bt+]*['"]/.test(code)) return true
+  if (new RegExp(`(?<![\\w.$])\\b(?:open${openAliasesPart})\\s*\\([^)]*['"](?:[wax](?:[bt]\\+?|[bt])?|r(?:[bt])?\\+)[bt+]*['"]`).test(code)) return true
   if (new RegExp(`\\b(?:builtins|io${biAliasesPart})\\s*\\.\\s*open\\s*\\([^)]*['"](?:[wax](?:[bt]\\+?|[bt])?|r(?:[bt])?\\+)[bt+]*['"]`).test(code)) return true
   // K1: node fs.open/openSync — the SECOND argument is a mode string, same
   // charset as python open; write modes must deny (they were in the fs
@@ -772,7 +795,7 @@ function hasUnverifiableDanger(code: string): boolean {
   // J2: open() strict chain with a write method — the no-mode form
   // (open('/etc/x').write('a')) has no mode literal at all, so the mode
   // scan above misses it; the .write call itself is the danger.
-  if (/(?<![\w.$])\bopen\s*\([^;)]*\)\s*\.\s*(?:write|truncate|writelines)\s*\(/.test(code)) return true
+  if (new RegExp(`(?<![\\w.$])\\b(?:open${openAliasesPart})\\s*\\([^;)]*\\)\\s*\\.\\s*(?:write|truncate|writelines)\\s*\\(`).test(code)) return true
   if (new RegExp(`\\b(?:builtins|io${biAliasesPart})\\s*\\.\\s*open\\s*\\([^;)]*\\)\\s*\\.\\s*(?:write|truncate|writelines)\\s*\\(`).test(code)) return true
   // W2: the old ANY-identifier chain net (obj.writeFileSync( / Store()
   // .write_text() ) mis-denied unrelated classes — narrow it to Path-family
@@ -1671,7 +1694,8 @@ function classifySingleCommand(command: string): ClassifyResult {
     // R5: interpreters with inline code — classify the wrapped argv so
     // `python3 -c "subprocess.run(['pip3','install',x])"` and
     // `node -e "process.kill(pid)"` cannot ride on local_exec.
-    const wrapped = extractWrappedCommand(rest)
+    const isPython = /^python(\d+(\.\d+)*)?$/.test(firstWord)
+    const wrapped = extractWrappedCommand(rest, isPython)
     if (wrapped) {
       if (wrapped.kind === 'kill') {
         return {
@@ -1707,7 +1731,7 @@ function classifySingleCommand(command: string): ClassifyResult {
       // as r`, destructured/spawn aliases, shell=True strings) fails closed
       // to unknown instead of riding local_exec.
       const code2 = extractInlineCode(rest)
-      if (code2 && hasUnverifiableDanger(code2)) {
+      if (code2 && hasUnverifiableDanger(code2, isPython)) {
         return {
           category: 'unknown',
           reason: `Interpreter code with unverifiable dangerous call: ${fullCmd.slice(0, 60)}`,

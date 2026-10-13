@@ -58,6 +58,18 @@ const cases = [
   [`git status`, true],
   [`node -e "require('fs').writeFileSync('/etc/guardtest/x','a')"`, false],
   [`node -e "const re=/\\/\\//; require('fs').writeFileSync('/etc/guardtest/x','a')"`, false],
+  // ── round-9 blockers: from-import open-as + no-space python comments ──
+  [`python3 -c "from io import open as op; op('/etc/guardtest/x','w').write('a')"`, false],
+  [`python3 -c "from builtins import open as op; op('/etc/guardtest/x','w')"`, false],
+  [`python3 -c "from io import open as op; op('/etc/guardtest/x','w').truncate()"`, false],
+  [`python3 -c "from io import open as op; o2=op; o2('/etc/guardtest/x','w').write('a')"`, false],
+  [`python3 -c "from io import open as op; op('/etc/hosts').read()"`, true],
+  [`python3 -c "x=1#os.system('id')\nprint(x)"`, true],
+  [`python3 -c "1#os.system('id')\nprint(1)"`, true],
+  [`python3 -c "import os; x=1#os.system('id')\nos.getcwd()"`, true],
+  [`python3 -c "import os; os.system('id')#trailing\nprint(1)"`, false],
+  [`node -e "class A { #x = 1; #w(){} }; console.log(1)"`, true],
+  [`node -e "const fs=require('fs'); fs.openSync('/etc/guardtest/x','rs+')#x\nconsole.log(1)"`, false],
 ]
 
 let miss = 0
