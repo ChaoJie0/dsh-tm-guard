@@ -91,6 +91,16 @@ All notable changes to dsh-tm-guard will be documented in this file.
   字面量）静态扫描不识别；0.2.5 起版本化解释器名（`python3.12`/`pypy3`）
   与裸名共享此边界（非回归，两版一致）。高需求用户可从可信工具移除内联
   解释器，或配出口防火墙（见 README § Limitations）。
+- **存量边界 1（temp 前缀未规范化）**：写门控的 temp 豁免对**未规范化的
+  `/tmp/../` 前缀**误判——`echo x > /tmp/../etc/evil.txt` 会按 temp 放行，
+  而 OS 实际落点在 `/tmp` 之外。0.2.4 行为相同（非 0.2.5 回归），且外层
+  沙箱/git-net 实测兜底；计划 0.2.6 让 temp 判定与受保护路径判定使用同一
+  规范化逻辑并补穿越单测。
+- **存量边界 2（curl 捆绑短选项）**：curl 只读下载的危险 flag 以**独立
+  token** 匹配，`curl -sLk -o a https://…`、`-sLd x=y`（POST body）、
+  `-sLH "X:y"`（任意头）等捆绑短选项可绕过检测、被降级为 file_write 判定
+  （受保护路径/`/tmp` 下会放行落地，但远端内容不执行、仍受写门控+快照
+  约束）。0.2.4 行为相同（非回归）；计划 0.2.6 短选项簇展开解析。
 
 ## [0.2.4] - 2026-10-03
 
