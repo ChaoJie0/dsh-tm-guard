@@ -60,3 +60,6 @@ dsh-plugin-update-guide.md
 dsh-tm-guard-020-independent-review.md
 dsh-tm-guard-v0.2.0-test-report.md
 .upgrade-smoke.txt
+
+# Test coverage scratch
+coverage/
