@@ -1734,8 +1734,9 @@ function stripUvRunFlags(s: string): string {
   // local script is local execution (outputs decided by path).
   if (['bash', 'sh', 'zsh', 'dash'].includes(firstWord)) {
     if (subCmd === '-c') {
-      const m = rest.match(/^-c\s+(?:"([^"]*)"|'([^']*)'|(\S+))/)
-      const code = m?.[1] ?? m?.[2] ?? m?.[3]
+      // R14 W1: escape-aware quote extraction so `bash -c "python3 -c \"…\""`
+      // does not truncate at the inner \" (extractFlagArgument).
+      const code = extractFlagArgument(' ' + rest, '-c')
       if (code) {
         // R13: forward denyReadPaths — `bash -c "cat ~/.ssh/id_rsa"` must
         // forceDeny under a sensitive dir, not lose the context here.
@@ -1766,9 +1767,10 @@ function stripUvRunFlags(s: string): string {
   // so `xargs -I{} sh -c "curl …"` / `xargs curl https://…` do not ride on
   // an unknown/local placeholder (R5, audit #60/#88/#120).
   if (firstWord === 'xargs') {
-    const shellM = rest.match(/(?:^|\s)(?:sh|bash|zsh|dash)\s+-c\s+(?:"([^"]*)"|'([^']*)')/)
+    // R14 W1: escape-aware extraction of the inner shell -c code.
+    const shellM = /(?:^|\s)(?:sh|bash|zsh|dash)\s+-c/.exec(rest)
     if (shellM) {
-      const code = shellM[1] ?? shellM[2] ?? ''
+      const code = extractFlagArgument(' ' + rest.slice(shellM.index).trim(), '-c')
       if (code) return classifyBashCommand(code, denyReadPaths)
     }
     const toks = rest.split(/\s+/)
@@ -2417,6 +2419,51 @@ function scanCodeForSensitivePaths(
 }
 
 /**
+ * R14 W1: match a quoted shell string starting at index i (s[i] is " or '),
+ * honoring backslash escapes so a `\"` inside `bash -c "python3 -c \"…\""`
+ * does not terminate the string early. Returns captured text (escapes kept
+ * verbatim, so literal paths stay visible to the scans) and the index just
+ * after the closing quote.
+ */
+function matchQuotedAt(s: string, i: number): { text: string; end: number } | null {
+  const quote = s[i]
+  if (quote !== '"' && quote !== "'") return null
+  let j = i + 1
+  let text = ''
+  while (j < s.length) {
+    if (s[j] === '\\' && j + 1 < s.length) {
+      text += s[j] + s[j + 1]
+      j += 2
+      continue
+    }
+    if (s[j] === quote) {
+      return { text, end: j + 1 }
+    }
+    text += s[j]
+    j++
+  }
+  return null
+}
+
+/**
+ * R14 W1: extract the first argument after a flag (e.g. -c): quoted first
+ * (escape-aware, see matchQuotedAt), otherwise the next bare token.
+ * Returns null when no argument is present.
+ */
+function extractFlagArgument(s: string, flag: string): string | null {
+  const fm = new RegExp(`\\s${flag}(?:=|\\s)`).exec(s)
+  if (!fm) return null
+  let i = fm.index + fm[0].length
+  while (i < s.length && s[i] === ' ') i++
+  if (s[i] === '"' || s[i] === "'") {
+    const q = matchQuotedAt(s, i)
+    if (q) return q.text
+  }
+  const bare = /^(\S+)/.exec(s.slice(i))
+  return bare ? bare[1] : null
+}
+
+/**
  * R14 W1: extract the inline code (-c/-e/…) of a single command and scan
  * it for sensitive-path references, so wrappers that only recurse through
  * classifySingleCommand (nohup / env / bare assignment prefix / subshell)
@@ -2435,18 +2482,15 @@ function scanInlineCodeForSensitive(
     PY_INTERPRETER_RE.test(firstWord) ? ['-c'] : INTERPRETER_CODE_FLAGS[firstWord]
   if (!codeFlags) return null
   for (const flag of codeFlags) {
-    const fm = new RegExp(`\\s${flag}(?:=|\\s)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(command)
-    if (fm) {
-      const codeText = fm[1] ?? fm[2] ?? fm[3]
-      if (!codeText) continue
-      const hits = scanCodeForSensitivePaths(codeText, denyReadPaths)
-      if (hits.length > 0) {
-        return {
-          category: 'read',
-          reason: `Sensitive path access blocked (denyReadPaths, interpreter -c): ${hits[0]}`,
-          targetPaths: hits,
-          forceDeny: true,
-        }
+    const codeText = extractFlagArgument(command, flag)
+    if (!codeText) continue
+    const hits = scanCodeForSensitivePaths(codeText, denyReadPaths)
+    if (hits.length > 0) {
+      return {
+        category: 'read',
+        reason: `Sensitive path access blocked (denyReadPaths, interpreter -c): ${hits[0]}`,
+        targetPaths: hits,
+        forceDeny: true,
       }
     }
   }
@@ -2574,9 +2618,10 @@ export function classifyBashCommand(
       PY_INTERPRETER_RE.test(firstWordCode) ? ['-c'] : INTERPRETER_CODE_FLAGS[firstWordCode]
     if (codeFlags) {
       for (const flag of codeFlags) {
-        const fm = new RegExp(`\\s${flag}(?:=|\\s)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(s)
-        if (fm) {
-          const codeText = fm[1] ?? fm[2] ?? fm[3]
+        // R14 W1: escape-aware extraction (\" inside an inner quoted string
+        // must not truncate the code).
+        const codeText = extractFlagArgument(s, flag)
+        if (codeText) {
           for (const hit of scanCodeForSensitivePaths(codeText, denyReadPaths)) {
             resolvedReads.push(hit)
           }

@@ -146,6 +146,21 @@ const cases = [
   [`uv run --no-sync python3 -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
   [`bash -c "cat /Users/x/.ssh/id_rsa"`, false, ['/Users/x/.ssh']],
   [`uv run python3 -c "print(open('/Users/x/notes.txt').read())"`, true, ['/Users/x/.ssh']],
+  // ── round-14 W1: single-layer wrappers must forceDeny on -c sensitive reads ──
+  [`nohup python3 -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
+  [`FOO=bar python3 -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
+  [`FOO=bar BAZ=qux python3 -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
+  [`env FOO=bar python3 -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
+  [`env -i PATH=/usr/bin python3 -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
+  [`(python3 -c "print(open('/Users/x/.ssh/id_rsa').read())")`, false, ['/Users/x/.ssh']],
+  [`nohup python3.12 -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
+  [`FOO=bar python3.12m -c "print(open('/Users/x/.ssh/id_rsa').read())"`, false, ['/Users/x/.ssh']],
+  [`bash -c "python3 -c \\"print(open('/Users/x/.ssh/id_rsa').read())\\""`, false, ['/Users/x/.ssh']],
+  [`nohup python3 -c "print(1)"`, true, ['/Users/x/.ssh']],
+  [`FOO=bar python3 -c "print(open('/Users/x/notes.txt').read())"`, true, ['/Users/x/.ssh']],
+  [`(python3 -c "print(1)")`, true, ['/Users/x/.ssh']],
+  [`nohup python3.12 --version`, true, ['/Users/x/.ssh']],
+  [`FOO=bar echo hi`, true, ['/Users/x/.ssh']],
 ]
 
 let miss = 0
