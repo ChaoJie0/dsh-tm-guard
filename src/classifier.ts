@@ -1277,14 +1277,19 @@ function isReadonlyCurlDownload(rest: string): boolean {
   // Any of these flags makes it not a read-only download.
   const blocked: RegExp[] = [
     /(?:^|\s)-X\s*\S?/, /(?:^|\s)--request\b/,
-    /(?:^|\s)-d\b/, /(?:^|\s)--data\b/, /(?:^|\s)--data-raw\b/, /(?:^|\s)--data-binary\b/, /(?:^|\s)--data-urlencode\b/,
-    /(?:^|\s)-T\b/, /(?:^|\s)--upload-file\b/,
-    /(?:^|\s)-F\b/, /(?:^|\s)--form\b/,
-    /(?:^|\s)-H\b/, /(?:^|\s)--header\b/,
-    /(?:^|\s)-u\b/, /(?:^|\s)--user\b/, /(?:^|\s)--basic\b/, /(?:^|\s)--digest\b/, /(?:^|\s)--anyauth\b/, /(?:^|\s)--bearer\b/,
-    /(?:^|\s)-k\b/, /(?:^|\s)--insecure\b/,
-    /(?:^|\s)-K\b/, /(?:^|\s)--config\b/,
-    /(?:^|\s)--proxy\b/, /(?:^|\s)-e\b/, /(?:^|\s)--referer\b/,
+    // Value-taking short options: match the glued form too (-HX:y, -dsecret,
+    // -ua:b, -Fkey=@f, -Tfile, -ehttp://r) — `\b` misses the letter-to-letter
+    // boundary, so use "not followed by another `-`" (long options are matched
+    // by their own `--…` rules and never hit these, because (?:^|\s) requires
+    // a space/start before the single dash).
+    /(?:^|\s)-d(?!-)/, /(?:^|\s)--data\b/, /(?:^|\s)--data-raw\b/, /(?:^|\s)--data-binary\b/, /(?:^|\s)--data-urlencode\b/,
+    /(?:^|\s)-T(?!-)/, /(?:^|\s)--upload-file\b/,
+    /(?:^|\s)-F(?!-)/, /(?:^|\s)--form\b/,
+    /(?:^|\s)-H(?!-)/, /(?:^|\s)--header\b/,
+    /(?:^|\s)-u(?!-)/, /(?:^|\s)--user\b/, /(?:^|\s)--basic\b/, /(?:^|\s)--digest\b/, /(?:^|\s)--anyauth\b/, /(?:^|\s)--bearer\b/,
+    /(?:^|\s)-k(?!-)/, /(?:^|\s)--insecure\b/,
+    /(?:^|\s)-K(?!-)/, /(?:^|\s)--config\b/,
+    /(?:^|\s)--proxy\b/, /(?:^|\s)-e(?!-)/, /(?:^|\s)--referer\b/,
     /(?:^|\s)--post\d*\b/, /(?:^|\s)--head\b/,
   ]
   for (const re of blocked) if (re.test(s)) return false
