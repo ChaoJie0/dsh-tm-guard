@@ -59,6 +59,15 @@ All notable changes to dsh-tm-guard will be documented in this file.
   with a README pointer. A second warning fires for the combination
   `failClosed=false` + `autoApprove=true`, which leaves no human confirmation
   step and no rollback gate. No behaviour change — announcements only.
+- **Audit log rotation (new default behaviour)**. `audit.jsonl` now rotates at
+  10 MiB, keeps 5 generations, total ≈ 50 MiB (100 MiB hard cap), with a
+  cross-process lock. **The oldest generation is physically deleted once the
+  retained window is full** — rollback/forensics reach back only as far as the
+  window. This replaces 0.2.4's unbounded log, so the audit can never silently
+  fill the disk (which would break the write path rollback depends on). Tune
+  via `auditMaxBytes`/`auditRetainFiles`/`auditTotalMaxBytes`; set
+  `auditMaxBytes: 0` to disable rotation entirely. See README § Audit log
+  rotation.
 
 ### Known UX notes（发布说明，非缺陷）
 - **解释器内联代码里再包本地开发命令会被拦（R15 起新增 deny 面）**：
@@ -70,8 +79,18 @@ All notable changes to dsh-tm-guard will be documented in this file.
 - **`uv run --with <pkg> script.py` / `--with-requirements` 按包操作拒绝**：
   属于既有"包操作默认拒绝"立场（profile 定向放行即可）；可先 `uv sync` 再
   `uv run`，或去掉 `--with` 直接运行。`--with` 精确 token 化留待下个版本。
-- 上述均为安全方向的收紧，被拦命令不会执行；误拦面估计为全量命令的
-  1–3%，均有低成本改写。
+- 上述均为安全方向的收紧，被拦命令不会执行。真实生产语料回放显示内联
+  解释器写法（`python/node -c/-e`）会大幅收紧，具体踩不踩中取决于内联码
+  里是否出现高危 import/原语——请以内联码改写指引为准，而非一个固定
+  百分比（既有 "1–3%" 估算无干净语料支撑，已撤回）。
+- **audit 自动轮转（升级须知）**：默认 10MiB/5 代/100MiB，保留窗口填满后
+  最旧审计会被**物理删除**——若你需要更长回滚/取证历史，用
+  `auditMaxBytes`/`auditRetainFiles` 调大窗口，或 `auditMaxBytes: 0` 完全
+  关闭轮转（回到无界增长）。
+- **已知边界**：纯 socket 外联（`socket.create_connection(...)`，无 URL
+  字面量）静态扫描不识别；0.2.5 起版本化解释器名（`python3.12`/`pypy3`）
+  与裸名共享此边界（非回归，两版一致）。高需求用户可从可信工具移除内联
+  解释器，或配出口防火墙（见 README § Limitations）。
 
 ## [0.2.4] - 2026-10-03
 

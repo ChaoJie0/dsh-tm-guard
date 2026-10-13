@@ -223,6 +223,10 @@ The plugin accepts a `Partial<TmGuardConfig>` on its inserted row. Users normall
 | `requireGitBaseline` | `boolean` | `true` | Require a committed local-git baseline (auto-created) for file writes. |
 | `autoApprove` | `boolean` | `true` | Answer DSH approval requests `allowed-once` for calls already passed by the prepended gate. Prints a startup warning; **its safety depends on this plugin's `prepend` order** — see [Auto-approval and its blast radius](#auto-approval-and-its-blast-radius). Set false to let approval asks reach the user / fail closed. |
 
+| `auditMaxBytes` | `number` | `10485760` | Per-file audit rotation threshold in **bytes** (default 10 MiB). When the live `audit.jsonl` would exceed it, the current content is rotated to `.1` and a fresh file starts. **`0` (or negative) disables rotation entirely** — the audit then grows unbounded. See [Audit log rotation](#audit-log-rotation). |
+| `auditRetainFiles` | `number` | `5` | How many rotated generations (`.1`, `.2`, …) are kept before the **oldest is physically deleted**. Total retained ≈ `auditMaxBytes × (1 + auditRetainFiles)`. |
+| `auditTotalMaxBytes` | `number` | `104857600` | Optional global cap in **bytes** (default 100 MiB) across all generations; a safety net if `maxBytes`/`retainFiles` are raised. |
+
 > **⚠️ Do NOT put `subagent` / `subagent_fork` / `workflow` / `job_output` in `extraAllowTools`.** The allow-list short-circuits classification entirely, so a whitelisted subagent tool bypasses the gate's `mixed`-category denial and can write outside `protectedPaths` without rollback coverage. Subagents are `mixed` by default and denied for exactly that reason; keep them out of the allow-list (see Limitations).
 
 Example — your profile's `cordis.patch.yml` (the shipped bundle itself inserts a bare row; this is how a user configures it):
@@ -244,6 +248,33 @@ Example — your profile's `cordis.patch.yml` (the shipped bundle itself inserts
         failClosed: true
         requireGitBaseline: true
         turnReports: true
+```
+
+### Audit log rotation
+
+Since 0.2.5 the audit log rotates by default so an unattended machine is never
+silently driven to disk-full by the gate's own history — disk-full would break
+the write path that rollback depends on. Defaults: each live `audit.jsonl`
+rotates at **10 MiB**, keeps **5** generations (`.1`–`.5`), total ≈ 50 MiB
+(100 MiB hard cap).
+
+- Rotation is **pre-append**: the triggering record lands in the fresh file,
+  and `.1` is byte-for-byte the pre-rotation history.
+- **The oldest generation is physically deleted** once the retained window is
+  full — this is a real, intentional change from 0.2.4's unbounded log.
+  Rollback/forensics reach back only as far as the retained window.
+- Cross-process lock keeps several hosts from corrupting the same file.
+- **To disable rotation** (keep the full history forever — only for users who
+  explicitly want unbounded growth): set `auditMaxBytes: 0`.
+- **To keep more history** without going unbounded, raise both, e.g.
+  `auditMaxBytes: 100` + `auditRetainFiles: 20` (≈ 21 × 100 MiB retained).
+
+```yaml
+config:
+  auditMaxBytes: 0          # disable rotation
+  # or
+  auditMaxBytes: 100        # MiB per generation
+  auditRetainFiles: 20      # generations kept
 ```
 
 ---
@@ -318,6 +349,8 @@ Please read this before trusting the plugin. It raises the bar for unattended ru
 - **Heuristic command classification.** Exotic one-liners may be misclassified; the default for the unknown is deny. Tune with `extraAllowTools`/`extraDenyTools`, and keep `denyNetwork`/`denySystem` on.
 - **Path extraction is heuristic, and the write-flag list is curated.** Paths carried by command arguments (positional paths, redirections, `key=value` operands, glued `--flag=value` values) are recovered by pattern matching, not by a shell parser. The write-side glued-flag list (`--output`, `--outfile`, `--target-directory`, …) is a maintainer-curated allow-list: a new write flag or exotic variant not yet listed will not be surfaced to the write-protection check. Unknown = denied by default keeps the common case fail-closed; review new write flags as you encounter them, and keep `denyNetwork` on as the egress backstop.
 - **Interpreter `-c/-e` code is only scanned for literal sensitive paths.** `python3 -c "print(open('/Users/alice/.ssh/id_rsa').read())"` is blocked, but the code text is a Turing-complete program — dynamically assembled paths (`'.'+'ssh'`, `os.path.join(expanduser('~'), ...)`, decoding, …) can evade the text scan. That residual gap is covered by `denyNetwork` egress blocking, the audit log, and the agent's own judgment; remove `python3 -c`/`node -e` from your trusted tools if you need stricter behavior.
+- **Inline code that wraps local dev commands is denied since 0.2.5.** `python3 -c "subprocess.run(['npm','test'])"`, `node -e "execFileSync('git',['status'])"` or any inline `npm/git/cargo/go` invocation are rejected (`package`/`vcs_remote`/`unknown`): static analysis cannot prove the wrapped `npm` is `test` and not `install`, or that the wrapped `git` is local `status` and not a remote op. The direct forms (`npm test`, `git status`, `cargo test`, `go run`) still pass, and **script-file forms are unaffected** — `node x.js` / `python x.py` are scanned as files, not as inline code. Prefer running the command directly or writing it to a script file.
+- **Raw socket egress without a URL literal is not detected.** `python3 -c "import socket; socket.create_connection(('host',4444))"` has no URL/`urllib`/`requests` pattern for the egress net to match — a static-text limitation that exists in every version (README's "honest scope"). Since 0.2.5 recognizes versioned interpreter names (`python3.12`, `pypy3`, …) instead of mis-blocking them as `unknown`, this same blind spot now also applies to those names — identical to bare `python3`, not a regression. `denyNetwork` still blocks the *category* when the command is classified network; socket is the residual hole. For credential-rich hosts, remove inline interpreters from your trusted tools and pair with an egress firewall (see below).
 - **Subagents are blocked by default** because child operations cannot be fully verified; only enable them if they inherit equivalent constraints.
 - **For production or credential-rich machines**, use a real OS sandbox / disposable profile / VM, least-privilege credentials, and egress filtering in addition to this plugin. Review the source before installing any DSH plugin — a plugin is trusted host code, not sandboxed agent code.
 
