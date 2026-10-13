@@ -1789,6 +1789,12 @@ function stripUvRunFlags(s: string): string {
   // subcommands (npm test, cargo test, go run…) are allowed while install/fetch
   // (which hit the network) stay blocked.
   if (LOCAL_EXEC_COMMANDS.has(firstWord) || PY_INTERPRETER_RE.test(firstWord) || LOCAL_EXEC_COMMANDS.has(fullCmd)) {
+    // R14 W1: sensitive-path scan on the inline code now runs inside
+    // classifySingleCommand so it flows through every wrapper recursion
+    // (nohup/env/assignment/subshell), not just the outer per-segment
+    // loop where the first word is the interpreter.
+    const sensHit = scanInlineCodeForSensitive(trimmed, denyReadPaths)
+    if (sensHit) return sensHit
     // R5: interpreters with inline code — classify the wrapped argv so
     // `python3 -c "subprocess.run(['pip3','install',x])"` and
     // `node -e "process.kill(pid)"` cannot ride on local_exec.
@@ -2408,6 +2414,43 @@ function scanCodeForSensitivePaths(
     }
   }
   return hits
+}
+
+/**
+ * R14 W1: extract the inline code (-c/-e/…) of a single command and scan
+ * it for sensitive-path references, so wrappers that only recurse through
+ * classifySingleCommand (nohup / env / bare assignment prefix / subshell)
+ * still produce the forceDeny mark. The scan used to live only in
+ * classifyBashCommand's per-segment loop, where the segment's first word
+ * had to be the interpreter itself — `nohup python3 -c "open('…/.ssh/…')"`
+ * therefore rode local_exec.
+ */
+function scanInlineCodeForSensitive(
+  command: string,
+  denyReadPaths: string[],
+): ClassifyResult | null {
+  if (denyReadPaths.length === 0) return null
+  const firstWord = command.trim().split(/\s+/)[0]?.toLowerCase().split('/').pop() ?? ''
+  const codeFlags =
+    PY_INTERPRETER_RE.test(firstWord) ? ['-c'] : INTERPRETER_CODE_FLAGS[firstWord]
+  if (!codeFlags) return null
+  for (const flag of codeFlags) {
+    const fm = new RegExp(`\\s${flag}(?:=|\\s)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(command)
+    if (fm) {
+      const codeText = fm[1] ?? fm[2] ?? fm[3]
+      if (!codeText) continue
+      const hits = scanCodeForSensitivePaths(codeText, denyReadPaths)
+      if (hits.length > 0) {
+        return {
+          category: 'read',
+          reason: `Sensitive path access blocked (denyReadPaths, interpreter -c): ${hits[0]}`,
+          targetPaths: hits,
+          forceDeny: true,
+        }
+      }
+    }
+  }
+  return null
 }
 
 /** Private-key / credential file names that -name may carry (precise, no wildcards). */
