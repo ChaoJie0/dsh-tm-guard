@@ -17,6 +17,10 @@ All notable changes to dsh-tm-guard will be documented in this file.
 - **误拦修复（curl -o 分离值提取）**：`curl -o /tmp/x https://…` 的下载目标路径
   之前提取为空（temp 豁免不触发 → 合法下载被 BLOCKED）；现在提取 `-o/--output`
   分离值，合法 `/tmp` 下载恢复 temp 豁免放行。
+- **回归封口（curl -K/--config 配置注入）**：独立对抗复查发现 `-K/--config`
+  配置文件注入可携带 `-k/-d/-H/--output` 任意参数（配置内容 curl 真实执行）；
+  `-K`/`--config` 已加入危险 flag 表 → `curl -K cfg / -K - / -Kcfg` 一律
+  network/deny（不再降级为只读下载）。
 
 ### Changed
 - **审计轮转运行时日志**：审计日志轮转发生时输出

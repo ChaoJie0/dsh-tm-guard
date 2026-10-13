@@ -1274,6 +1274,7 @@ function isReadonlyCurlDownload(rest: string): boolean {
     /(?:^|\s)-H\b/, /(?:^|\s)--header\b/,
     /(?:^|\s)-u\b/, /(?:^|\s)--user\b/, /(?:^|\s)--basic\b/, /(?:^|\s)--digest\b/, /(?:^|\s)--anyauth\b/, /(?:^|\s)--bearer\b/,
     /(?:^|\s)-k\b/, /(?:^|\s)--insecure\b/,
+    /(?:^|\s)-K\b/, /(?:^|\s)--config\b/,
     /(?:^|\s)--proxy\b/, /(?:^|\s)-e\b/, /(?:^|\s)--referer\b/,
     /(?:^|\s)--post\d*\b/, /(?:^|\s)--head\b/,
   ]

