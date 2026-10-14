@@ -13,7 +13,8 @@
  *
  * Exit code: 0 = clean; 1 = any violation (fails the release gate).
  */
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { gunzipSync } from 'node:zlib'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -81,6 +82,56 @@ for (const t of expectedTop) {
 if (unexpectedTop.length) {
   console.log(`  UNEXPECTED: ${unexpectedTop.join(', ')}`)
   violations.push(`unexpected top-level: ${unexpectedTop.join(', ')}`)
+}
+
+// R-3 freshness gate: if a local tarball exists, every entry must byte-match
+// the current worktree (which equals HEAD when verify:build passed). This
+// closes the blind spot where the audit checked the tree but not the tarball
+// actually staged for publish. Pure Node: no child process, no tar binary.
+const TGZ = join(ROOT, `dsh-tm-guard-${pkg.version}.tgz`)
+if (existsSync(TGZ)) {
+  console.log('')
+  console.log('Freshness vs staged tarball:')
+  const tarBuf = gunzipSync(readFileSync(TGZ))
+  const entries = []
+  let off = 0
+  while (off + 512 <= tarBuf.length) {
+    const header = tarBuf.subarray(off, off + 512)
+    if (header.every((b) => b === 0)) break
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/, '')
+    const size = parseInt(header.subarray(124, 136).toString('utf8').replace(/\0.*$/, '').trim() || '0', 8)
+    off += 512
+    const content = size > 0 ? tarBuf.subarray(off, off + size) : Buffer.alloc(0)
+    entries.push({ name, content })
+    off += Math.ceil(size / 512) * 512
+  }
+  const byName = new Map(entries.map((e) => [e.name.replace(/^package\//, ''), e.content]))
+  for (const f of rel) {
+    const disk = join(ROOT, f)
+    const want = existsSync(disk) ? readFileSync(disk) : null
+    const got = byName.get(f)
+    if (got === undefined) {
+      violations.push(`tarball missing whitelist file: ${f}`)
+      console.log(`  MISSING ${f}`)
+    } else if (want === null) {
+      violations.push(`tarball has file absent from worktree: ${f}`)
+      console.log(`  EXTRA ${f}`)
+    } else if (!got.equals(want)) {
+      violations.push(`tarball byte-differs from worktree: ${f}`)
+      console.log(`  DIFF   ${f}`)
+    } else {
+      console.log(`  OK     ${f}`)
+    }
+  }
+  for (const [name, content] of byName) {
+    if (name.startsWith('package/')) continue // tar pax/global headers ignored by map above
+    if (!rel.includes(name)) {
+      violations.push(`tarball contains non-whitelist entry: ${name} (${content.length}B)`)
+      console.log(`  EXTRA  ${name}`)
+    }
+  }
+} else {
+  console.log('  (no staged tarball — freshness check skipped)')
 }
 
 console.log('')
