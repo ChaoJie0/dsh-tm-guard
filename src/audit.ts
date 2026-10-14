@@ -68,6 +68,8 @@ export interface RotateInfo {
   totalMiB: number
   /** Total rotations performed by this process. */
   rotatedCount: number
+  /** Generations physically deleted by THIS rotation (0 until the window fills). */
+  evicted: number
 }
 
 /** Stall clock: lets recover the stale-lock timeout on waiters. */
@@ -141,10 +143,14 @@ export class AuditLog {
     this.logPath = join(this.dir, 'audit.jsonl')
     this.rotation = { ...DEFAULT_ROTATION, ...rotation }
     this.onRotate = onRotate ?? ((info) => {
+      const deletion =
+        info.evicted > 0
+          ? `physically deleted ${info.evicted} generation(s) — forensics reach back only this far`
+          : `no file evicted yet — retention window just shifted (deletion starts once it fills)`
       console.warn(
         `[tm-guard] audit rotated → .1; oldest generation beyond ${info.retainFiles} retained (` +
-          `≈${info.perFile}/file, ${info.totalMiB} MiB cap) physically deleted — ` +
-          `forensics reach back only this far (set auditMaxBytes:0 to keep all)`,
+          `≈${info.perFile}/file, ${info.totalMiB} MiB cap), ${deletion} ` +
+          `(set auditMaxBytes:0 to keep all)`,
       )
     })
     try {
@@ -280,7 +286,7 @@ export class AuditLog {
     // --- Step 1: shift old generations, oldest first ------------------
     // Drop the generation that would fall outside the retention window, then
     // walk backwards so no rename can clobber a not-yet-shifted file.
-    this.unlinkIfExists(this.rotatedPath(retainFiles))
+    let evicted = this.unlinkIfExists(this.rotatedPath(retainFiles)) ? 1 : 0
     for (let i = retainFiles - 1; i >= 1; i--) {
       const from = this.rotatedPath(i)
       if (!existsSync(from)) continue
@@ -315,13 +321,16 @@ export class AuditLog {
     this.rotatedCount++
     const mb = this.rotation.maxBytes / 1048576
     const perFile = mb >= 1 ? `${mb.toFixed(0)} MiB` : `${(this.rotation.maxBytes / 1024).toFixed(0)} KiB`
+    // Total-ceiling deletions must be counted too, or the log line would say
+    // "no file evicted yet" while the size backstop physically removed files.
+    evicted += this.enforceTotalLimit(totalMaxBytes)
     this.onRotate({
       retainFiles,
       perFile,
       totalMiB: Math.round(totalMaxBytes / 1048576),
       rotatedCount: this.rotatedCount,
+      evicted,
     })
-    this.enforceTotalLimit(totalMaxBytes)
     return true
   }
 
@@ -332,8 +341,8 @@ export class AuditLog {
    * enabled). With the default 100 MiB vs. 5 × 10 MiB it should not fire in
    * steady state.
    */
-  private enforceTotalLimit(totalMaxBytes: number): void {
-    if (!(totalMaxBytes > 0)) return
+  private enforceTotalLimit(totalMaxBytes: number): number {
+    if (!(totalMaxBytes > 0)) return 0
     const oldestFirst = (): { path: string; size: number; gen: number }[] => {
       const out: { path: string; size: number; gen: number }[] = []
       for (let i = MAX_ROTATED_FILES; i >= 1; i--) {
@@ -347,29 +356,34 @@ export class AuditLog {
       return out
     }
     let total = this.currentSize() + oldestFirst().reduce((n, f) => n + f.size, 0)
-    if (total <= totalMaxBytes) return
+    if (total <= totalMaxBytes) return 0
     // Delete from the oldest generation inward, never the current file: the
     // live log is the only copy of the newest records.
+    let evicted = 0
     for (const f of oldestFirst()) {
       if (total <= totalMaxBytes) break
       try {
         rmSync(f.path, { force: true })
         total -= f.size
+        evicted++
       } catch {
         // ignore
       }
     }
+    return evicted
   }
 
   private rotatedPath(gen: number): string {
     return `${this.logPath}.${gen}`
   }
 
-  private unlinkIfExists(path: string): void {
+  private unlinkIfExists(path: string): boolean {
     try {
+      if (!existsSync(path)) return false
       rmSync(path, { force: true })
+      return true
     } catch {
-      // ignore
+      return false
     }
   }
 

@@ -473,10 +473,13 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     // structured logger (host log surface / TUI / future log panel) at info
     // level, with a console fallback if the logger service is unavailable.
     const log = ctx.logger ? ctx.logger('tm-guard') : console
+    const deletion =
+      info.evicted > 0
+        ? `physically deleted ${info.evicted} generation(s) — forensics reach back only this far`
+        : `no file evicted yet — retention window just shifted (deletion starts once it fills)`
     log.info(
       `audit rotated → .1; oldest generation beyond ${info.retainFiles} retained (` +
-        `≈${info.perFile}/file, ${info.totalMiB} MiB cap) physically deleted — ` +
-        `forensics reach back only this far ` +
+        `≈${info.perFile}/file, ${info.totalMiB} MiB cap), ${deletion} ` +
         `(set auditMaxBytes:0 to keep all; total rotations ${info.rotatedCount})`,
     )
   })

@@ -80,3 +80,6 @@ docs/
 scratch-*.mts
 /RELEASE.md
 _tmp_*
+
+# sibling plugin project — never auto-checkpoint into this repo
+dsh-provider-failover/

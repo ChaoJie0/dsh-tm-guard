@@ -134,7 +134,9 @@ test('rotation: emits a runtime log line ([tm-guard] audit rotated …)', () => 
     assert.equal(rotated, true, 'rotation should emit [tm-guard] audit rotated …')
     assert.equal(existsSync(join(a.dirPath, 'audit.jsonl.1')), true)
     const line = captured.find((s) => s.includes('audit rotated'))!
-    assert.match(line, /\[tm-guard\] audit rotated → \.1; oldest generation beyond 5 retained \(≈1 KiB\/file, 100 MiB cap\) physically deleted — forensics reach back only this far/)
+    // First rotation evicts nothing (the window has not filled yet): the line
+    // must say so explicitly instead of claiming a deletion that never happened.
+    assert.match(line, /\[tm-guard\] audit rotated → \.1; oldest generation beyond 5 retained \(≈1 KiB\/file, 100 MiB cap\), no file evicted yet — retention window just shifted \(deletion starts once it fills\)/)
   } finally {
     console.warn = origWarn
   }
@@ -156,10 +158,103 @@ test('rotation: host-injected onRotate callback receives structured info (no con
   assert.equal(rotated, true, 'rotation should invoke onRotate')
   assert.equal(existsSync(join(a.dirPath, 'audit.jsonl.1')), true)
   const info = infos[infos.length - 1] as {
-    retainFiles: number; perFile: string; totalMiB: number; rotatedCount: number
+    retainFiles: number; perFile: string; totalMiB: number; rotatedCount: number; evicted: number
   }
   assert.equal(info.retainFiles, 5)
   assert.match(info.perFile, /1 KiB/)
   assert.equal(info.totalMiB, 100)
   assert.ok(info.rotatedCount >= 1)
+  assert.equal(typeof info.evicted, 'number', 'RotateInfo must carry evicted')
+})
+
+test('rotation: maxBytes:0 disables rotation entirely (auditMaxBytes:0 contract)', () => {
+  const d = tmpDir('rot0')
+  const a = new AuditLog(d, { maxBytes: 0 }) // the documented "keep all" switch
+  assert.equal(a.maybeRotate(), false, 'maybeRotate with maxBytes:0 must return false')
+  for (let i = 0; i < 200; i++) {
+    a.record({
+      tool: 'bash', category: 'read', decision: 'allow',
+      reason: 'r'.repeat(256), targetPaths: [],
+    })
+  }
+  assert.equal(existsSync(join(a.dirPath, 'audit.jsonl.1')), false,
+    'no rotation generation may appear while rotation is disabled')
+  assert.ok(a.readAll().length >= 200, 'all records must stay in the live file')
+})
+
+test('rotation: negative maxBytes also disables rotation (guard is >0)', () => {
+  const d = tmpDir('rotneg')
+  const a = new AuditLog(d, { maxBytes: -1 })
+  assert.equal(a.maybeRotate(), false, 'maybeRotate with negative maxBytes must return false')
+  for (let i = 0; i < 50; i++) {
+    a.record({
+      tool: 'bash', category: 'read', decision: 'allow',
+      reason: 'r'.repeat(128), targetPaths: [],
+    })
+  }
+  assert.equal(existsSync(join(a.dirPath, 'audit.jsonl.1')), false)
+})
+
+test('rotation: evicted=1 once the window fills — oldest generation deleted, line says so', () => {
+  const d = tmpDir('rotevict')
+  const a = new AuditLog(d, { maxBytes: 1024, retainFiles: 3 })
+  // Pre-seed the oldest generation so the FIRST rotation evicts it.
+  writeFileSync(join(a.dirPath, 'audit.jsonl.3'), 'older\n', 'utf8')
+  const captured: string[] = []
+  const origWarn = console.warn
+  console.warn = (m: unknown, ...rest: unknown[]) => {
+    captured.push(String(m) + (rest.length ? ' ' + rest.map(String).join(' ') : ''))
+  }
+  try {
+    let rotated = false
+    for (let i = 0; i < 500 && !rotated; i++) {
+      a.record({
+        tool: 'bash', category: 'read', decision: 'allow',
+        reason: 'r'.repeat(96), targetPaths: [],
+      })
+      rotated = captured.some((s) => s.includes('audit rotated'))
+    }
+    assert.equal(rotated, true, 'rotation should fire')
+    assert.equal(existsSync(join(a.dirPath, 'audit.jsonl.3')), false,
+      'the evicted oldest generation must be gone')
+    const line = captured.find((s) => s.includes('audit rotated'))!
+    assert.match(line, /physically deleted 1 generation\(s\) — forensics reach back only this far/,
+      'window-full rotation must report the actual deletion')
+  } finally {
+    console.warn = origWarn
+  }
+})
+
+test('rotation: total-ceiling (backstop) deletions are counted into evicted', () => {
+  const d = tmpDir('rotevictcap')
+  // Pre-seed an oversized generation so the FIRST rotation's size backstop
+  // (not the window shift) does the deleting: retainFiles=3, .3 absent so
+  // step1 evicts 0; the seeded .1 shifts to .2 and the ceiling evicts it.
+  const guardDir = join(d, '.tm-guard')
+  mkdirSync(guardDir, { recursive: true })
+  writeFileSync(join(guardDir, 'audit.jsonl.1'), 'x'.repeat(2048), 'utf8')
+  const a = new AuditLog(d, { maxBytes: 1024, retainFiles: 3, totalMaxBytes: 1024 })
+  const captured: string[] = []
+  const origWarn = console.warn
+  console.warn = (m: unknown, ...rest: unknown[]) => {
+    captured.push(String(m) + (rest.length ? ' ' + rest.map(String).join(' ') : ''))
+  }
+  try {
+    let rotated = false
+    for (let i = 0; i < 500 && !rotated; i++) {
+      a.record({
+        tool: 'bash', category: 'read', decision: 'allow',
+        reason: 'r'.repeat(96), targetPaths: [],
+      })
+      rotated = captured.some((s) => s.includes('audit rotated'))
+    }
+    assert.equal(rotated, true, 'rotation should fire')
+    assert.equal(existsSync(join(guardDir, 'audit.jsonl.2')), false,
+      'the ceiling-evicted generation must be gone')
+    const line = captured.find((s) => s.includes('audit rotated'))!
+    assert.match(line, /physically deleted 1 generation\(s\) — forensics reach back only this far/,
+      'backstop deletions must be reported as real evictions')
+  } finally {
+    console.warn = origWarn
+  }
 })

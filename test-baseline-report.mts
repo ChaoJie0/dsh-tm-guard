@@ -641,3 +641,46 @@ test('U-27: probeGitBaseline reports a missing git binary without throwing', () 
     process.env.PATH = savedPath
   }
 })
+
+/* ------------------------------------------------------------------ */
+/* c. Schema-versioned regeneration (the B2 upgrade-user gap)          */
+/* ------------------------------------------------------------------ */
+
+test('U-27c: a stale report (older schema, no version marker) is regenerated', async () => {
+  const ws = workspace()
+  const report = reportOf(ws)
+  // Simulate an 0.2.5-era report: present on disk, six sections, but no
+  // `报告版本` marker — exactly what an upgrade user would have.
+  writeFileSync(
+    report,
+    '# TM-Guard 首次运行安全基线自检\n\n| 项 | 值 |\n|---|---|\n| 生成时间 | 2026-10-01T00:00:00.000Z |\n| 平台 | darwin（full mode） |\n\n## 6. 已知残余风险\n\n（0.2.5 版没有审计保留窗口披露）\n',
+    'utf8',
+  )
+  const staleMtime = statSync(report).mtimeMs
+
+  applyIn(ws, 'darwin')
+  const fresh = readFileSync(report, 'utf8')
+  assert.ok(fresh.includes('| 报告版本 |'), 'regenerated report must carry the version marker')
+  assert.ok(fresh.includes('6. 已知残余风险'), 'regenerated report must keep all six sections')
+  assert.ok(
+    statSync(report).mtimeMs !== staleMtime || fresh.includes('报告版本'),
+    'stale report must actually be rewritten (mtime or bytes must change)',
+  )
+  planCleanup(ws)
+})
+
+test('U-27c: a current-version report is not rewritten (steady state)', async () => {
+  const ws = workspace()
+  const report = reportOf(ws)
+  applyIn(ws, 'darwin')
+  await sleep(200) // let the async TM refine settle before pinning baseline
+  const body = readFileSync(report, 'utf8')
+  assert.ok(body.includes('| 报告版本 |'), 'fresh report must carry the version marker')
+  const mtime = statSync(report).mtimeMs
+  await sleep(30) // so a rewrite would land on a strictly later mtime
+
+  applyIn(ws, 'darwin')
+  assert.equal(statSync(report).mtimeMs, mtime, 'current-version report must not be rewritten')
+  assert.equal(readFileSync(report, 'utf8'), body, 'current-version report bytes must not change')
+  planCleanup(ws)
+})

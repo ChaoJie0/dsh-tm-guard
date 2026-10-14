@@ -17,7 +17,9 @@
  * live, which platform mode is in effect — followed by the residual risks that
  * remain even when everything above is green. The README's Limitations become
  * facts measured on *this* machine. The report then stays on disk (§
- * baseline-report.md) and every later `apply()` is a single `existsSync`.
+ * baseline-report.md) and every later `apply()` is one `existsSync` plus a
+ * ~512-byte head read, unless the report carries an outdated schema version —
+ * then it is regenerated once (see `REPORT_VERSION`).
  *
  * Read-only by construction. The one probe that must *understand* git
  * (`rev-parse`) does not create anything, and the git baseline probe
@@ -49,6 +51,15 @@ export const BASELINE_SECTIONS = [
   '## 5. 平台支持状态',
   '## 6. 已知残余风险',
 ] as const
+
+/**
+ * Report schema version. Bump it whenever the report gains a section or fact
+ * that *existing* users (who already have a report on disk) must see — the
+ * guard in `ensureBaselineReport` rewrites an outdated report instead of
+ * skipping it, so a disclosure fix actually reaches upgrade users (see the
+ * B2 gap: the rotation-retention section only appeared in report v2).
+ */
+export const REPORT_VERSION = 2
 
 /**
  * Residual risks quoted from README § "Limitations & honest scope". They are
@@ -165,6 +176,7 @@ export function renderBaselineReport(input: BaselineReportInput): string {
   out.push('| 项 | 值 |')
   out.push('|---|---|')
   out.push(`| 生成时间 | ${input.generatedAt.toISOString()} |`)
+  out.push(`| 报告版本 | ${REPORT_VERSION} |`)
   out.push(`| 平台 | ${cell(platform)}${platformSupported ? '（full mode）' : '（limited mode — 无 Time Machine）'} |`)
   out.push(`| Workspace | ${cell(workspace)} |`)
   out.push(`| 报告路径 | ${cell(input.reportPath)} |`)
@@ -311,8 +323,8 @@ export function renderBaselineReport(input: BaselineReportInput): string {
   out.push('')
   out.push('---')
   out.push('')
-  out.push(`本报告只在首次运行生成一次（${BASELINE_REPORT_FILE} 存在即跳过）。`)
-  out.push('要看**当前**状态用 `tm_status`；要重新生成本报告，删除该文件后重启会话。')
+  out.push(`本报告在首次运行生成一次；插件升级带来新增章节时（报告版本 ${REPORT_VERSION}）会自动重新生成。`)
+  out.push('要看**当前**状态用 `tm_status`；要强制重新生成，删除该文件后重启会话。')
   out.push('')
 
   return out.join('\n')
@@ -362,7 +374,7 @@ export function ensureBaselineReport(
   input: Omit<BaselineReportInput, 'reportPath'>,
 ): BaselineWriteResult {
   const reportPath = join(dir, BASELINE_REPORT_FILE)
-  if (existsSync(reportPath)) {
+  if (existsSync(reportPath) && reportIsCurrent(reportPath)) {
     return { written: false, reportPath, markdown: '' }
   }
   const markdown = renderBaselineReport({ ...input, reportPath })
@@ -377,6 +389,23 @@ export function ensureBaselineReport(
       markdown,
       error: err instanceof Error ? err.message : String(err),
     }
+  }
+}
+
+/**
+ * True when the on-disk report carries the current `REPORT_VERSION` marker.
+ *
+ * Steady-state cost stays one `existsSync` plus a ~512-byte head read per
+ * `apply()`; the read is cheap and only fires when the file exists. A report
+ * that is missing, unreadable, truncated, or stamped with an older version
+ * counts as stale and is rewritten by `ensureBaselineReport`.
+ */
+function reportIsCurrent(reportPath: string): boolean {
+  try {
+    const head = readFileSync(reportPath, 'utf8').slice(0, 512)
+    return head.includes(`| 报告版本 | ${REPORT_VERSION} |`)
+  } catch {
+    return false
   }
 }
 

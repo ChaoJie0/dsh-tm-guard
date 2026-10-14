@@ -1,6 +1,6 @@
 # dsh-tm-guard
 
-**A zero-intervention permission gate for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) agents on macOS.** Local, reversible operations — writes that can be undone via a local git baseline or macOS Time Machine — are auto-approved and checkpointed; network access, package installs, system/process management, remote VCS, and reads of sensitive credential paths are blocked and audited. The agent runs unattended inside a protected workspace with no approval prompts.
+**A zero-intervention permission gate for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) agents on macOS — active on install.** Writes that can be undone via a local git baseline or macOS Time Machine are auto-approved and snapshot-checkpointed; network access, package installs, process/system management, and reads of sensitive credential paths are blocked; every decision is audited — the audit log is bounded by default with rotation (set `auditMaxBytes: 0` to retain all).
 
 > Core rule: **operations that can be rolled back are allowed; operations that cannot be rolled back are denied.**
 

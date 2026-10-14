@@ -6,6 +6,19 @@ All notable changes to dsh-tm-guard will be documented in this file.
 
 ## [0.2.6] - 2026-10-14
 
+### Disclosure & hardening (review-gap fill)
+- **auditMaxBytes:0 关闭轮转契约补测**：`auditMaxBytes: 0`（及负值）是文档承诺的
+  "keep all" 开关，但此前关闭路径零测试覆盖。补 2 条测试钉死：`maybeRotate()` 返回
+  false、`record()` 永不触发轮转、不生成任何 `.N` 代（实现已有 `>0` 保护，非功能修复）。
+- **基线报告版本化重生成（存量升级用户可见披露）**：报告此前"存在即跳过"，
+  0.2.5 老用户升级后永远看不到 §6 新增的审计保留窗口披露。报告现在带 schema 版本
+  （`报告版本 | 2 |`），版本不匹配自动重新生成；稳态成本仍是一次 `existsSync` +
+  ~512B 头部读。补 2 条测试（旧报告重生成 / 当前版本不重写）。
+- **轮转日志按实际删除区分措辞**：此前每次轮转都打印 "physically deleted"，
+  但前 `retainFiles` 次轮转实际没有删除任何文件（窗口未满）。`RotateInfo` 新增
+  `evicted` 计数，日志改为：未满窗口时明说 "no file evicted yet — retention window
+  just shifted"，真删除时报告 "physically deleted N generation(s)"。补 evicted 两条测试（窗口驱逐 evicted=1、总字节顶 backstop 删除计入 evicted）。
+
 ### Fixed (edges promised in 0.2.5)
 - **存量边界 1 修复（temp 前缀穿越）**：写门控的 temp 豁免现在与敏感读/写保护
   使用同一规范化（`normalizeForMatch` 折叠 `//`、`.`、`..` 并 lowercase）。
