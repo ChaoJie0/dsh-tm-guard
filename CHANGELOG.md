@@ -4,7 +4,31 @@ All notable changes to dsh-tm-guard will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-14
+
+### Keep-all 定稿（0.2.6 废弃说明）
+- **0.2.6（npm 已发布版）为有界默认版，已废弃（deprecated）**：npm 0.2.6 发布于
+  keep-all 定稿前，审计日志默认 10MiB 轮转、物理删最老代——与最终拍板相反。
+  **请升级 0.2.7**；`npm view dsh-tm-guard deprecated` 可看到废弃提示。
+- **审计日志默认保留全部（keep-all）随 0.2.7 定稿**：默认 `auditMaxBytes: 0`——
+  不轮转、不生成任何 `.N` 代、记录全量保留；轮转为 opt-in（配置 `auditMaxBytes` 启用，
+  `auditRetainFiles` 控制代数，`auditTotalMaxBytes` 设硬顶）。基线报告版本 `3`。
+- **市场措辞最终形态**：README/description 明确"写操作自动放行并**自动打快照**
+  （本地 git 基线 / Time Machine）"、"审计日志默认保留全部，可配置启用**自动清理
+  最旧审计记录**"——无参数名/术语噪音，参数细节见正文 Configuration 与 § Audit log
+  rotation。
+
+### Fixed / Test
+- **真机 TM 测试断言双布局**：回滚源接受外部盘 `.previous` 完成备份或本地快照树
+  （`Backups.backupdb`）任一合法 TM 源，对齐 `src/tm.ts` 既有枚举+最新优先行为
+  （`src/tm.ts` 零改动）。
+- 门禁：300/300 测试、verify:fast exit 0（peer 19/19、18 files byte-identical）。
+
 ## [0.2.6] - 2026-10-14
+
+> ⚠️ **废弃**：npm 0.2.6 为有界默认版（审计默认 10MiB 轮转、物理删最老代），
+> 与 keep-all 定稿相反。请使用 **0.2.7**（本条目内容为发布时的代码状态，随 0.2.7
+> 的 keep-all 反转在下方 [0.2.7] 描述）。
 
 ### Disclosure & hardening (review-gap fill)
 - **auditMaxBytes:0 关闭轮转契约补测**：`auditMaxBytes: 0`（及负值）短路
