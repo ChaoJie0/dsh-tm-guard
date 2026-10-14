@@ -1,6 +1,6 @@
 # dsh-tm-guard
 
-**A zero-intervention permission gate for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) agents on macOS — active on install.** Writes that can be undone via a local git baseline or macOS Time Machine are auto-approved and snapshot-checkpointed; network access, package installs, process/system management, and reads of sensitive credential paths are blocked; every decision is audited — the audit log is bounded by default with rotation (set `auditMaxBytes: 0` to retain all).
+**A zero-intervention permission gate for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) agents on macOS — active on install.** Writes that can be undone via a local git baseline or macOS Time Machine are auto-approved and snapshot-checkpointed; network access, package installs, process/system management, and reads of sensitive credential paths are blocked; every decision is audited — the audit log keeps everything by default (optional bounded rotation via `auditMaxBytes`).
 
 > Core rule: **operations that can be rolled back are allowed; operations that cannot be rolled back are denied.**
 
@@ -223,7 +223,7 @@ The plugin accepts a `Partial<TmGuardConfig>` on its inserted row. Users normall
 | `requireGitBaseline` | `boolean` | `true` | Require a committed local-git baseline (auto-created) for file writes. |
 | `autoApprove` | `boolean` | `true` | Answer DSH approval requests `allowed-once` for calls already passed by the prepended gate. Prints a startup warning; **its safety depends on this plugin's `prepend` order** — see [Auto-approval and its blast radius](#auto-approval-and-its-blast-radius). Set false to let approval asks reach the user / fail closed. |
 
-| `auditMaxBytes` | `number` | `10485760` | Per-file audit rotation threshold in **bytes** (default 10 MiB). When the live `audit.jsonl` would exceed it, the current content is rotated to `.1` and a fresh file starts. **`0` (or negative) disables rotation entirely** — the audit then grows unbounded. See [Audit log rotation](#audit-log-rotation). |
+| `auditMaxBytes` | `number` | `0` | Per-file audit rotation threshold in **bytes** (default `0` = rotation off, the audit log keeps everything). Set a positive value (e.g. `10485760` = 10 MiB) to enable rotation: when the live `audit.jsonl` would exceed it, the current content is rotated to `.1` and a fresh file starts. See [Audit log rotation](#audit-log-rotation). |
 | `auditRetainFiles` | `number` | `5` | How many rotated generations (`.1`, `.2`, …) are kept before the **oldest is physically deleted**. Total retained ≈ `auditMaxBytes × (1 + auditRetainFiles)`. |
 | `auditTotalMaxBytes` | `number` | `104857600` | Optional global cap in **bytes** (default 100 MiB) across all generations; a safety net if `maxBytes`/`retainFiles` are raised. |
 
@@ -252,20 +252,22 @@ Example — your profile's `cordis.patch.yml` (the shipped bundle itself inserts
 
 ### Audit log rotation
 
-Since 0.2.5 the audit log rotates by default so an unattended machine is never
-silently driven to disk-full by the gate's own history — disk-full would break
-the write path that rollback depends on. Defaults: each live `audit.jsonl`
-rotates at **10 MiB**, keeps **5** generations (`.1`–`.5`), total ≈ 50 MiB
-(100 MiB hard cap).
+Since 0.2.6 the audit log **keeps everything by default** — rotation is off, so
+an unattended machine's full history is retained. Rotation is **opt-in** for
+users who prefer bounded disk usage: set `auditMaxBytes` (per-file threshold in
+bytes, e.g. `10485760` = 10 MiB) plus `auditRetainFiles` (generations kept).
+With defaults of 10 MiB × 5 generations the total is ≈ 50 MiB (100 MiB hard cap).
 
 - Rotation is **pre-append**: the triggering record lands in the fresh file,
   and `.1` is byte-for-byte the pre-rotation history.
 - **The oldest generation is physically deleted** once the retained window is
-  full — this is a real, intentional change from 0.2.4's unbounded log.
+  full — this is a real, intentional trade-off (0.2.4 had an unbounded log;
+  0.2.5 rotated by default; 0.2.6 made rotation opt-in).
   Rollback/forensics reach back only as far as the retained window.
 - Cross-process lock keeps several hosts from corrupting the same file.
-- **To disable rotation** (keep the full history forever — only for users who
-  explicitly want unbounded growth): set `auditMaxBytes: 0`.
+- **To enable rotation** (bounded disk usage — only for users who prefer a cap
+  over full history): set `auditMaxBytes: 10485760` (or `100` in MiB units) +
+  `auditRetainFiles: 5`.
 - **To keep more history** without going unbounded, raise both, e.g.
   `auditMaxBytes: 100` + `auditRetainFiles: 20` (≈ 21 × 100 MiB retained).
 - Each rotation is recorded through the plugin's structured logger under the
@@ -276,9 +278,9 @@ rotates at **10 MiB**, keeps **5** generations (`.1`–`.5`), total ≈ 50 MiB
 
 ```yaml
 config:
-  auditMaxBytes: 0          # disable rotation
+  auditMaxBytes: 0          # default: rotation off, keep everything
   # or
-  auditMaxBytes: 100        # MiB per generation
+  auditMaxBytes: 100        # MiB per generation (rotation on)
   auditRetainFiles: 20      # generations kept
 ```
 
@@ -355,7 +357,7 @@ Please read this before trusting the plugin. It raises the bar for unattended ru
 - **Path extraction is heuristic, and the write-flag list is curated.** Paths carried by command arguments (positional paths, redirections, `key=value` operands, glued `--flag=value` values) are recovered by pattern matching, not by a shell parser. The write-side glued-flag list (`--output`, `--outfile`, `--target-directory`, …) is a maintainer-curated allow-list: a new write flag or exotic variant not yet listed will not be surfaced to the write-protection check. Unknown = denied by default keeps the common case fail-closed; review new write flags as you encounter them, and keep `denyNetwork` on as the egress backstop.
 - **Interpreter `-c/-e` code is only scanned for literal sensitive paths.** `python3 -c "print(open('/Users/alice/.ssh/id_rsa').read())"` is blocked, but the code text is a Turing-complete program — dynamically assembled paths (`'.'+'ssh'`, `os.path.join(expanduser('~'), ...)`, decoding, …) can evade the text scan. That residual gap is covered by `denyNetwork` egress blocking, the audit log, and the agent's own judgment; remove `python3 -c`/`node -e` from your trusted tools if you need stricter behavior.
 - **Inline code that wraps local dev commands is denied since 0.2.5.** `python3 -c "subprocess.run(['npm','test'])"`, `node -e "execFileSync('git',['status'])"` or any inline `npm/git/cargo/go` invocation are rejected (`package`/`vcs_remote`/`unknown`): static analysis cannot prove the wrapped `npm` is `test` and not `install`, or that the wrapped `git` is local `status` and not a remote op. The direct forms (`npm test`, `git status`, `cargo test`, `go run`) still pass, and **script-file forms are unaffected** — `node x.js` / `python x.py` are scanned as files, not as inline code. Prefer running the command directly or writing it to a script file.
-- **The audit log is bounded by default (since 0.2.5).** It rotates at 10 MiB per file and keeps 5 generations (~50 MiB, hard 100 MiB cap); **once the window is full the oldest generation is physically deleted and cannot be recovered** — forensics and rollback reach back only as far as the retained window. Set `auditMaxBytes: 0` to keep everything (unbounded growth then becomes your own disk problem). See [Audit log rotation](#audit-log-rotation).
+- **The audit log keeps everything by default (since 0.2.6).** Rotation is off unless you opt in: set `auditMaxBytes` (e.g. `10485760` = 10 MiB) + `auditRetainFiles` to enable bounded retention; **once the window is full the oldest generation is physically deleted and cannot be recovered** — forensics and rollback reach back only as far as the retained window. With the cap off, unbounded growth becomes your own disk problem. See [Audit log rotation](#audit-log-rotation).
 - **Raw socket egress without a URL literal is not detected.** `python3 -c "import socket; socket.create_connection(('host',4444))"` has no URL/`urllib`/`requests` pattern for the egress net to match — a static-text limitation that exists in every version (README's "honest scope"). Since 0.2.5 recognizes versioned interpreter names (`python3.12`, `pypy3`, …) instead of mis-blocking them as `unknown`, this same blind spot now also applies to those names — identical to bare `python3`, not a regression. `denyNetwork` still blocks the *category* when the command is classified network; socket is the residual hole. For credential-rich hosts, remove inline interpreters from your trusted tools and pair with an egress firewall (see below).
 - **Temp-dir exemption normalizes paths (since 0.2.6).** Scratch writes under `/tmp`, `/private/tmp`, `/var/tmp`, `/var/folders` are allowed without a snapshot; the check now resolves `//`, `.`, `..` and case (same normalization as the sensitive-path checks), so `/tmp/../etc/…` no longer matches the exemption (the OS would land it outside `/tmp`).
 - **`curl` download flags are cluster-expanded (since 0.2.6).** `curl -sLk -o file https://…` (bundled `-k`), `-sLd x=y` (POST body) and `-sLH "X:y"` (arbitrary header) no longer bypass the readonly-download blocklist: glued short-option clusters are expanded (`-sLk` → `-s -L -k`) before matching, so they classify as `network` deny.

@@ -33,8 +33,9 @@ const MAX_ROTATED_FILES = 20
 
 /** Defaults for rotation, mirrored in `DEFAULT_CONFIG` (src/index.ts). */
 export const AUDIT_DEFAULTS = {
-  /** Rotate the current file once it reaches this size (10 MiB). */
-  maxBytes: 10 * 1024 * 1024,
+  /** Rotation is OFF by default — the audit log keeps everything. Set a
+   *  positive value (e.g. 10 MiB) to rotate once the live file crosses it. */
+  maxBytes: 0,
   /** Keep `audit.jsonl.1` … `audit.jsonl.N`; `.1` is the newest. */
   retainFiles: 5,
   /** Hard ceiling across all generations (2× headroom over retain×max). */
@@ -150,7 +151,7 @@ export class AuditLog {
       console.warn(
         `[tm-guard] audit rotated → .1; oldest generation beyond ${info.retainFiles} retained (` +
           `≈${info.perFile}/file, ${info.totalMiB} MiB cap), ${deletion} ` +
-          `(set auditMaxBytes:0 to keep all)`,
+          `(rotation is opt-in; default keeps all)`,
       )
     })
     try {

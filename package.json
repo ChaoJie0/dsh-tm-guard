@@ -1,7 +1,7 @@
 {
   "name": "dsh-tm-guard",
   "version": "0.2.6",
-  "description": "Time-Machine-backed autonomous agent permission gate for DeepSeek Harness (dsh). Safe defaults on install (protect cwd, deny network/system, block sensitive reads). Configure protectedPaths/extraAllowTools to tune access for tools you explicitly trust — see README. Audit log is bounded by default (rotates at 10 MiB, keeps 5 generations; oldest is physically deleted — set auditMaxBytes:0 to retain all).",
+  "description": "Time-Machine-backed autonomous agent permission gate for DeepSeek Harness (dsh). Safe defaults on install (protect cwd, deny network/system, block sensitive reads). Configure protectedPaths/extraAllowTools to tune access for tools you explicitly trust — see README. Audit log keeps everything by default (no rotation); optionally enable bounded rotation via auditMaxBytes.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "type": "module",

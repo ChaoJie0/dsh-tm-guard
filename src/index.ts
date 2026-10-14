@@ -480,7 +480,7 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     log.info(
       `audit rotated → .1; oldest generation beyond ${info.retainFiles} retained (` +
         `≈${info.perFile}/file, ${info.totalMiB} MiB cap), ${deletion} ` +
-        `(set auditMaxBytes:0 to keep all; total rotations ${info.rotatedCount})`,
+        `(rotation is opt-in; default keeps all; total rotations ${info.rotatedCount})`,
     )
   })
 

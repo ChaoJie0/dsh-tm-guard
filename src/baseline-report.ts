@@ -59,7 +59,7 @@ export const BASELINE_SECTIONS = [
  * skipping it, so a disclosure fix actually reaches upgrade users (see the
  * B2 gap: the rotation-retention section only appeared in report v2).
  */
-export const REPORT_VERSION = 2
+export const REPORT_VERSION = 3
 
 /**
  * Residual risks quoted from README § "Limitations & honest scope". They are
@@ -312,10 +312,10 @@ export function renderBaselineReport(input: BaselineReportInput): string {
   out.push('     不约束 syscall。本机加固请叠加外部防火墙 / 一次性 profile / VM 与最小权限凭证。')
   out.push('  5. **路径与命令分类是启发式的**：写法冷门的单行命令可能被误分类；')
   out.push('     未识别的默认拒绝（保守方向），但请以 `denyNetwork` 作为出口兜底。')
-  out.push('  6. **审计日志只保留有限窗口（since 0.2.5）**：默认每 10 MiB 轮转、保留 5 代')
-  out.push('     （约 50 MiB，100 MiB 硬顶）；**窗口外最老代被物理删除、不可恢复**。')
-  out.push('     取证/回滚只能回看到保留窗口内的记录。如需完整留痕：')
-  out.push('     `cordis.patch.yml` 设 `auditMaxBytes: 0`（关闭轮转）。当前窗口见')
+  out.push('  6. **审计日志默认保留全部（since 0.2.6）**：默认不轮转、完整留痕；')
+  out.push('     仅当在 `cordis.patch.yml` 显式设置 `auditMaxBytes`（如 10，单位 MiB）')
+  out.push('     + `auditRetainFiles` 时启用有界轮转，**窗口满后最老代被物理删除、不可恢复**。')
+  out.push('     取证/回滚只能回看到保留窗口内的记录。当前窗口见')
   out.push('     `tm_status` → Data sources。')
   out.push('')
   out.push('  权威表述见：')
