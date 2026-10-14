@@ -255,8 +255,9 @@ Example — your profile's `cordis.patch.yml` (the shipped bundle itself inserts
 Since 0.2.6 the audit log **keeps everything by default** — rotation is off, so
 an unattended machine's full history is retained. Rotation is **opt-in** for
 users who prefer bounded disk usage: set `auditMaxBytes` (per-file threshold in
-bytes, e.g. `10485760` = 10 MiB) plus `auditRetainFiles` (generations kept).
-With defaults of 10 MiB × 5 generations the total is ≈ 50 MiB (100 MiB hard cap).
+**bytes**, e.g. `10485760` = 10 MiB); `auditRetainFiles` is optional and
+defaults to 5 generations. With 10 MiB × 5 generations the total is ≈ 50 MiB
+(100 MiB hard cap).
 
 - Rotation is **pre-append**: the triggering record lands in the fresh file,
   and `.1` is byte-for-byte the pre-rotation history.
@@ -266,10 +267,11 @@ With defaults of 10 MiB × 5 generations the total is ≈ 50 MiB (100 MiB hard c
   Rollback/forensics reach back only as far as the retained window.
 - Cross-process lock keeps several hosts from corrupting the same file.
 - **To enable rotation** (bounded disk usage — only for users who prefer a cap
-  over full history): set `auditMaxBytes: 10485760` (or `100` in MiB units) +
-  `auditRetainFiles: 5`.
+  over full history): set `auditMaxBytes: 10485760` (10 MiB); `auditRetainFiles`
+  defaults to 5 if omitted.
 - **To keep more history** without going unbounded, raise both, e.g.
-  `auditMaxBytes: 100` + `auditRetainFiles: 20` (≈ 21 × 100 MiB retained).
+  `auditMaxBytes: 104857600` (100 MiB) + `auditRetainFiles: 20`
+  (≈ 21 × 100 MiB retained).
 - Each rotation is recorded through the plugin's structured logger under the
   name `tm-guard` (visible in the host log surface; e.g. web profile:
   `/tmp/dsh-web.log`), and the current generation count is always readable via
@@ -278,10 +280,10 @@ With defaults of 10 MiB × 5 generations the total is ≈ 50 MiB (100 MiB hard c
 
 ```yaml
 config:
-  auditMaxBytes: 0          # default: rotation off, keep everything
+  auditMaxBytes: 0              # default: rotation off, keep everything
   # or
-  auditMaxBytes: 100        # MiB per generation (rotation on)
-  auditRetainFiles: 20      # generations kept
+  auditMaxBytes: 10485760       # bytes per file (10 MiB, rotation on)
+  auditRetainFiles: 5           # generations kept (optional, default 5)
 ```
 
 ---

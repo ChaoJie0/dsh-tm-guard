@@ -184,17 +184,18 @@ export interface TmGuardConfig {
    */
   autoApprove: boolean
   /**
-   * Rotate `.tm-guard/audit.jsonl` once it exceeds this many bytes (default
-   * 10 MiB ≈ 22.9k records at 457 B/record). Rotation keeps the rollback
-   * history readable instead of letting one unbounded file grow forever.
-   * `0` (or negative) disables rotation entirely.
+   * Rotate `.tm-guard/audit.jsonl` once it exceeds this many bytes. Default `0`
+   * = rotation off, the audit log keeps everything (unbounded growth becomes
+   * your own disk problem). Set a positive value (e.g. 10 MiB ≈ 22.9k records
+   * at 457 B/record) to enable bounded rotation.
    */
   auditMaxBytes: number
   /**
    * How many rotated generations to keep as `audit.jsonl.1` … `audit.jsonl.N`
-   * (default 5, where `.1` is the NEWEST). With the default 10 MiB threshold
-   * this is a ≈50 MiB / ≈115k-record history window. The oldest generation is
-   * deleted once the window is full — that deletion is irreversible.
+   * (default 5, where `.1` is the NEWEST). Used only when rotation is enabled
+   * (auditMaxBytes > 0): with a 10 MiB threshold this is a ≈50 MiB / ≈115k-record
+   * history window. The oldest generation is deleted once the window is full —
+   * that deletion is irreversible.
    */
   auditRetainFiles: number
   /**

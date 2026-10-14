@@ -195,6 +195,21 @@ test('rotation: negative maxBytes also disables rotation (guard is >0)', () => {
   assert.equal(existsSync(join(a.dirPath, 'audit.jsonl.1')), false)
 })
 
+test('rotation: DEFAULT config keeps everything (auditMaxBytes defaults to 0)', () => {
+  const d = tmpDir('rotdef')
+  const a = new AuditLog(d) // DEFAULT_ROTATION → AUDIT_DEFAULTS.maxBytes = 0 (keep-all)
+  assert.equal(a.maybeRotate(), false, 'default config must not rotate (maxBytes defaults to 0)')
+  for (let i = 0; i < 300; i++) {
+    a.record({
+      tool: 'bash', category: 'read', decision: 'allow',
+      reason: 'r'.repeat(256), targetPaths: [],
+    })
+  }
+  assert.equal(existsSync(join(a.dirPath, 'audit.jsonl.1')), false,
+    'no rotation generation may appear under default config')
+  assert.ok(a.readAll().length >= 300, 'all records must stay in the live file under default config')
+})
+
 test('rotation: evicted=1 once the window fills — oldest generation deleted, line says so', () => {
   const d = tmpDir('rotevict')
   const a = new AuditLog(d, { maxBytes: 1024, retainFiles: 3 })

@@ -669,6 +669,27 @@ test('U-27c: a stale report (older schema, no version marker) is regenerated', a
   planCleanup(ws)
 })
 
+test('U-27c: a v2-marker report (older REPORT_VERSION) is regenerated to v3', async () => {
+  const ws = workspace()
+  const report = reportOf(ws)
+  // Simulate an RC-era v2 report: present on disk WITH the old `报告版本 | 2 |`
+  // marker — exactly what a 0.2.6-RC tester would have.
+  writeFileSync(
+    report,
+    '# TM-Guard 首次运行安全基线自检\n\n| 项 | 值 |\n|---|---|\n| 报告版本 | 2 |\n| 生成时间 | 2026-10-01T00:00:00.000Z |\n| 平台 | darwin（full mode） |\n\n## 6. 已知残余风险\n\n（v2 报告：审计默认有界轮转的旧披露）\n',
+    'utf8',
+  )
+  const staleMtime = statSync(report).mtimeMs
+
+  applyIn(ws, 'darwin')
+  const fresh = readFileSync(report, 'utf8')
+  assert.ok(fresh.includes('| 报告版本 | 3 |'), 'v2 report must be regenerated to REPORT_VERSION 3')
+  assert.ok(!fresh.includes('| 报告版本 | 2 |'), 'old v2 marker must be gone after regeneration')
+  assert.ok(fresh.includes('默认保留全部'), 'regenerated §6 must carry the keep-all disclosure')
+  assert.ok(statSync(report).mtimeMs !== staleMtime, 'v2 report must actually be rewritten')
+  planCleanup(ws)
+})
+
 test('U-27c: a current-version report is not rewritten (steady state)', async () => {
   const ws = workspace()
   const report = reportOf(ws)

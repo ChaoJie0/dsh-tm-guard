@@ -7,12 +7,12 @@ All notable changes to dsh-tm-guard will be documented in this file.
 ## [0.2.6] - 2026-10-14
 
 ### Disclosure & hardening (review-gap fill)
-- **auditMaxBytes:0 关闭轮转契约补测**：`auditMaxBytes: 0`（及负值）是文档承诺的
-  "keep all" 开关，但此前关闭路径零测试覆盖。补 2 条测试钉死：`maybeRotate()` 返回
-  false、`record()` 永不触发轮转、不生成任何 `.N` 代（实现已有 `>0` 保护，非功能修复）。
+- **auditMaxBytes:0 关闭轮转契约补测**：`auditMaxBytes: 0`（及负值）短路
+  轮转（`maybeRotate()` 返回 false、`record()` 永不触发轮转、不生成任何 `.N` 代）。
+  **0 现为默认值**——0.2.6 定稿将默认反转为保留全部（见下方 Changed）。
 - **基线报告版本化重生成（存量升级用户可见披露）**：报告此前"存在即跳过"，
   0.2.5 老用户升级后永远看不到 §6 新增的审计保留窗口披露。报告现在带 schema 版本
-  （`报告版本 | 2 |`），版本不匹配自动重新生成；稳态成本仍是一次 `existsSync` +
+  （`报告版本 | 3 |`），版本不匹配自动重新生成；稳态成本仍是一次 `existsSync` +
   ~512B 头部读。补 2 条测试（旧报告重生成 / 当前版本不重写）。
 - **轮转日志按实际删除区分措辞**：此前每次轮转都打印 "physically deleted"，
   但前 `retainFiles` 次轮转实际没有删除任何文件（窗口未满）。`RotateInfo` 新增
@@ -47,20 +47,26 @@ All notable changes to dsh-tm-guard will be documented in this file.
   不误拦合法下载。分隔/粘连/簇内/任意前缀/引号包裹形态全部 network/deny。
 
 ### Changed
+- **审计日志默认反转为保留全部（0.2.6 定稿）**：默认 `auditMaxBytes: 0`——不轮转、
+  完整留痕（磁盘无界增长由用户自行管理，README Limitations 已如实披露）；有界轮转
+  改为 **opt-in**（显式设 `auditMaxBytes` + `auditRetainFiles`）。同步反转 README
+  开头段/配置表/轮转章节/Limitations、npm description、基线报告 §6
+  （`报告版本 | 3 |`，升级用户自动重生成）、轮转日志文案
+  （"rotation is opt-in; default keeps all"）。
 - **审计轮转披露补强（B1/B2/O1/O2）**——轮转对用户数据保留有实质影响（窗口外
   最老代被物理删除、不可恢复），披露从"深渠道"补齐到"用户必经渠道"：
   - 运行时轮转日志点明后果：`audit rotated → .1; oldest generation beyond N
     retained (~X MiB/file, Y MiB cap) physically deleted — forensics reach back
     only this far (set auditMaxBytes:0 to keep all)`（之前只说 rotated/retained，
     没说删除与取证窗口；无宿主 logger 时回退 console 同款文案）。
-  - 首次基线报告第 6 节新增"审计日志只保留有限窗口（since 0.2.5）"本机事实
-    （默认 10 MiB/5 代/100 MiB 硬顶、关闭方法、看当前窗口的方法）——把深
+  - 首次基线报告第 6 节披露本机审计数据保留事实（0.2.6 起默认保留全部；显式配置
+    才启用有界轮转；窗口满后最老代物理删除不可恢复；看当前窗口的方法）——把深
     README 事实落到用户最可能打开的持久产物。
-  - README § Limitations 新增 **The audit log is bounded by default (since
-    0.2.5)** 条目（与其它 since 0.2.5/0.2.6 条目同格式，链接 § Audit log
+  - README § Limitations 更新为 **The audit log keeps everything by default
+    (since 0.2.6)** 条目（与其它 since 0.2.5/0.2.6 条目同格式，链接 § Audit log
     rotation）。
-  - npm/market 包描述（description）末尾补半句：审计默认有界轮转、最老代
-    物理删除、`auditMaxBytes:0` 可保留全部——命中安装前唯一几乎必读的渠道。
+  - npm/market 包描述（description）同步为：审计默认保留全部、可选启用
+    有界轮转——命中安装前唯一几乎必读的渠道。
 
 ## [0.2.5] - 2026-10-13
 
