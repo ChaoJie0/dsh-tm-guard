@@ -79,3 +79,4 @@ docs/
 .reval-*/
 scratch-*.mts
 /RELEASE.md
+_tmp_*
