@@ -57,8 +57,8 @@ All notable changes to dsh-tm-guard will be documented in this file.
   最老代被物理删除、不可恢复），披露从"深渠道"补齐到"用户必经渠道"：
   - 运行时轮转日志点明后果：`audit rotated → .1; oldest generation beyond N
     retained (~X MiB/file, Y MiB cap) physically deleted — forensics reach back
-    only this far (set auditMaxBytes:0 to keep all)`（之前只说 rotated/retained，
-    没说删除与取证窗口；无宿主 logger 时回退 console 同款文案）。
+    only this far (rotation is opt-in; default keeps all)`（之前只说
+    rotated/retained，没说删除与取证窗口；无宿主 logger 时回退 console 同款文案）。
   - 首次基线报告第 6 节披露本机审计数据保留事实（0.2.6 起默认保留全部；显式配置
     才启用有界轮转；窗口满后最老代物理删除不可恢复；看当前窗口的方法）——把深
     README 事实落到用户最可能打开的持久产物。
