@@ -4,7 +4,7 @@ All notable changes to dsh-tm-guard will be documented in this file.
 
 ## [Unreleased]
 
-## [0.2.6] - unreleased
+## [0.2.6] - 2026-10-14
 
 ### Fixed (edges promised in 0.2.5)
 - **存量边界 1 修复（temp 前缀穿越）**：写门控的 temp 豁免现在与敏感读/写保护
@@ -34,11 +34,20 @@ All notable changes to dsh-tm-guard will be documented in this file.
   不误拦合法下载。分隔/粘连/簇内/任意前缀/引号包裹形态全部 network/deny。
 
 ### Changed
-- **审计轮转运行时日志**：审计日志轮转发生时经插件结构化日志
-  `tm-guard`（宿主日志面可见）输出
-  `audit rotated → .1 (retained N gen, ≈X MiB/file, Y MiB cap, total rotations N)`，
-  运行时可自解释（之前静默轮转，用户翻审计时可能误以为旧记录丢失）；
-  日志经 `onRotate` 回调注入 `ctx.logger`，无宿主 logger 时回退 console。
+- **审计轮转披露补强（B1/B2/O1/O2）**——轮转对用户数据保留有实质影响（窗口外
+  最老代被物理删除、不可恢复），披露从"深渠道"补齐到"用户必经渠道"：
+  - 运行时轮转日志点明后果：`audit rotated → .1; oldest generation beyond N
+    retained (~X MiB/file, Y MiB cap) physically deleted — forensics reach back
+    only this far (set auditMaxBytes:0 to keep all)`（之前只说 rotated/retained，
+    没说删除与取证窗口；无宿主 logger 时回退 console 同款文案）。
+  - 首次基线报告第 6 节新增"审计日志只保留有限窗口（since 0.2.5）"本机事实
+    （默认 10 MiB/5 代/100 MiB 硬顶、关闭方法、看当前窗口的方法）——把深
+    README 事实落到用户最可能打开的持久产物。
+  - README § Limitations 新增 **The audit log is bounded by default (since
+    0.2.5)** 条目（与其它 since 0.2.5/0.2.6 条目同格式，链接 § Audit log
+    rotation）。
+  - npm/market 包描述（description）末尾补半句：审计默认有界轮转、最老代
+    物理删除、`auditMaxBytes:0` 可保留全部——命中安装前唯一几乎必读的渠道。
 
 ## [0.2.5] - 2026-10-13
 

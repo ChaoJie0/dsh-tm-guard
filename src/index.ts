@@ -474,9 +474,10 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     // level, with a console fallback if the logger service is unavailable.
     const log = ctx.logger ? ctx.logger('tm-guard') : console
     log.info(
-      `audit rotated → .1 (retained ${info.retainFiles} gen, ` +
-        `≈${info.perFile}/file, ` +
-        `${info.totalMiB} MiB cap, total rotations ${info.rotatedCount})`,
+      `audit rotated → .1; oldest generation beyond ${info.retainFiles} retained (` +
+        `≈${info.perFile}/file, ${info.totalMiB} MiB cap) physically deleted — ` +
+        `forensics reach back only this far ` +
+        `(set auditMaxBytes:0 to keep all; total rotations ${info.rotatedCount})`,
     )
   })
 

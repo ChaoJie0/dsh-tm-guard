@@ -142,9 +142,9 @@ export class AuditLog {
     this.rotation = { ...DEFAULT_ROTATION, ...rotation }
     this.onRotate = onRotate ?? ((info) => {
       console.warn(
-        `[tm-guard] audit rotated → .1 (retained ${info.retainFiles} gen, ` +
-          `≈${info.perFile}/file, ` +
-          `${info.totalMiB} MiB cap)`,
+        `[tm-guard] audit rotated → .1; oldest generation beyond ${info.retainFiles} retained (` +
+          `≈${info.perFile}/file, ${info.totalMiB} MiB cap) physically deleted — ` +
+          `forensics reach back only this far (set auditMaxBytes:0 to keep all)`,
       )
     })
     try {

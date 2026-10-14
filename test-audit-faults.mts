@@ -134,7 +134,7 @@ test('rotation: emits a runtime log line ([tm-guard] audit rotated …)', () => 
     assert.equal(rotated, true, 'rotation should emit [tm-guard] audit rotated …')
     assert.equal(existsSync(join(a.dirPath, 'audit.jsonl.1')), true)
     const line = captured.find((s) => s.includes('audit rotated'))!
-    assert.match(line, /\[tm-guard\] audit rotated → \.1 \(retained 5 gen, ≈1 KiB\/file, 100 MiB cap\)/)
+    assert.match(line, /\[tm-guard\] audit rotated → \.1; oldest generation beyond 5 retained \(≈1 KiB\/file, 100 MiB cap\) physically deleted — forensics reach back only this far/)
   } finally {
     console.warn = origWarn
   }
