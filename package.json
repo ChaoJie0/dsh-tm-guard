@@ -32,8 +32,8 @@
   "scripts": {
     "build": "node scripts/build/build.mjs",
     "prepare": "npm run build",
-    "test": "node --test test-*.mts",
-    "test:coverage": "node --test --experimental-test-coverage test-*.mts",
+    "test": "node --test test-*.mts test-*.mjs",
+    "test:coverage": "node --test --experimental-test-coverage test-*.mts test-*.mjs",
     "verify:peer": "node scripts/verify-peer-matrix.mjs",
     "verify:build": "node scripts/verify-reproducible-build.mjs",
     "verify:pack": "node scripts/verify-pack-audit.mjs",
