@@ -294,6 +294,10 @@ async function maybeSnapshot(cooldownSeconds: number): Promise<string | null> {
 /* ------------------------------------------------------------------ */
 
 export const name = 'tm-guard'
+// Note: `logger` is a built-in cordis service (always on Context); declaring
+// it in `inject` makes the plugin wait for a separate activation and can leave
+// the plugin `pending` — so it stays out of the dependency list and is used
+// defensively via `ctx.logger?.() ?? console`.
 export const inject = ['tools']
 
 /**
@@ -464,6 +468,16 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     maxBytes: config.auditMaxBytes,
     retainFiles: config.auditRetainFiles,
     totalMaxBytes: config.auditTotalMaxBytes,
+  }, (info) => {
+    // Rotation is a normal self-healing maintenance event, not an error:
+    // structured logger (host log surface / TUI / future log panel) at info
+    // level, with a console fallback if the logger service is unavailable.
+    const log = ctx.logger ? ctx.logger('tm-guard') : console
+    log.info(
+      `audit rotated → .1 (retained ${info.retainFiles} gen, ` +
+        `≈${info.perFile}/file, ` +
+        `${info.totalMiB} MiB cap, total rotations ${info.rotatedCount})`,
+    )
   })
 
   /* -------------------------------------------------------------- */

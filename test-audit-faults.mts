@@ -139,3 +139,27 @@ test('rotation: emits a runtime log line ([tm-guard] audit rotated …)', () => 
     console.warn = origWarn
   }
 })
+
+test('rotation: host-injected onRotate callback receives structured info (no console)', () => {
+  const d = tmpDir('rotcb')
+  const infos: unknown[] = []
+  // Disable the console fallback by injecting a callback that does not log.
+  const a = new AuditLog(d, { maxBytes: 1024 }, (info) => { infos.push(info) })
+  let rotated = false
+  for (let i = 0; i < 500 && !rotated; i++) {
+    a.record({
+      tool: 'bash', category: 'read', decision: 'allow',
+      reason: 'r'.repeat(96), targetPaths: [],
+    })
+    rotated = infos.length > 0
+  }
+  assert.equal(rotated, true, 'rotation should invoke onRotate')
+  assert.equal(existsSync(join(a.dirPath, 'audit.jsonl.1')), true)
+  const info = infos[infos.length - 1] as {
+    retainFiles: number; perFile: string; totalMiB: number; rotatedCount: number
+  }
+  assert.equal(info.retainFiles, 5)
+  assert.match(info.perFile, /1 KiB/)
+  assert.equal(info.totalMiB, 100)
+  assert.ok(info.rotatedCount >= 1)
+})

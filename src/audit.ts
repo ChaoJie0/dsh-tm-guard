@@ -58,6 +58,18 @@ export const DEFAULT_ROTATION: RotationConfig = {
   lockTimeoutSeconds: AUDIT_DEFAULTS.lockTimeoutSeconds,
 }
 
+/** Info handed to the `onRotate` callback after a rotation completed. */
+export interface RotateInfo {
+  /** Retention generations kept on disk (`.1` … `.N`). */
+  retainFiles: number
+  /** Per-file threshold, human-readable (e.g. "10 MiB"). */
+  perFile: string
+  /** Hard ceiling across all generations in MiB. */
+  totalMiB: number
+  /** Total rotations performed by this process. */
+  rotatedCount: number
+}
+
 /** Stall clock: lets recover the stale-lock timeout on waiters. */
 const START_TIME = Date.now()
 
@@ -116,12 +128,25 @@ export class AuditLog {
   private rotation: RotationConfig
   /** Set once a rotation has been performed; surfaced for status/diagnostics. */
   private rotatedCount = 0
+  /** Host-injected logger callback; falls back to console.warn when absent. */
+  private onRotate: (info: RotateInfo) => void
 
-  constructor(workspaceDir?: string, rotation?: Partial<RotationConfig>) {
+  constructor(
+    workspaceDir?: string,
+    rotation?: Partial<RotationConfig>,
+    onRotate?: (info: RotateInfo) => void,
+  ) {
     const base = workspaceDir ?? process.env.DSH_HOME ?? process.cwd()
     this.dir = join(base, '.tm-guard')
     this.logPath = join(this.dir, 'audit.jsonl')
     this.rotation = { ...DEFAULT_ROTATION, ...rotation }
+    this.onRotate = onRotate ?? ((info) => {
+      console.warn(
+        `[tm-guard] audit rotated → .1 (retained ${info.retainFiles} gen, ` +
+          `≈${info.perFile}/file, ` +
+          `${info.totalMiB} MiB cap)`,
+      )
+    })
     try {
       if (!existsSync(this.dir)) {
         mkdirSync(this.dir, { recursive: true })
@@ -290,11 +315,12 @@ export class AuditLog {
     this.rotatedCount++
     const mb = this.rotation.maxBytes / 1048576
     const perFile = mb >= 1 ? `${mb.toFixed(0)} MiB` : `${(this.rotation.maxBytes / 1024).toFixed(0)} KiB`
-    console.warn(
-      `[tm-guard] audit rotated → .1 (retained ${retainFiles} gen, ` +
-        `≈${perFile}/file, ` +
-        `${(totalMaxBytes / 1048576).toFixed(0)} MiB cap)`,
-    )
+    this.onRotate({
+      retainFiles,
+      perFile,
+      totalMiB: Math.round(totalMaxBytes / 1048576),
+      rotatedCount: this.rotatedCount,
+    })
     this.enforceTotalLimit(totalMaxBytes)
     return true
   }

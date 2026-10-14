@@ -268,6 +268,11 @@ rotates at **10 MiB**, keeps **5** generations (`.1`–`.5`), total ≈ 50 MiB
   explicitly want unbounded growth): set `auditMaxBytes: 0`.
 - **To keep more history** without going unbounded, raise both, e.g.
   `auditMaxBytes: 100` + `auditRetainFiles: 20` (≈ 21 × 100 MiB retained).
+- Each rotation is recorded through the plugin's structured logger under the
+  name `tm-guard` (visible in the host log surface; e.g. web profile:
+  `/tmp/dsh-web.log`), and the current generation count is always readable via
+  `tm_status` → 【Data sources】. Rotation is a normal self-healing event — it
+  does not interrupt or notify you.
 
 ```yaml
 config:

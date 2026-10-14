@@ -34,9 +34,11 @@ All notable changes to dsh-tm-guard will be documented in this file.
   不误拦合法下载。分隔/粘连/簇内/任意前缀/引号包裹形态全部 network/deny。
 
 ### Changed
-- **审计轮转运行时日志**：审计日志轮转发生时输出
-  `[tm-guard] audit rotated → .1 (retained N gen, ≈X MiB/file, Y MiB cap)`，
-  运行时可自解释（之前静默轮转，用户翻审计时可能误以为旧记录丢失）。
+- **审计轮转运行时日志**：审计日志轮转发生时经插件结构化日志
+  `tm-guard`（宿主日志面可见）输出
+  `audit rotated → .1 (retained N gen, ≈X MiB/file, Y MiB cap, total rotations N)`，
+  运行时可自解释（之前静默轮转，用户翻审计时可能误以为旧记录丢失）；
+  日志经 `onRotate` 回调注入 `ctx.logger`，无宿主 logger 时回退 console。
 
 ## [0.2.5] - 2026-10-13
 
