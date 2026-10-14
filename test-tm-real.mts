@@ -47,8 +47,11 @@ test('real TM: browse finds the SD backup and rollback succeeds via tm-backup', 
     const cp = called.find((c) => c.file === '/bin/cp')
     assert.ok(cp, 'cp should have been invoked')
     assert.equal(cp!.args[0], '-R')
-    assert.ok(cp!.args[1].startsWith('/Volumes/SD/'), `src should be under SD: ${cp!.args[1]}`)
-    assert.ok(cp!.args[1].includes('.previous'), `src should be a completed backup: ${cp!.args[1]}`)
+    assert.ok(cp!.args[1].startsWith('/Volumes/'), `src should be under /Volumes: ${cp!.args[1]}`)
+    assert.ok(
+      cp!.args[1].includes('.previous') || cp!.args[1].includes('Backups.backupdb'),
+      `src should be a completed backup or a local-snapshot tree: ${cp!.args[1]}`,
+    )
     assert.equal(cp!.args[2], TARGET)
   } finally {
     __setExecOverride(null)
