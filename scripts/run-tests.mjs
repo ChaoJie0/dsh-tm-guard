@@ -13,7 +13,7 @@ import { spawnSync } from 'node:child_process'
 import { readdirSync } from 'node:fs'
 
 const tests = readdirSync('.')
-  .filter((f) => /^test-.*\.mts$/.test(f))
+  .filter((f) => /^test-.*\.(mts|mjs)$/.test(f))
   .sort()
 
 const args = process.argv.slice(2)
