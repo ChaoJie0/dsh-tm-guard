@@ -4,6 +4,35 @@ All notable changes to dsh-tm-guard will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-10-20
+
+### Added
+- **Per-file git recoverability probe + forced fresh snapshot for git-ignored
+  deletes.** Before an allowed file write/delete, each target is probed
+  individually against the local git baseline: `yes` (tracked/committable, git
+  can restore it), `no` (git-ignored — e.g. `.env.local`, which `git add -A`
+  never commits, so git cannot restore it), `unknown` (no baseline or probe
+  failed). Targets classified `no` bypass the cooldown skip and force exactly
+  one fresh APFS snapshot before the write; the allow audit record carries
+  `git=no(n)`. The write is still **allowed, never denied** — zero-intervention
+  is unchanged; this only raises snapshot frequency for a file git cannot
+  roll back.
+- Advisory-only `warnOnIgnoredDelete` (default `false`): when `true`, also
+  `console.warn`s the ignored path(s); otherwise silent.
+- `tm_audit` and `tm_status` render the `git=no(n)` count and a
+  `git-unrecoverable targets in recent window` aggregate line.
+
+### Notes
+- No new deny surface; the default decision is unchanged. Setting
+  `requireGitBaseline: false` disables this probe and its forced snapshot too.
+- Backlog (not in this release): large-batch `ls-files` over stdin (ARG_MAX),
+  dangling-symlink strict `unknown`, audit path-form normalization.
+
+### Test
+- 333 tests pass / 0 fail; peer matrix 19/19; real-machine APFS drill verified
+  end to end (one forced snapshot on an ignored delete, zero extra snapshot on
+  a tracked delete inside cooldown), independently re-run and rechecked.
+
 ## [0.2.7] - 2026-10-14
 
 ### Keep-all 定稿（0.2.6 废弃说明）
