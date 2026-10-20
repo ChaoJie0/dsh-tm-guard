@@ -4,45 +4,51 @@
 
 ## 分层架构
 
+> 注：本文件 L0–L6 是**测试机制分层**；`RELEASE.md`（本地私有）里的 L0–L5 是**发布卫生/审查清单**，两套编号互不相干（如 TESTING L1=构建可复现，RELEASE L1=Git 树卫生）。引用时一律带文档前缀（"TESTING L2" / "RELEASE L2"），`DEV.md` 已采用此约定。
+
 | 层 | 名称 | 命令 | 耗时 | 时机 | 自动化 |
 |---|---|---|---|---|---|
-| L0 | 单元测试 | `npm test` | ~30s | 每次提交 / 发布前 | CI + 本地 |
-| L1 | 构建可复现 | `npm run verify:build` | ~15s | 发布前 / 工作树变更后 | CI + 本地 |
-| L2 | 包内容审计 | `npm run verify:pack` | ~10s | 发布前 / 推送前 | CI + 本地 |
-| L3 | peer 兼容矩阵 | `npm run verify:peer` | ~1s | 发布前 / 改动声明后 | CI + 本地 |
+| L0 | 单元测试 | `npm test` | ~20s | 每次提交 / 发布前 | CI + 本地 |
+| L1 | 构建可复现 | `npm run verify:build` | <1s | 发布前 / 工作树变更后 | CI + 本地 |
+| L2 | 包内容审计 | `npm run verify:pack` | <1s | 发布前 / 推送前 | CI + 本地 |
+| L3 | peer 兼容矩阵 | `npm run verify:peer` | <1s | 发布前 / 改动声明后 | CI + 本地 |
 | L4 | 双线隔离冒烟 | 见发布规范步骤 5 | ~10min | **发布前（手动）** | 本地（需 macOS + TM + dsh host） |
 | L5 | 独立复核 | 委派 dsh 会话 | ~3min | **发布前（手动）** | 本地（需 dsh 会话） |
 | L6 | 内容隐私审查 | `npm run verify:pack` + 清单 | ~1min | **推送前（手动）** | 本地 |
+
+> 耗时实测（2026-10-20，本机）：L0 ≈ 18s（TAP duration），L1 ≈ 0.7s，L2 ≈ 0.2s，L3 ≈ 0.25s。L1/L2 因无子进程/增量构建而为亚秒级。
 
 `npm run verify:fast` = L0+L1+L2+L3 一键全跑（发布门禁的自动部分）；`npm run release:check` 为 `verify:fast` 的别名。
 
 ## 各层说明
 
 ### L0 单元测试（`npm test`）
-`node --test test-*.mts test-*.mjs`，**36 个测试文件（35 .mts + 1 .mjs）、333 用例**（2026-10-20 实测 333/333/0），纯逻辑 + 真实文件系统，不依赖 dsh/tmutil。覆盖分类器、决策真值表、路径变体、敏感路径、对抗回归、fuzz、扫描脚本与配额、验证器、报告、hook、运行时、git 回滚与恢复、tm 快照、审计/配置故障注入、ignored 恢复门、平台探测、watermark 等。**任何 src/ 改动必须保持此层全绿。**
+`node --test test-*.mts test-*.mjs`，**37 个测试文件（36 .mts + 1 .mjs）、333 用例**（2026-10-20 实测 333/333/0），纯逻辑 + 真实文件系统，不依赖 dsh/tmutil。覆盖分类器、决策真值表、路径变体、敏感路径、对抗回归、fuzz、扫描脚本与配额、验证器、报告、hook、运行时、git 回滚与恢复、tm 快照、审计/配置故障注入、ignored 恢复门、平台探测、watermark 等。**任何 src/ 改动必须保持此层全绿。**
 
 **测试文件地图**（按主题分组；新用例就近加入，新增特性测试建 `test-<特性>.mts`）：
 
 | 主题 | 文件 |
 |---|---|
-| 分类与决策 | `test-classifier.mts`、`test-classifier-edge.mts`、`test-decide-matrix.mts`、`test-path-variants.mts`、`test-sensitive-paths.mts`、`test-fuzz-classifier.mts`、`test-bypass-regression.mts`、`test-fp-verdict-regression.mts`、`test-round9.mjs` |
+| 分类与决策 | `test-classifier.mts`、`test-classifier-edge.mts`、`test-decide-matrix.mts`、`test-path-variants.mts`、`test-sensitive-paths.mts`、`test-fuzz-classifier.mts`、`test-bypass-regression.mts`、`test-fp-verdict-regression.mts`、`test-adversarial.mts`、`test-round9.mjs` |
 | 门控与自动放行 | `test-gate-prod.mts`、`test-auto-approve-warn.mts` |
 | 扫描脚本 | `test-scan-scripts.mts`、`test-scan-quota.mts`、`test-fuzz-scan.mts` |
 | git 恢复/回滚 | `test-git-real.mts`、`test-git-rollback.mts`、`test-git-recovery.mts`、`test-git-faults.mts` |
 | ignored 恢复门（0.2.8） | `test-ignored-recovery-gate.mts`、`test-ignored-recovery-render.mts` |
-| tm 快照 | `test-tm-real.mts`、`test-tm-faults.mts` |
+| tm 快照 | `test-tm-real.mts`、`test-tm-faults.mts`、`test-rollback.mts` |
 | 故障注入 | `test-audit-faults.mts`、`test-config-faults.mts` |
 | 集成/报告/状态 | `test-index.mts`、`test-report.mts`、`test-baseline-report.mts`、`test-status.mts`、`test-verify.mts`、`test-hook.mts`、`test-runtime.mts` |
 | 平台/元数据 | `test-platform-detect.mts`、`test-readme.mts`、`test-watermark.mts`、`test-perf.mts` |
+
+注：`test-rollback.mts` 是需真实 TM 备份的条件自跳过脚本（前置不满足时 `process.exit(0)` 跳过，不注册 node:test 用例、不贡献 `# tests` 计数）。
 
 ### L1 构建可复现（`npm run verify:build`）
 从 `git HEAD`（将要发布的提交）用 `git archive` 导出干净工作树 → 重新构建 → 与当前 `lib/` + 随包文件逐文件比对 SHA-256。**阻止「未提交改动 + 陈旧 lib/ 被发布」**。工作树有任何未提交改动时此层会正确失败（门禁在起作用）。
 
 ### L2 包内容审计（`npm run verify:pack`）
-`npm pack --dry-run --json` 实际 tarball 内容审计：
+按 package.json `files` 白名单**进程内递归展开**（无子进程，等价于实际 tarball 清单；仓库根存在同名 `<pkg>-<ver>.tgz` 时追加逐字节新鲜度比对）审计：
 - 无本地绝对路径（`/Users/`、`/private/`、`/tmp/`）、无 session id
-- 无源码/测试/临时残留（`src/`、`test-*.mts`、`.smoke-out/`、`.tm-*`、`.git/`、`node_modules/`）
-- 顶层条目仅限白名单（`lib` + 4 文档 + `package.json`）
+- 无源码/测试/临时残留（`src/`、`test-*.mts`、`test-*.mjs`、`.smoke-out/`、`.tm-*`、`.git/`、`node_modules/`）
+- 顶层条目仅限白名单（`lib` + `cordis.patch.yml` + 3 文档 `README.md`/`CHANGELOG.md`/`LICENSE` + `package.json`，共 18 文件）
 
 这是 0.2.0 推送前那次人工隐私审查的机器化版本（当时抓出 3 份本地报告 + 2 个测试残留）。
 
@@ -77,7 +83,7 @@
 
 环境：每版本 = npm tgz 解压 + pnpm 装依赖（`allowBuilds` 白名单 6 项）+ 独立 profile（dsh-base/web-app 同版本 + 插件 tarball）+ 独立端口实例。0.1.2-rc.1 会话为 v3 格式（`session.jsonl.zstd`），0.1.7+ 为 v4（`session.v4.jsonl.zstd`）。冒烟 RPC 脚本见 `.smoke-out/verify-host-matrix-023.md` 附注（/tmp/tm-rpc.py + tm-gate-smoke.py，端口参数化认证）。
 
-**写门控端到端补测（2026-10-02）**：3 个可端到端 host（0.1.7-rc.2/0.2.0-rc.1/0.2.0-rc.2）全部通过受保护内写放行、越界写拒（非临时路径）、敏感路径写拒三场景，行为一致。驱动脚本 `scripts/verify-host-matrix-write.py`，报告 `.smoke-out/verify-host-matrix-write-023.md`。注意：`/tmp`/`/var/tmp`/`/var/folders` 是设计内一次性临时区放行（classifier.ts），越界写测试须用非临时路径。
+**写门控端到端补测（2026-10-02）**：3 个可端到端 host（0.1.7-rc.2/0.2.0-rc.1/0.2.0-rc.2）全部通过受保护内写放行、越界写拒（非临时路径）、敏感路径写拒三场景，行为一致。驱动为一次性临时脚本（记录于 gitignored 报告 `.smoke-out/verify-host-matrix-write-023.md`，不随仓库存档）。注意：`/tmp`/`/var/tmp`/`/var/folders` 是设计内一次性临时区放行（classifier.ts），越界写测试须用非临时路径。
 
 **0.2.8 特性实机验证（git-ignored 删除兜底，2026-10-20）**：
 在真实 APFS + Time Machine 配置上验证新增的「被 `.gitignore` 忽略、git 无法恢复的删除目标」处理：
@@ -100,14 +106,14 @@
 
 | 历史事件 | 固化位置 |
 |---|---|
-| H1：`subagent` 白名单短路绕过 mixed 拒绝（生产 1682 条 explicit-allow 实证） | `test-gate-prod.mts` F 组（t7 迁移）+ README ⚠️ 警示 |
-| 敏感读经重定向渗漏（`cat ~/.ssh/id_rsa > 保护区`） | `test-classifier.mts` C 组 + `test-gate-prod.mts` C 组（forceDeny 优先于路径豁免） |
-| 灾难模式 `rm -rf /` | `test-classifier.mts` H 组（decide 强拒） |
+| H1：`subagent` 白名单短路绕过 mixed 拒绝（生产 1682 条 explicit-allow 实证） | `test-gate-prod.mts` F 组（工具层分类/越界/敏感路径；t7 迁移）+ README ⚠️ 警示。注：短路本身是**显式放权设计**，靠 README 警示约束而非用例禁止，全仓无"白名单内必须拒绝"回归用例 |
+| 敏感读经重定向渗漏（`cat ~/.ssh/id_rsa > 保护区`） | `test-classifier.mts` Sensitive-read 节 + `test-gate-prod.mts` C 组（forceDeny 优先于路径豁免） |
+| 灾难模式 `rm -rf /` | `test-classifier.mts` Catastrophic 节（decide 强拒） |
 | 0.1.1 声明 `<0.2.0-0` 挡掉全部 0.2.x 用户 | `verify-peer-matrix.mjs`（0.2.0-rc.2 必须 PASS） |
 | 0.2.0 三段式漏配 0.1.0/0.1.1 stable | `verify-peer-matrix.mjs`（0.1.0/0.1.1 必须 PASS，四段式） |
 | **`$HOME` 变量展开绕过敏感读**（`cat $HOME/.ssh/id_rsa` 曾放行；0.2.3 修复：expandHome/toAbsolute 归一化 `$HOME`/`${HOME}`） | `test-adversarial.mts` GAP 组（先红后绿） |
 | **`cd` 上下文绕过**（`cd ~/.ssh && cat id_rsa` 曾放行；0.2.3 修复：cd 后敏感目录内 read 类 segment 即 deny） | `test-adversarial.mts` GAP 组（先红后绿） |
-| **git-ignored 删除目标 git 无法恢复**（0.2.8：探针 `state=no`，删除后 git 无法还原；修复：绕过冷却强制恰好 1 张新鲜 APFS 快照兜底，始终 allow 绝不 deny） | `test-ignored-recovery-gate.mts`（28）+ `test-ignored-recovery-render.mts`（5）+ `test-git-recovery.mts`（20） |
+| **git-ignored 删除目标 git 无法恢复**（0.2.8：探针 `state=no`，删除后 git 无法还原；修复：绕过冷却强制恰好 1 张新鲜 APFS 快照兜底，始终 allow 绝不 deny） | `test-ignored-recovery-gate.mts`（14）+ `test-ignored-recovery-render.mts`（2）+ `test-git-recovery.mts`（17） |
 | **审查/研究/外部资料被 checkpoint 误收录**（0.2.8：`research-proposal/`、`ha-mcp-README.md`、第三方 PDF 混入未 push 提交） | `.gitignore` 红线（`docs/`、`RELEASE.md`、`research-proposal/`、`ha-mcp-README.md`、`100 问 PDF`）+ L2 历史检查（`origin/main..HEAD`） |
 | 发布物与提交漂移 / 未提交改动混入 | `verify-reproducible-build.mjs` |
 | 本地路径/测试残留进公开仓库 | `verify-pack-audit.mjs` + `.gitignore` 锁定 |

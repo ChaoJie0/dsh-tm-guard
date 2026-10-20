@@ -47,18 +47,17 @@ const unexpectedTop = []
 const FORBIDDEN = [
   /^\/Users\//, /^\/private\//, /^\/tmp\//,      // local absolute paths
   /session-[0-9a-f-]{36}/, /(^|\/)\.smoke-out\//, // session ids, scratch
-  /(^|\/)\.tm-/, /(^|\/)src\//, /(^|\/)test-.*\.mts$/, // test residue
+  /(^|\/)\.tm-/, /(^|\/)src\//, /(^|\/)test-.*\.m[jt]s$/, // test residue
   /(^|\/)\.git(\/|$)/, /(^|\/)node_modules(\/|$)/,
 ]
 const FORBIDDEN_HINT = [
   '/Users/', '/private/', '/tmp/',
   'session-', '.smoke-out/',
-  '.tm-', 'src/', 'test-*.mts',
+  '.tm-', 'src/', 'test-*.mts / test-*.mjs',
   '.git/', 'node_modules/',
 ]
 
 const expectedTop = ['lib', 'cordis.patch.yml', 'README.md', 'CHANGELOG.md', 'LICENSE', 'package.json']
-const expectedLibCount = 14 // 13 js + index.d.ts (must match lib/ output)
 
 for (const f of files) {
   const path = f.path
