@@ -116,7 +116,7 @@
 
 ## 环境要求
 
-- L0/L1/L2/L3：Node ≥ 20 + npm + git（CI 用 macOS runner 可全跑）
+- L0/L1/L2/L3：Node ≥ 20 + npm + git；其中 L1（verify:build）在本机构建需 Node ≥ 22.6 或 ≥ 20.19 LTS（stripTypeScriptTypes）。CI 用 macOS runner 可全跑。
 - L4/L5/L6：macOS + APFS + Time Machine 配置 + 本地 dsh 安装（不能进 CI）
 
 ## CI
