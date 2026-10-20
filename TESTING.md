@@ -4,7 +4,7 @@
 
 ## 分层架构
 
-> 注：本文件 L0–L6 是**测试机制分层**；`RELEASE.md`（本地私有）里的 L0–L5 是**发布卫生/审查清单**，两套编号互不相干（如 TESTING L1=构建可复现，RELEASE L1=Git 树卫生）。引用时一律带文档前缀（"TESTING L2" / "RELEASE L2"），`DEV.md` 已采用此约定。
+> 注：L0–L6 以本文件为**唯一事实源**（测试机制分层）。`RELEASE.md`（本地私有）沿用同一套编号，不另立体系：L0–L3 自动门禁、L4 实机 host 冒烟、L5 独立复核（L5-a MainAgent / L5-b dsh）、L6 内容隐私审查（L6-a Git 树 / L6-b 历史 / L6-c 发布物）。`DEV.md` 为日常开发，只引用本编号。
 
 | 层 | 名称 | 命令 | 耗时 | 时机 | 自动化 |
 |---|---|---|---|---|---|
@@ -12,7 +12,7 @@
 | L1 | 构建可复现 | `npm run verify:build` | <1s | 发布前 / 工作树变更后 | CI + 本地 |
 | L2 | 包内容审计 | `npm run verify:pack` | <1s | 发布前 / 推送前 | CI + 本地 |
 | L3 | peer 兼容矩阵 | `npm run verify:peer` | <1s | 发布前 / 改动声明后 | CI + 本地 |
-| L4 | 双线隔离冒烟 | 见发布规范步骤 5 | ~10min | **发布前（手动）** | 本地（需 macOS + TM + dsh host） |
+| L4 | 全版本 host 矩阵冒烟 | 见 RELEASE §2 / L4（RELEASE.md 实机 host 段） | ~10min | **发布前（手动）** | 本地（需 macOS + TM + dsh host） |
 | L5 | 独立复核 | 委派 dsh 会话 | ~3min | **发布前（手动）** | 本地（需 dsh 会话） |
 | L6 | 内容隐私审查 | `npm run verify:pack` + 清单 | ~1min | **推送前（手动）** | 本地 |
 
