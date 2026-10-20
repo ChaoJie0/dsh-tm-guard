@@ -79,6 +79,8 @@ docs/
 .reval-*/
 scratch-*.mts
 research-proposal/
+ha-mcp-README.md
+关于 DeepSeek Harness 的 100 个问题.pdf
 /RELEASE.md
 _tmp_*
 
