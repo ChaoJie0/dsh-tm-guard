@@ -32,6 +32,7 @@
   "scripts": {
     "build": "node scripts/build/build.mjs",
     "prepare": "npm run build",
+    "prepublishOnly": "npm run release:check",
     "test": "node --test test-*.mts test-*.mjs",
     "test:coverage": "node --test --experimental-test-coverage test-*.mts test-*.mjs",
     "verify:peer": "node scripts/verify-peer-matrix.mjs",

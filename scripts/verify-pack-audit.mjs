@@ -133,6 +133,18 @@ if (existsSync(TGZ)) {
   console.log('  (no staged tarball — freshness check skipped)')
 }
 
+// G3: install-time lifecycle hooks must not exist — this plugin sits between
+// the agent and the filesystem; a preinstall/install/postinstall script would
+// execute arbitrary code on the user's machine at install time.
+const INSTALL_HOOKS = ['preinstall', 'install', 'postinstall']
+const installHooks = INSTALL_HOOKS.filter((h) => pkg.scripts && pkg.scripts[h])
+if (installHooks.length) {
+  violations.push(`install-time lifecycle hooks present: ${installHooks.join(', ')}`)
+  console.log(`  HOOKS  ${installHooks.join(', ')}`)
+} else {
+  console.log('  no install-time lifecycle hooks (preinstall/install/postinstall) ✅')
+}
+
 console.log('')
 if (violations.length) {
   console.error('✗ Content audit violations:')
