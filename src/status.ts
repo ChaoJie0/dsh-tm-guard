@@ -345,13 +345,26 @@ export function renderStatusReport(input: StatusInput): string {
   )
 
   /* --- 4. Recent decisions ---------------------------------------- */
+  // ignored-file recovery: total git-unrecoverable (ignored) targets across
+  // the recent window. Optional field — old records contribute 0.
+  const recentNoCount = input.recentDecisions.reduce(
+    (n, r) => n + (r.gitRecovery?.filter((g) => g.state === 'no').length ?? 0),
+    0,
+  )
   out.push('', `【Recent】 last ${RECENT_STATUS_ITEMS} audit decision(s), newest first:`)
+  if (recentNoCount > 0) {
+    out.push(
+      `  git-unrecoverable (ignored) targets in recent window: ${recentNoCount} (marked git=no in tm_audit)`,
+    )
+  }
   if (input.recentDecisions.length === 0) {
     out.push('  (none recorded yet)')
   } else {
     for (const r of input.recentDecisions) {
       const verdict = r.decision === 'deny' ? 'DENY' : 'ALLOW'
-      out.push(`  ${r.ts}  ${verdict.padEnd(5)} [${r.category}] ${r.tool}`)
+      const noCount = r.gitRecovery?.filter((g) => g.state === 'no').length ?? 0
+      const gitNo = noCount > 0 ? `  git=no(${noCount})` : ''
+      out.push(`  ${r.ts}  ${verdict.padEnd(5)} [${r.category}] ${r.tool}${gitNo}`)
     }
   }
 

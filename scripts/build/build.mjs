@@ -114,6 +114,7 @@ export interface TmGuardConfig {
   blockingBackupBeforeWrite: boolean
   requireGitBaseline: boolean
   autoApprove: boolean
+  warnOnIgnoredDelete: boolean
 }
 
 export declare const name: 'tm-guard'

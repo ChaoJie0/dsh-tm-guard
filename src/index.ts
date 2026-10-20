@@ -54,7 +54,14 @@ import {
   resolveWatermark,
   watermarkOf,
 } from './state.ts'
-import { ensureGitBaseline, commitCheckpoint } from './git.ts'
+import {
+  ensureGitBaseline,
+  commitCheckpoint,
+  probeGitRecovery,
+  backfillGitRecovery,
+  type GitRecoveryTarget,
+  type GitRecoveryProbe,
+} from './git.ts'
 import { buildTurnReport } from './report.ts'
 import { renderStatusReport, RECENT_STATUS_ITEMS } from './status.ts'
 import {
@@ -199,6 +206,16 @@ export interface TmGuardConfig {
    */
   auditRetainFiles: number
   /**
+   * Off-by-default warning for deletion/rewrite targets that git CANNOT
+   * restore because they match a .gitignore rule (`state: 'no'`). When
+   * true, one console.warn names each such target before the write. This is
+   * advisory ONLY: it never denies the write (hard-denying would falsely
+   * block regenerable artifacts like node_modules/build output). The default
+   * behavior with an ignored target is unchanged except that ONE fresh APFS
+   * snapshot is forced before the write, bypassing the cooldown window.
+   */
+  warnOnIgnoredDelete: boolean
+  /**
    * Hard ceiling across the current log plus every rotated generation
    * (default 100 MiB = 2× headroom over `auditRetainFiles × auditMaxBytes`).
    * This is an abnormal-case backstop, not the normal window control: with
@@ -250,6 +267,10 @@ export const DEFAULT_CONFIG: TmGuardConfig = {
   auditMaxBytes: AUDIT_DEFAULTS.maxBytes,
   auditRetainFiles: AUDIT_DEFAULTS.retainFiles,
   auditTotalMaxBytes: AUDIT_DEFAULTS.totalMaxBytes,
+  // Off by default: naming git-unrecoverable (ignored) write targets is
+  // advisory noise for repos full of regenerable artifacts. When true it
+  // warns; it NEVER denies. See TmGuardConfig.warnOnIgnoredDelete.
+  warnOnIgnoredDelete: false,
 }
 
 /* ------------------------------------------------------------------ */
@@ -259,9 +280,23 @@ export const DEFAULT_CONFIG: TmGuardConfig = {
 let lastSnapshotTime = 0
 let consecutiveSnapshotFailures = 0
 
-async function maybeSnapshot(cooldownSeconds: number): Promise<string | null> {
+/**
+ * Test-only seam: reset the module-level snapshot clock / failure counter so
+ * cooldown-dependent behavior is deterministic across tests that share one
+ * loaded module. Mirrors the __-prefixed seam convention used elsewhere. No
+ * production caller uses it.
+ */
+export function __resetSnapshotClockForTests(): void {
+  lastSnapshotTime = 0
+  consecutiveSnapshotFailures = 0
+}
+
+async function maybeSnapshot(cooldownSeconds: number, force = false): Promise<string | null> {
   const now = Date.now()
-  if (now - lastSnapshotTime < cooldownSeconds * 1000) {
+  // force=true bypasses the cooldown short-circuit (ignored-target recovery)
+  // but reuses the exact same success/failure tail below: one snapshot, with
+  // lastSnapshotTime / failure counter / health cache handled identically.
+  if (!force && now - lastSnapshotTime < cooldownSeconds * 1000) {
     return null
   }
   try {
@@ -365,6 +400,7 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
     auditMaxBytes: normalizeNumber(rawConfig?.auditMaxBytes, DEFAULT_CONFIG.auditMaxBytes),
     auditRetainFiles: normalizeNumber(rawConfig?.auditRetainFiles, DEFAULT_CONFIG.auditRetainFiles),
     auditTotalMaxBytes: normalizeNumber(rawConfig?.auditTotalMaxBytes, DEFAULT_CONFIG.auditTotalMaxBytes),
+    warnOnIgnoredDelete: normalizeBool(rawConfig?.warnOnIgnoredDelete, DEFAULT_CONFIG.warnOnIgnoredDelete),
   }
   // Empty writable scope is a silent footgun: `protectedPaths: []` means the
   // agent can never write anywhere (every write is denied), which most users
@@ -806,6 +842,12 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       const isFileWrite = decision.allow && decision.category === 'file_write'
       const isReadOp = decision.category === 'read'
 
+      // Per-target git recoverability for allowed file writes (ignored-file
+      // recovery proposal). Probed while the targets still exist, resolved
+      // after the checkpoint, attached to the allow audit record. Probe
+      // failures never deny — affected targets are recorded 'unknown'.
+      let gitRecoveryProbes: GitRecoveryProbe[] = []
+
       /*
        * Tool-layer rollback net for file writes. Local git is the PRIMARY
        * mechanism (instant, offline, root-free); ensure a committed baseline
@@ -825,6 +867,21 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         if (config.requireGitBaseline) {
           const results = await Promise.all(dirList.map((d) => ensureGitBaseline(d)))
           gitNetReady = results.every((r) => r.ok)
+
+          // PRE-CHECKPOINT recovery probe (hard timing invariant): classify
+          // each target while it still exists, BEFORE `git add -A`. Tracked
+          // targets short-circuit (yes); ignored targets are git-unrecoverable
+          // (no) and force a fresh snapshot below; untracked targets stay
+          // provisional until the post-checkpoint backfill proves whether the
+          // checkpoint committed them. Read-only, never denies the write.
+          try {
+            gitRecoveryProbes = await probeGitRecovery(classification.targetPaths)
+          } catch {
+            gitRecoveryProbes = classification.targetPaths.map((p) => ({
+              path: p.startsWith('/') ? p : resolve(process.cwd(), p),
+              state: 'unknown' as const,
+            }))
+          }
 
           // Precise rollback: commit any pending work as a checkpoint BEFORE
           // the new write, so `git reset --hard` returns to this exact point.
@@ -914,6 +971,41 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         warnPlatformOnce()
       }
 
+      // An ignored (git-unrecoverable) target forces a fresh pre-write
+      // snapshot even inside the cooldown window.
+      let forceSnapshot = false
+
+      // Ignored-file recovery: resolve the provisional untracked targets NOW
+      // that commitCheckpoint has settled (S2 backfill). Re-probe each with
+      // ls-files --error-unmatch: hit => the checkpoint committed it (yes);
+      // miss => the swallowed add/commit left it unrecoverable (unknown,
+      // never a false yes). Tracked/ignored/unknown states pass through.
+      let gitRecovery: GitRecoveryTarget[] | undefined
+      if (isFileWrite && !isTmInternalTool && gitRecoveryProbes.length > 0) {
+        try {
+          gitRecovery = await backfillGitRecovery(gitRecoveryProbes)
+        } catch {
+          gitRecovery = gitRecoveryProbes.map((p) => ({
+            path: p.path,
+            state: p.state === 'yes' || p.state === 'no' ? p.state : 'unknown' as const,
+          }))
+        }
+        // Any ignored target forces ONE fresh APFS snapshot outside the
+        // cooldown window. Advisory warning only — never a deny.
+        const ignoredTargets = gitRecovery.filter((t) => t.state === 'no')
+        if (ignoredTargets.length > 0) {
+          forceSnapshot = true
+          if (config.warnOnIgnoredDelete) {
+            for (const t of ignoredTargets) {
+              console.warn(
+                `[tm-guard] ${t.path} is git-ignored: git cannot restore it after a delete/rewrite ` +
+                '(a fresh Time Machine snapshot is being forced; this is a warning, the write is NOT blocked).',
+              )
+            }
+          }
+        }
+      }
+
       // Pre-mutation checkpoint, enforced at the TOOL layer (the agent cannot
       // bypass this hook). In strict mode it covers file writes AND state-
       // changing local VCS ops (git commit/reset/checkout/clean can discard
@@ -968,9 +1060,17 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         } else if (config.snapshotCooldownSeconds >= 0) {
           // Default mode: instant local APFS snapshot (sub-second). Reading it
           // back needs root/the TM UI; completed hourly backups are root-free.
-          snapshotId = (await maybeSnapshot(config.snapshotCooldownSeconds)) ?? undefined
+          // force replaces the cooldown skip for ignored targets; it is the
+          // SAME single call — never a second snapshot.
+          snapshotId = (await maybeSnapshot(config.snapshotCooldownSeconds, forceSnapshot)) ?? undefined
           if (snapshotId && config.verbose) {
-            console.log(`[tm-guard] Pre-op snapshot created: ${snapshotId}`)
+            console.log(
+              forceSnapshot
+                ? `[tm-guard] Pre-op snapshot created (forced: git-ignored target): ${snapshotId}`
+                : `[tm-guard] Pre-op snapshot created: ${snapshotId}`,
+            )
+          } else if (forceSnapshot && config.verbose) {
+            console.log('[tm-guard] Forced snapshot for git-ignored target did not return an id (see earlier warning)')
           }
         }
       }
@@ -983,6 +1083,7 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         reason: decision.reason,
         targetPaths: classification.targetPaths,
         snapshotId,
+        gitRecovery,
         args,
       })
 
@@ -1333,7 +1434,12 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
             ? ` [${r.targetPaths.join(', ')}]`
             : ''
           const snap = r.snapshotId ? ` snap=${r.snapshotId}` : ''
-          return `  ${time} ${decision} [${r.category}] ${r.tool}${paths}${snap}`
+          // ignored-file recovery: surface a git-unrecoverable target
+          // without forcing the reader to open JSONL. Marker only on lines
+          // that actually contain a 'no' target; absent field → no marker.
+          const noCount = r.gitRecovery?.filter((g) => g.state === 'no').length ?? 0
+          const gitNo = noCount > 0 ? ` git=no(${noCount})` : ''
+          return `  ${time} ${decision} [${r.category}] ${r.tool}${paths}${snap}${gitNo}`
         })
 
         const header = `=== TM-Guard Audit Log (${records.length} records, log: ${audit.path}) ===`

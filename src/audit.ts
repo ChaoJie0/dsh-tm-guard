@@ -123,6 +123,13 @@ export interface AuditRecord {
   args?: Record<string, unknown>
   /** Session identifier if available */
   sessionId?: string
+  /**
+   * Per-target git recoverability for allowed file writes (ignored-file
+   * recovery proposal). Absent on records that are not allowed file writes,
+   * and absent in old JSONL written before this field existed — readers must
+   * tolerate that. 'no' means git cannot restore the target (ignored).
+   */
+  gitRecovery?: Array<{ path: string; state: 'yes' | 'no' | 'unknown' }>
 }
 
 export class AuditLog {
