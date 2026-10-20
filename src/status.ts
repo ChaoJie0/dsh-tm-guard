@@ -363,7 +363,7 @@ export function renderStatusReport(input: StatusInput): string {
     for (const r of input.recentDecisions) {
       const verdict = r.decision === 'deny' ? 'DENY' : 'ALLOW'
       const noCount = r.gitRecovery?.filter((g) => g.state === 'no').length ?? 0
-      const gitNo = noCount > 0 ? `  git=no(${noCount})` : ''
+      const gitNo = noCount > 0 ? ` git=no(${noCount})` : ''
       out.push(`  ${r.ts}  ${verdict.padEnd(5)} [${r.category}] ${r.tool}${gitNo}`)
     }
   }
