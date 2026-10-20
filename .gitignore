@@ -78,6 +78,7 @@ scripts/verify-host-matrix-rpc.py
 docs/
 .reval-*/
 scratch-*.mts
+research-proposal/
 /RELEASE.md
 _tmp_*
 
