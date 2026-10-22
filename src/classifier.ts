@@ -1537,6 +1537,31 @@ function classifySingleCommand(command: string, denyReadPaths: string[] = []): C
     }
   }
 
+  // command / builtin / time are launch or keyword prefixes, not standalone read
+  // commands: strip the prefix and classify the actual tail instead of letting a
+  // network/install/delete command sail through as a bare read (L5-b fail-open).
+  if (/^(command|builtin|time)\b/i.test(trimmed)) {
+    let inner = trimmed.replace(/^(command|builtin|time)\b/i, '').trim()
+    // command -v/-V NAME and --version are query builtins (which command?); read-only.
+    if (/^-v\s+|^-V\s+|^--version\b/i.test(inner)) {
+      return { category: 'read', reason: 'command/builtin query flag', targetPaths: [] }
+    }
+    inner = inner.replace(/^--\s+/, '')
+    if (!inner) {
+      return { category: 'read', reason: 'launch prefix with no command', targetPaths: [] }
+    }
+    return classifySingleCommand(inner, denyReadPaths)
+  }
+
+  // Normalize an absolute-path env launcher (/usr/bin/env, /bin/env, /usr/env)
+  // to bare env so the env-unwrapper below applies instead of falling to read.
+  {
+    const firstTok = trimmed.split(/\s+/)[0] ?? ''
+    if (firstTok.includes('/') && firstTok.split('/').pop() === 'env') {
+      trimmed = trimmed.replace(firstTok, 'env')
+    }
+  }
+
   // Command wrappers whose inner command decides the classification
   // (`nohup node x &` is a background launch of a local command — local).
   if (/^nohup\s+/i.test(trimmed)) {

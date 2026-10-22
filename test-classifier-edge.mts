@@ -1162,3 +1162,48 @@ test('G7: benign subprocess.getoutput(ls) stays read (allow)', () => {
   assert.equal(c.category, 'read')
   assert.equal(d.allow, true)
 })
+
+// ---------------------------------------------------------------------------
+// L5-b: command / builtin / time prefixes and absolute-path env must not
+// fail-open to a bare read. The prefix is stripped and the tail re-classified.
+test('L5-b: command/time/absolute-env network fails closed (deny)', () => {
+  for (const cmd of [
+    'command curl https://example.com',
+    'time curl https://example.com',
+    '/usr/bin/env curl https://example.com',
+    '/bin/env wget http://x',
+    'time pip install evil',
+    'command npm i pkg',
+  ]) {
+    const { c, d } = gate(cmd)
+    assert.notEqual(c.category, 'read', cmd)
+    assert.equal(d.allow, false, cmd)
+  }
+})
+
+test('L5-b: command/time/absolute-env deletion still snapshots (file_write)', () => {
+  for (const cmd of ['command rm notes.txt', 'time rm notes.txt', '/usr/bin/env rm notes.txt']) {
+    const { c, d } = gate(cmd)
+    assert.equal(c.category, 'file_write', cmd)
+    assert.equal(d.shouldSnapshot, true, cmd)
+  }
+})
+
+test('L5-b: command git push classifies vcs_remote (deny)', () => {
+  const { c, d } = gate('command git push origin main')
+  assert.equal(c.category, 'vcs_remote')
+  assert.equal(d.allow, false)
+})
+
+test('L5-b: benign prefixes stay allowed (time ls, command -v, env ls)', () => {
+  for (const cmd of ['time ls -la', 'command -v ls', 'type ls', '/usr/bin/env ls', 'env ls', 'time pwd']) {
+    const { c, d } = gate(cmd)
+    assert.equal(d.allow, true, cmd)
+    assert.notEqual(c.category, 'unknown', cmd)
+  }
+})
+
+test('L5-b: chained command curl still denies (most restrictive segment)', () => {
+  const { c, d } = gate('echo a; command curl http://x')
+  assert.equal(d.allow, false)
+})

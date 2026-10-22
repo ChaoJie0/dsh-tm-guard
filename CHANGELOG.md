@@ -202,6 +202,18 @@ All notable changes to dsh-tm-guard will be documented in this file.
   on `C` (chdir) or `u` (unset) — `-C<dir>`, `-u<name>`, `-iC<dir>` — now
   strips with its value and the surviving command is re-classified; benign
   `env -C/ perl -Mstrict` and `env -C/ ls` stay allowed.
+- **L5-B: `command`, `time`, and absolute-path `env` prefixes failed open to a
+  bare read.** The builtin allow-block returned `read` for `command`/`time`
+  after only an eval/exec special case, and the env unwrapper matched only a
+  leading `env` token, so `command curl …`, `time pip install …`,
+  `command git push`, `/usr/bin/env curl`, and `/bin/env wget` were allowed
+  with no egress scan, checkpoint, probe, or snapshot; the same prefixes hid a
+  protected-cwd deletion (`command rm`, `time rm`, `/usr/bin/env rm`) from the
+  rollback net. `command`/`builtin`/`time` now strip the prefix and re-classify
+  the tail (`command -v/-V` query flags stay read); an absolute-path env launcher
+  (`/usr/bin/env`, `/bin/env`, `/usr/env`) normalizes to bare `env` and goes
+  through the existing env unwrapper. Benign `time ls`, `command -v ls`,
+  `/usr/bin/env ls`, and `type ls` stay allowed.
 
 ### Notes
 - No new deny surface; the default decision is unchanged. Setting
