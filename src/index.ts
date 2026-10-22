@@ -856,6 +856,10 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
        * as long as ONE of the two nets is in place; if neither is, it is denied.
        */
       let gitNetReady = false
+      // B1: true when any pre-write checkpoint failed to prove the pending
+      // bytes into the object store; forces a fresh TM snapshot instead of a
+      // false git `yes` inside the cooldown window.
+      let checkpointFailed = false
       if (isFileWrite && !isTmInternalTool) {
         const dirs = new Set<string>()
         for (const p of classification.targetPaths) {
@@ -887,7 +891,19 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
           // the new write, so `git reset --hard` returns to this exact point.
           for (const r of results) {
             if (r.ok && r.root) {
-              await commitCheckpoint(r.root, toolName)
+              const cp = await commitCheckpoint(r.root, toolName)
+              if (!cp.ok) {
+                // B1: the pending bytes were NOT proven into the object store
+                // (locked index, read-only .git, disk full, rejecting hook).
+                // Do not keep a false `yes`; force a fresh TM snapshot below.
+                checkpointFailed = true
+                if (config.verbose) {
+                  console.warn(
+                    `[tm-guard] git checkpoint failed in ${r.root} (${toolName}): ` +
+                      `${cp.reason ?? 'unknown'} — forcing a fresh Time Machine snapshot; the write is NOT blocked.`,
+                  )
+                }
+              }
             }
           }
 
@@ -987,24 +1003,54 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         } catch {
           gitRecovery = gitRecoveryProbes.map((p) => ({
             path: p.path,
-            state: p.state === 'yes' || p.state === 'no' ? p.state : 'unknown' as const,
+            state:
+              p.state === 'yes' || p.state === 'no' || p.state === 'unrecoverable'
+                ? p.state
+                : ('unknown' as const),
+            ...(p.unrecoverableReason
+              ? { unrecoverableReason: p.unrecoverableReason }
+              : {}),
           }))
         }
-        // Any ignored target forces ONE fresh APFS snapshot outside the
-        // cooldown window. Advisory warning only — never a deny.
-        const ignoredTargets = gitRecovery.filter((t) => t.state === 'no')
-        if (ignoredTargets.length > 0) {
+        // Ignored (git-unrecoverable) and special-layout targets (skip-worktree/
+        // sparse-excluded, gitlink, symlink-to-outside) cannot be restored by a
+        // standard offline git command; force ONE fresh APFS snapshot outside
+        // the cooldown window. Advisory warning — never a deny.
+        const unRecoverable = gitRecovery.filter(
+          (t) => t.state === 'no' || t.state === 'unrecoverable',
+        )
+        if (unRecoverable.length > 0) {
           forceSnapshot = true
           if (config.warnOnIgnoredDelete) {
-            for (const t of ignoredTargets) {
-              console.warn(
-                `[tm-guard] ${t.path} is git-ignored: git cannot restore it after a delete/rewrite ` +
-                '(a fresh Time Machine snapshot is being forced; this is a warning, the write is NOT blocked).',
-              )
+            for (const t of unRecoverable) {
+              if (t.state === 'unrecoverable') {
+                console.warn(
+                  `[tm-guard] ${t.path} cannot be restored by a standard git ` +
+                    `command (${t.unrecoverableReason ?? 'special layout'}): ` +
+                    'a fresh Time Machine snapshot is being forced; the write is NOT blocked.',
+                )
+              } else {
+                console.warn(
+                  `[tm-guard] ${t.path} is git-ignored: git cannot restore it after a delete/rewrite ` +
+                    '(a fresh Time Machine snapshot is being forced; this is a warning, the write is NOT blocked).',
+                )
+              }
             }
           }
         }
+        // B1: a checkpoint failed to prove the pending bytes into the object
+        // store. Do not keep a false `yes`; downgrade yes -> unknown for an
+        // honest audit and force ONE fresh snapshot outside cooldown.
+        if (checkpointFailed && gitRecovery) {
+          forceSnapshot = true
+          for (const t of gitRecovery) {
+            if (t.state === 'yes') t.state = 'unknown'
+          }
+        }
       }
+      // B1: checkpoint failure forces a fresh snapshot even when there were no
+      // per-target probes to downgrade.
+      if (checkpointFailed) forceSnapshot = true
 
       // Pre-mutation checkpoint, enforced at the TOOL layer (the agent cannot
       // bypass this hook). In strict mode it covers file writes AND state-
@@ -1434,12 +1480,14 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
             ? ` [${r.targetPaths.join(', ')}]`
             : ''
           const snap = r.snapshotId ? ` snap=${r.snapshotId}` : ''
-          // ignored-file recovery: surface a git-unrecoverable target
-          // without forcing the reader to open JSONL. Marker only on lines
-          // that actually contain a 'no' target; absent field → no marker.
+          // git recovery: surface a target git cannot restore (ignored 'no',
+          // or a special-layout 'unrecoverable' entry) without opening JSONL.
           const noCount = r.gitRecovery?.filter((g) => g.state === 'no').length ?? 0
+          const unsafeCount =
+            r.gitRecovery?.filter((g) => g.state === 'unrecoverable').length ?? 0
           const gitNo = noCount > 0 ? ` git=no(${noCount})` : ''
-          return `  ${time} ${decision} [${r.category}] ${r.tool}${paths}${snap}${gitNo}`
+          const gitUnsafe = unsafeCount > 0 ? ` git=unsafe(${unsafeCount})` : ''
+          return `  ${time} ${decision} [${r.category}] ${r.tool}${paths}${snap}${gitNo}${gitUnsafe}`
         })
 
         const header = `=== TM-Guard Audit Log (${records.length} records, log: ${audit.path}) ===`

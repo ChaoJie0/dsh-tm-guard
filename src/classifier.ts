@@ -1550,12 +1550,62 @@ function classifySingleCommand(command: string, denyReadPaths: string[] = []): C
   // `env CMD` runs CMD with an adjusted environment — classify the INNER
   // command. Previously `env` sat in READ_COMMANDS, so `env curl https://…`
   // (and `env uv --version`) sailed through as a read (R5 bypass #80/#81).
+  // Zero-argument short flags (`-i`/`--ignore-environment`, `-0`/`--null`,
+  // clusters like `-iv`) must NOT swallow the following interpreter as a phantom
+  // option argument; only options that genuinely take a value consume the next
+  // token (`-u NAME`, `-C DIR`, and their `--unset`/`--chdir` long forms).
   if (/^env\s+/i.test(trimmed)) {
     let inner = trimmed.replace(/^env\s+/i, '').trim()
-    // Strip env flags and VAR=value assignments: env -i PATH=x CMD → CMD
-    while (/^-\w+(\s+\S+)?\s+/.test(inner)) inner = inner.replace(/^-\w+(\s+\S+)?\s+/, '').trim()
-    while (/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/.test(inner)) inner = inner.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/, '').trim()
-    if (!inner || /^-\w/.test(inner)) {
+    const ENV_ARG_SHORT = new Set(['-u', '-C'])
+    const ENV_ZERO_LONG = new Set(['--ignore-environment', '--null', '--help', '--version'])
+    let guard = 0
+    while (guard++ < 60) {
+      const tok = inner.split(/\s+/)[0] ?? ''
+      if (!tok) break
+      // VAR=value assignment prefix
+      if (/^[A-Za-z_][A-Za-z0-9_]*=\S*$/.test(tok)) {
+        inner = inner.slice(tok.length).trim()
+        continue
+      }
+      // Long option: --flag, --flag=value; zero-arg/self-contained, else --opt NAME
+      if (tok.startsWith('--')) {
+        const eq = tok.split('=')[0]!
+        if (ENV_ZERO_LONG.has(eq) || tok.includes('=')) {
+          inner = inner.slice(tok.length).trim()
+          continue
+        }
+        if (/^--(unset|chdir|split-string|default-signal|block-signal|encoding|files-from|debug)$/.test(eq)) {
+          inner = inner.slice(tok.length).trim()
+          const arg = inner.split(/\s+/)[0]
+          if (arg) inner = inner.slice(arg.length).trim()
+          continue
+        }
+        break
+      }
+      // Short option cluster (`-i`, `-0`, `-iv`); only -u/-C take a value.
+      // A value-taking letter may carry its value attached (`-C/`, `-C/tmp`,
+      // `-uX`, `-iC/`); the whole attached token strips so the surviving command
+      // is re-classified instead of collapsing to a bare read.
+      if (/^-[A-Za-z0-9]+$/.test(tok)) {
+        if (ENV_ARG_SHORT.has(tok)) {
+          inner = inner.slice(tok.length).trim()
+          const arg = inner.split(/\s+/)[0]
+          if (arg) inner = inner.slice(arg.length).trim()
+          continue
+        }
+        inner = inner.slice(tok.length).trim()
+        continue
+      }
+      if (/^-[A-Za-z0-9]*[Cu][^\s]*$/.test(tok)) {
+        inner = inner.slice(tok.length).trim()
+        continue
+      }
+      break
+    }
+    if (!inner) {
+      return { category: 'read', reason: 'env (no command)', targetPaths: [] }
+    }
+    if (/^--?(help|version|ignore-environment|null)$/i.test(inner)) {
       return { category: 'read', reason: 'env help/flag', targetPaths: [] }
     }
     return classifySingleCommand(inner, denyReadPaths)
@@ -1878,6 +1928,20 @@ function stripUvRunFlags(s: string): string {
     // loop where the first word is the interpreter.
     const sensHit = scanInlineCodeForSensitive(trimmed, denyReadPaths)
     if (sensHit) return sensHit
+    // B2: ruby -e (and any future inline interpreter) that calls
+    // File.unlink/rmtree deletes files; fail closed instead of local_exec.
+    const inlineDestructive = detectInlineDestructiveCode(trimmed, firstWord)
+    if (inlineDestructive) return inlineDestructive
+    // G8: a bare ruby -r network module load flag (not wrapped in find -exec)
+    // reaches LOCAL_EXEC; fail closed instead of riding local execution.
+    const flagEgress = moduleFlagEgress(trimmed, firstWord)
+    if (flagEgress) {
+      return {
+        category: 'network',
+        reason: `Network module load flag: ${flagEgress}`,
+        targetPaths: [],
+      }
+    }
     // R5: interpreters with inline code — classify the wrapped argv so
     // `python3 -c "subprocess.run(['pip3','install',x])"` and
     // `node -e "process.kill(pid)"` cannot ride on local_exec.
@@ -2207,6 +2271,21 @@ function stripUvRunFlags(s: string): string {
         category: 'file_write',
         reason: `${firstWord} with output redirection`,
         targetPaths: extractWritePaths(trimmed),
+      }
+    }
+    // B2: find -delete/-exec rm and perl/ruby inline unlink are destructive
+    // even though the leading word sits in READ_COMMANDS; do not let them
+    // sail through as a bare read with no checkpoint/probe/snapshot.
+    const destructive = detectDestructiveRead(trimmed, firstWord)
+    if (destructive) return destructive
+    // G8: a bare perl -M/-m network module load flag (not wrapped in find -exec)
+    // reaches READ_COMMANDS; fail closed instead of sailing through as read.
+    const flagEgress = moduleFlagEgress(trimmed, firstWord)
+    if (flagEgress) {
+      return {
+        category: 'network',
+        reason: `Network module load flag: ${flagEgress}`,
+        targetPaths: [],
       }
     }
     return {
@@ -2591,6 +2670,471 @@ const FIND_READ_EXEC = new Set([
 ])
 
 /**
+ * Commands a `find -exec`/`-execdir` may run that mutate or delete the matched
+ * files. `find` itself sits in READ_COMMANDS, so without this the destructive
+ * action rode through as a bare read with no checkpoint/probe/snapshot (B2).
+ */
+const FIND_DESTRUCTIVE_EXEC = new Set([
+  'rm', 'rmdir', 'unlink', 'mv', 'trash', 'tee', 'truncate',
+  'cp', 'dd', 'install', 'ln', 'chmod', 'chown', 'chgrp', 'chflags',
+])
+
+/** Inline interpreter code (perl/ruby -e/-E) that deletes files or runs an
+ *  arbitrary shell command we cannot verify (system/qx/backticks/exec). */
+/**
+ * Single filesystem-delete API surface. Both the direct inline detector
+ * (INLINE_DESTRUCTIVE_RE) and the find-exec shell-body heuristic match against
+ * this source; adding a delete API here covers both channels, so a delete call
+ * cannot be caught by the direct detector but missed inside a find-exec shell
+ * (the drift that caused B8 remove_tree and B9 remove_dir).
+ */
+const DELETE_API_SURFACE =
+  /\bunlink\b|\brmtree\b|\bremove_tree\b|\bremove_entry(?:_secure)?\b|\bremove_dir\b|FileUtils\.(?:rm|rm_f|rm_r|rm_rf|rmdir|remove_entry_secure|remove_entry|remove_dir)|File\.delete|File\.rmdir|Dir\.(?:rmdir|delete|unlink)|os\.remove|shutil\.rmtree|\.unlink(?:Sync)?\b|\.rmSync\b|\.rmdirSync\b/
+
+const INLINE_DESTRUCTIVE_RE = new RegExp([
+  DELETE_API_SURFACE.source,
+  /Kernel\.(system|exec)/,
+  /\bsystem\s*\(/,
+  /\bsystem\s+["']\S/,
+  /\bexec\s*\(/,
+  /\bqx\b/,
+  /`[^`]*`/,
+  /open\s*\(\s*['"]\|/,
+].map((r) => (typeof r === 'string' ? r : r.source)).join('|'))
+
+/** Extract the quoted code body after -e/-E, allowing an immediately-adjacent
+ *  quote (`perl -e'...'`) that extractFlagArgument skips. */
+function extractInlineCodeBody(trimmed: string, flags: string[]): string | null {
+  for (const flag of flags) {
+    const re = new RegExp(`${flag}\\s*(?:'([^']*)'|"([^"]*)")`)
+    const m = re.exec(trimmed)
+    if (m) return m[1] ?? m[2]
+  }
+  return null
+}
+
+/** Fallback: first quoted block, used when the code flag is a merged short
+ *  cluster (`ruby -ne`, `perl -pe`) that a standalone-flag match cannot reach. */
+function extractQuotedBody(trimmed: string): string | null {
+  const m = /(?:'([^']*)'|"([^"]*)")/.exec(trimmed)
+  return m ? (m[1] ?? m[2] ?? null) : null
+}
+
+/**
+ * First non-flag positional argument of `find`/`fd` (the starting directory),
+ * parsed before any -exec/-execdir/-ok action clause. Null when unresolvable.
+ */
+function extractFindStart(trimmed: string): string | null {
+  const beforeAction = trimmed.split(/\s+-(?:exec(?:dir)?|ok)\b/i)[0]
+  for (const tok of beforeAction.split(/\s+/)) {
+    if (!tok || tok === 'find' || tok === 'fd' || tok.startsWith('-')) continue
+    const cleaned = tok.replace(/[{};+]/g, '')
+    if (cleaned) return cleaned
+  }
+  return null
+}
+
+/**
+ * B2: perl/ruby inline code (-e/-E) that deletes files or invokes an
+ * unverifiable shell (unlink/rmtree/FileUtils/system/qx/backticks). The
+ * interpreter rides either READ_COMMANDS (perl) or LOCAL_EXEC_COMMANDS (ruby),
+ * so this is checked from both entrances.
+ */
+function detectInlineDestructiveCode(
+  trimmed: string,
+  firstWord: string,
+): ClassifyResult | null {
+  let code: string | null = null
+  if (firstWord === 'perl') {
+    code = extractInlineCodeBody(trimmed, ['-E', '-e'])
+  } else if (firstWord === 'ruby') {
+    // -e, and merged clusters (-ne/-pe) whose code body follows the cluster.
+    // The quoted-block fallback applies only when an inline flag is actually
+    // present; an external `ruby script.rb 'arg'` must not be scanned.
+    const hasInlineFlag = /(^|\s)-(?:e|n|p|[a-z]*[enp])\b/.test(trimmed)
+    code = extractInlineCodeBody(trimmed, ['-e'])
+      ?? (hasInlineFlag ? extractQuotedBody(trimmed) : null)
+  } else {
+    return null
+  }
+  if (code && INLINE_DESTRUCTIVE_RE.test(code)) {
+    return {
+      category: 'unknown',
+      reason: `${firstWord} inline code deletes files or runs an unverifiable shell command`,
+      targetPaths: [],
+      mutates: true,
+    }
+  }
+  return null
+}
+
+/** Destructive verbs carried by a `find -exec/-ok` or `fd -x/--exec` action. */
+function actionVerbDestructive(trimmed: string): string | null {
+  const re = /(?:--exec|-(?:exec(?:dir)?|ok|x))\s+(\S+)/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(trimmed))) {
+    const verb = m[1].split('/').pop()?.toLowerCase() ?? ''
+    if (FIND_DESTRUCTIVE_EXEC.has(verb)) return verb
+  }
+  return null
+}
+
+const SHELL_WRAP = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'tcsh', 'csh'])
+
+/**
+ * B3/B4: a shell interpreter wrapped behind `find -exec sh -c '...'` /
+ * `fd -x bash -c '...'` whose quoted script body itself deletes files. The
+ * interpreter may be an absolute path (`/bin/sh`), follow `env`, or be an
+ * unresolved variable (`$SHELL`) — basename-normalize the token and fail closed
+ * on a variable shell. The deletion target lives inside the script (often
+ * `$0`/`$1`/`{}`) and cannot be resolved statically, so unknown is the verdict.
+ */
+function wrappedShellDeletes(trimmed: string): boolean {
+  const actionRe = /(?:--exec|-(?:exec(?:dir)?|ok|x))/gi
+  let am: RegExpExecArray | null
+  while ((am = actionRe.exec(trimmed))) {
+    const rest = trimmed.slice(am.index + am[0].length)
+    // Only the quoted body that follows the -c flag is the script; a quoted
+    // interpreter token before it (e.g. "$SHELL") must not be read as the body.
+    const cm = rest.match(/(?:-[a-z]*c\s+)(?:'([^']*)'|"([^"]*)")/)
+    if (!cm) continue
+    const body = cm[1] ?? cm[2] ?? ''
+    // B5/B6/B7: only a concrete deletion signal inside the body fails closed.
+    // A bare command substitution (`$(...)`, backticks) or an inner interpreter
+    // flag is read-only on its own (`$(basename)`, `python3 -c print`) and must
+    // not deny. FS delete APIs require a receiver so a list `.remove()` or the
+    // word "remove" in a string is not matched; the API surface is shared with
+    // the direct inline detector to avoid direct/find drift.
+    const fsDeleteApi = DELETE_API_SURFACE
+    const directDelete =
+      /\b(?:rm|rmdir|unlink|mv|rmtree|remove_tree|truncate|dd|trash)\b/.test(body) ||
+      /(?:^|\s)-delete(?:\s|$)/.test(body) ||
+      fsDeleteApi.test(body)
+    const innerInterpDelete =
+      /(?:python\d?|node|perl|ruby)\s+(?:-[ce]\b|--eval\b)/.test(body) &&
+      fsDeleteApi.test(body)
+    if (!directDelete && !innerInterpDelete) continue
+    const lead = rest.slice(0, cm.index).trim()
+    const tokens = lead.split(/\s+/).filter(Boolean)
+    // Locate the interpreter: skip `env` (any absolute path), its options,
+    // env NAME=value assignments, and the -c flag; accept a shell by basename,
+    // fail closed on a variable or command-substituted token that cannot be
+    // resolved.
+    let interp = ''
+    for (const t of tokens) {
+      const clean = t.replace(/^["']|["']$/g, '')
+      const base = clean.split('/').pop()?.toLowerCase() ?? ''
+      if (
+        base === 'env' ||
+        clean.startsWith('-') ||
+        /^[A-Za-z_][A-Za-z0-9_]*=/.test(clean)
+      )
+        continue
+      interp = clean
+      break
+    }
+    const base = interp.split('/').pop()?.toLowerCase() ?? ''
+    const unresolved =
+      base.startsWith('$') || interp.startsWith('`') || interp.startsWith('$(')
+    if (SHELL_WRAP.has(base) || unresolved) return true
+  }
+  return false
+}
+
+/** Network/install verbs a `find -exec/-ok` / `fd -x` may launch directly. */
+const FIND_EGRESS_VERB = new Set([
+  'curl', 'wget', 'aria2c', 'axel', 'ncat', 'nc', 'netcat', 'telnet',
+  'ftp', 'sftp', 'ssh', 'scp', 'rsync', 'git',
+])
+
+/** Package managers whose install/add/update/download/publish subcommands fetch remotely. */
+const FIND_PKG_INSTALL_VERB = new Set([
+  'pip', 'pip3', 'npm', 'npx', 'pnpm', 'yarn', 'gem', 'cargo', 'brew', 'uv',
+])
+
+/**
+ * G1: a `find -exec/-ok` / `fd -x` action that reaches the network or installs
+ * a package, either directly (`-exec curl …`) or inside a wrapped shell
+ * (`-exec sh -c 'curl …' _ {} \;`). The read path never runs the egress scan,
+ * so a smuggled network/install call otherwise rode through as a bare read with
+ * no deny, checkpoint, or snapshot. Fail closed to unknown (not network) so a
+ * `denyNetwork:false` override cannot resurrect it. Returns the signal label
+ * when found, null when the action is offline/local.
+ */
+function wrappedEgressSignal(trimmed: string): string | null {
+  const actionRe = /(?:--exec|-(?:exec(?:dir)?|ok|x))/gi
+  let am: RegExpExecArray | null
+  while ((am = actionRe.exec(trimmed))) {
+    const rest = trimmed.slice(am.index + am[0].length)
+
+    // Direct verb: skip env, its options, NAME=value assignments, flags, then
+    // read the launch token basename.
+    const leadBody = rest.split(/\s+(?:'[^']*'|"[^"]*")/)[0]
+    const leadTokens = leadBody.split(/\s+/).filter(Boolean)
+    let verb = ''
+    for (const t of leadTokens) {
+      const clean = t.replace(/^["']|["']$/g, '')
+      const base = clean.split('/').pop()?.toLowerCase() ?? ''
+      if (
+        base === 'env' ||
+        clean.startsWith('-') ||
+        /^[A-Za-z_][A-Za-z0-9_]*=/.test(clean)
+      ) continue
+      verb = base
+      break
+    }
+    if (FIND_EGRESS_VERB.has(verb)) {
+      if (verb === 'git') {
+        const gm = rest.match(/\bgit\s+(push|pull|clone|fetch|ls-remote|remote)\b/)
+        if (gm) return `git ${gm[1]}`
+      } else {
+        return verb
+      }
+    }
+
+    // Direct package-manager install/fetch with no shell wrapper (fd -x pip install x).
+    if (
+      FIND_PKG_INSTALL_VERB.has(verb) &&
+      /\b(install|add|update|download|publish|uninstall)\b/.test(rest)
+    ) {
+      return 'package install'
+    }
+
+    // Wrapped shell body: only the quoted body after -c is the script.
+    const cm = rest.match(/(?:-[a-z]*c\s+)(?:'([^']*)'|"([^"]*)")/)
+    if (!cm) continue
+    const body = cm[1] ?? cm[2] ?? ''
+    // A bare network verb in a direct interpreter code body (python/node/perl/ruby
+    // -c/-e) may live in a comment or string; those bodies are covered by the
+    // dedicated inline egress / shell-out rules. Only a real shell wrapper uses the
+    // bare-verb scan.
+    const shellNet =
+      !FIND_INLINE_INTERP.has(verb) &&
+      /(?:^|[\s;|&`$()])(curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)\s+/.test(body)
+    const gitRemote = /\bgit\s+(push|pull|clone|fetch|ls-remote|remote)\b/.test(body)
+    const pkgMgr =
+      /\b(pip3?|npm|npx|pnpm|yarn|gem|cargo|brew|uv)\b[^\n;]*\b(install|add|update|download|publish|uninstall)\b/.test(body)
+    const innerPyNet =
+      /python\d?\s+-[ce]\b[^\n]*(urllib|requests\.(get|post|urlopen)|urlopen|http\.client|socket\.create_connection|socket\.socket)/.test(body)
+    const innerNodeNet =
+      /node\s+-(?:e|eval)\b[^\n]*(https?\.request|fetch\(|new\s+WebSocket|net\.connect)/.test(body)
+    if (shellNet) return 'shell network command'
+    if (gitRemote) return 'git remote'
+    if (pkgMgr) return 'package install'
+    if (innerPyNet) return 'inline python network'
+    if (innerNodeNet) return 'inline node network'
+  }
+  return null
+}
+
+/** Interpreters that may appear directly as a find/fd action verb (no sh wrapper). */
+const FIND_INLINE_INTERP = new Set([
+  'perl', 'perl5', 'ruby', 'python', 'python3', 'python3.12', 'node', 'nodejs',
+])
+
+/**
+ * G3b/G3c: inline interpreter network APIs reachable through a find/fd action
+ * verb directly (`-exec python3 -c urlopen`) or inside the wrapped shell body.
+ * The read path never egress-scans these, so fail closed on a match.
+ */
+const FIND_INLINE_EGRESS_RE = new RegExp([
+  /urllib(?:\.request)?/,
+  /requests\.(?:get|post|urlopen|request)\b/,
+  /urlopen\s*\(/,
+  /http\.client/,
+  /socket\.(?:socket|create_connection)\b/,
+  /\bfetch\s*\(/,
+  /https?\.request\s*\(/,
+  /require\(\s*\\?['"](?:https?|net)\\?['"]\s*\)/,
+  /new\s+WebSocket\b/,
+  /net\.connect\s*\(/,
+  /LWP::(?:Simple|UserAgent)\b/,
+  /\buse\s+LWP\b/,
+  /Net::HTTP\b/,
+  /net\/http/,
+  /open-uri/,
+  /IO::Socket(?:::(?:INET|SSL))?\b/,
+].map((r) => r.source).join('|'))
+
+/** Perl `-M`/`-m` and ruby `-r` network modules carried on the load flag rather
+ *  than inside the extracted code body; a match fails closed on egress. */
+const FIND_NET_PERL_FLAG = /(?:^|[\s=])-[mM]\s*=?\s*['"]?[A-Za-z0-9:]+['"]?/g
+const FIND_NET_RUBY_FLAG = /(?:^|[\s=])-r\s*=?\s*['"]?[A-Za-z0-9_\/-]+['"]?/g
+const FIND_NET_PERL_MODULES = new Set([
+  'LWP', 'LWP::Simple', 'LWP::UserAgent', 'IO::Socket::INET',
+  'IO::Socket', 'IO::Socket::SSL',
+])
+const FIND_NET_RUBY_MODULES = new Set([
+  'net/http', 'open-uri', 'net/ping', 'socket', 'open3',
+])
+
+/** G4c/G5: a subprocess / os.exec* / child-process shell-out that launches a
+ *  network command, or python `shell=True`. A bare `subprocess.run(['ls'])` /
+ *  `os.execvp('ls')` / `spawnSync('ls')` with a non-network argv stays allowed. */
+const FIND_SHELLOUT_RE = new RegExp([
+  /subprocess\.(?:run|Popen|call|check_call|check_output)\s*\([^)]*shell\s*=\s*True/,
+  /subprocess\.(?:run|Popen|call|check_call|check_output)\s*\(\s*\[\s*['"](?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)['"]/,
+  /subprocess\.(?:getoutput|getstatusoutput)\s*\(\s*['"][^'"]*(?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)/,
+  /os\.(?:exec[a-z]*|posix_spawn|popen[234]?)\s*\(\s*['"][^'"]*(?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)/,
+  /require\(\s*\\?['"]child_process\\?['"]\s*\)\s*\.\s*(?:spawn|spawnSync|fork|execFile|execFileSync|exec|execSync)\s*\(\s*['"][^'"]*(?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)/,
+].map((r) => r.source).join('|'))
+
+/** Network module carried on a perl `-M`/`-m` or ruby `-r` load flag. */
+function moduleFlagEgress(action: string, verb: string): string | null {
+  if (verb === 'perl' || verb === 'perl5') {
+    let m: RegExpExecArray | null
+    FIND_NET_PERL_FLAG.lastIndex = 0
+    while ((m = FIND_NET_PERL_FLAG.exec(action))) {
+      const mod = m[0].replace(/^[\s=]-[mM]\s*=?\s*/, '').replace(/^['"]|['"]$/g, '')
+      if (FIND_NET_PERL_MODULES.has(mod)) return `perl load flag ${mod}`
+    }
+  }
+  if (verb === 'ruby') {
+    let m: RegExpExecArray | null
+    FIND_NET_RUBY_FLAG.lastIndex = 0
+    while ((m = FIND_NET_RUBY_FLAG.exec(action))) {
+      const mod = m[0].replace(/^[\s=]-r\s*=?\s*/, '').replace(/^['"]|['"]$/g, '')
+      if (FIND_NET_RUBY_MODULES.has(mod)) return `ruby load flag ${mod}`
+    }
+  }
+  return null
+}
+
+/** Extract the quoted code after -c/-e/-E/--eval from an action substring. */
+function findInlineCode(action: string): string | null {
+  const m = action.match(/-(?:c|e|E|eval)\s*(?:'([^']*)'|"([^"]*)")/)
+  return m ? (m[1] ?? m[2] ?? null) : null
+}
+
+/**
+ * G3: a find/fd action that runs an interpreter inline — directly as the action
+ * verb (`-exec perl -e unlink`, `-exec python3 -c urlopen`) or inside the wrapped
+ * shell body (`sh -c 'node -e require("http")…'`), plus one nested sh/bash -c
+ * layer. Deletion uses the shared destructive surface; network uses the inline
+ * egress API set. Returns { kind, signal } or null when offline/local.
+ */
+function findActionInlineThreat(trimmed: string): { kind: 'delete' | 'egress'; signal: string } | null {
+  const actionRe = /(?:--exec|-(?:exec(?:dir)?|ok|x))/gi
+  let am: RegExpExecArray | null
+  while ((am = actionRe.exec(trimmed))) {
+    const action = trimmed.slice(am.index + am[0].length)
+
+    // Direct interpreter verb: skip env, options, NAME=value, read the token.
+    const tokens = action.split(/\s+/).filter(Boolean)
+    let verb = ''
+    for (const t of tokens) {
+      const clean = t.replace(/^["']|["']$/g, '')
+      const base = clean.split('/').pop()?.toLowerCase() ?? ''
+      if (
+        base === 'env' ||
+        clean.startsWith('-') ||
+        /^[A-Za-z_][A-Za-z0-9_]*=/.test(clean)
+      ) continue
+      verb = base
+      break
+    }
+    if (FIND_INLINE_INTERP.has(verb)) {
+      const code = findInlineCode(action)
+      if (code) {
+        if (INLINE_DESTRUCTIVE_RE.test(code)) return { kind: 'delete', signal: `${verb} inline delete` }
+        if (FIND_INLINE_EGRESS_RE.test(code)) return { kind: 'egress', signal: `${verb} inline network` }
+        if (FIND_SHELLOUT_RE.test(code)) return { kind: 'egress', signal: `${verb} subprocess shell-out` }
+      }
+      const flag = moduleFlagEgress(action, verb)
+      if (flag) return { kind: 'egress', signal: flag }
+      // Fallback scan the whole action when nested quotes truncate the extracted
+      // code body; the shell-out rule already requires a literal network program.
+      if (FIND_SHELLOUT_RE.test(action)) return { kind: 'egress', signal: `${verb} subprocess shell-out` }
+    }
+
+    // Wrapped shell body: delete surface + inline egress APIs, one nested layer.
+    const cm = action.match(/(?:-[a-z]*c\s+)(?:'([^']*)'|"([^"]*)")/)
+    if (cm) {
+      const body = cm[1] ?? cm[2] ?? ''
+      if (INLINE_DESTRUCTIVE_RE.test(body)) return { kind: 'delete', signal: 'wrapped inline delete' }
+      if (FIND_INLINE_EGRESS_RE.test(body)) return { kind: 'egress', signal: 'wrapped inline network' }
+      if (FIND_SHELLOUT_RE.test(body)) return { kind: 'egress', signal: 'wrapped subprocess shell-out' }
+      const nm = body.match(/(?:sh|bash|dash|zsh)\s+-[a-z]*c\s+(?:'([^']*)'|"([^"]*)")/)
+      if (nm) {
+        const inner = nm[1] ?? nm[2] ?? ''
+        const nestedNet =
+          /(?:^|[\s;|&`$()])(curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)\s+/.test(inner) ||
+          /\bgit\s+(push|pull|clone|fetch|ls-remote|remote)\b/.test(inner) ||
+          /\b(pip3?|npm|npx|pnpm|yarn|gem|cargo|brew|uv)\b[^\n;]*\b(install|add|update|download|publish|uninstall)\b/.test(inner) ||
+          FIND_INLINE_EGRESS_RE.test(inner)
+        if (nestedNet) return { kind: 'egress', signal: 'nested shell network' }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * B2: `find -delete`, `find -exec/-ok rm`, and `fd -x/--exec rm` that
+ * READ_COMMANDS would call read but actually deletes/mutates matched files.
+ * Returns a write/unknown result, or null when the command is read-only.
+ */
+function detectDestructiveRead(trimmed: string, firstWord: string): ClassifyResult | null {
+  if (firstWord === 'find' || firstWord === 'fd') {
+    const hasDelete = /(^|\s)-delete(\s|$)/.test(trimmed)
+    const actionVerb = actionVerbDestructive(trimmed)
+    const wrapped = wrappedShellDeletes(trimmed)
+    if (wrapped && !hasDelete && !actionVerb) {
+      return {
+        category: 'unknown',
+        reason: `${firstWord} wraps a shell script that deletes files; target cannot be resolved statically`,
+        targetPaths: [],
+        mutates: true,
+      }
+    }
+    if (hasDelete || actionVerb) {
+      const start = extractFindStart(trimmed)
+      const action = hasDelete ? '-delete' : `-${actionVerb}`
+      if (start) {
+        return {
+          category: 'file_write',
+          reason: `${firstWord} mutates matched files (${action})`,
+          targetPaths: [start],
+          mutates: true,
+        }
+      }
+      return {
+        category: 'unknown',
+        reason: `${firstWord} mutation (${action}) with no resolvable target path`,
+        targetPaths: [],
+        mutates: true,
+      }
+    }
+    // G3: interpreter inline code run directly as the action verb or inside the
+    // wrapped shell (delete surface / inline network API), incl. one nested layer.
+    const inlineThreat = findActionInlineThreat(trimmed)
+    if (inlineThreat) {
+      return {
+        category: 'unknown',
+        reason:
+          inlineThreat.kind === 'delete'
+            ? `${firstWord} action runs inline code that deletes files; target cannot be resolved statically (${inlineThreat.signal})`
+            : `${firstWord} action reaches the network via inline interpreter code (${inlineThreat.signal}); cannot prove offline`,
+        targetPaths: [],
+        mutates: inlineThreat.kind === 'delete',
+      }
+    }
+    // G1: network/install smuggled through a find/fd action or its wrapped
+    // shell; the read path never egress-scans, so fail closed here.
+    const egress = wrappedEgressSignal(trimmed)
+    if (egress) {
+      return {
+        category: 'unknown',
+        reason: `${firstWord} action reaches the network or installs packages (${egress}); cannot prove offline`,
+        targetPaths: [],
+        mutates: false,
+      }
+    }
+  }
+  return detectInlineDestructiveCode(trimmed, firstWord)
+}
+
+/**
  * Detect `find … -name <sensitive-name> -exec <read-cmd> {}` — a read channel
  * whose sensitive path only appears as a pattern + `{}` placeholder, invisible
  * to the literal-path scan. Returns a synthetic sensitive path (or null).
@@ -2674,6 +3218,15 @@ export function classifyBashCommand(
     const dir = baseDir
     for (const p of extractWritePaths(s)) {
       resolvedWrites.push(toAbsolute(p, dir))
+    }
+    // Preserve targets the per-segment classifier resolved itself (e.g. the
+    // starting directory of `find -delete`/`find -exec rm`) when the generic
+    // token extractor cannot read the find grammar.
+    const segResult = results[i]
+    if (segResult && segResult.category === 'file_write') {
+      for (const p of segResult.targetPaths) {
+        resolvedWrites.push(toAbsolute(p, dir))
+      }
     }
     for (const p of extractReadPaths(s)) {
       resolvedReads.push(toAbsolute(p, dir))

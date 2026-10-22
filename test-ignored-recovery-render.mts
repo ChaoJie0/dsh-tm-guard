@@ -50,7 +50,7 @@ test('status render: counts no targets in Recent and marks per-line; absent fiel
     gitRecovery: [{ path: '/p/t.txt', state: 'yes' }],
   }
   const out = renderStatusReport(baseInput(audit, [withYes, withNo, old]))
-  assert.match(out, /git-unrecoverable \(ignored\) targets in recent window: 1/)
+  assert.match(out, /git-unrecoverable targets in recent window: 1/)
   const noLine = out.split('\n').find((l) => l.includes('[file_write] bash'))
   assert.ok(noLine?.includes('git=no(1)'))
   // yes and old lines carry no marker

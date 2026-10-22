@@ -133,6 +133,40 @@ if (existsSync(TGZ)) {
   console.log('  (no staged tarball — freshness check skipped)')
 }
 
+// L6-c: in-process content scan over every whitelisted file — secrets, real
+// local account path, and review-artifact filenames. Pure in-process: no tar
+// binary, no network, no child process.
+const CONTENT_SECRET_RES = [
+  /ghp_[A-Za-z0-9]{20,}/,
+  /github_pat_[A-Za-z0-9_]{20,}/,
+  /sk-[A-Za-z0-9_-]{16,}/,
+  /AKIA[0-9A-Z]{16}/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+]
+const CONTENT_REAL_PATH = /\/Users\/(zero|root|admin)(?![A-Za-z0-9_-])/
+const REVIEW_NAME_RE = /(fp-review|final-release|audit-gap|independent-review)/i
+
+console.log('')
+console.log('L6-c content scan (secrets / real path / review artifacts):')
+for (const f of rel) {
+  const disk = join(ROOT, f)
+  if (!existsSync(disk)) continue
+  const text = readFileSync(disk, 'utf8')
+  let hit = null
+  for (const re of CONTENT_SECRET_RES) {
+    if (re.test(text)) { hit = `secret pattern ${re.source}`; break }
+  }
+  if (!hit && CONTENT_REAL_PATH.test(text)) hit = 'real local account path'
+  if (!hit && REVIEW_NAME_RE.test(f.split('/').pop())) hit = 'review-artifact filename'
+  if (!hit && REVIEW_NAME_RE.test(text)) hit = 'review-artifact token in content'
+  if (hit) {
+    violations.push(`${f}: ${hit}`)
+    console.log(`  LEAK   ${f} (${hit})`)
+  } else {
+    console.log(`  OK     ${f}`)
+  }
+}
+
 // G3: install-time lifecycle hooks must not exist — this plugin sits between
 // the agent and the filesystem; a preinstall/install/postinstall script would
 // execute arbitrary code on the user's machine at install time.

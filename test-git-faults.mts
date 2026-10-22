@@ -150,23 +150,26 @@ test('ensureGitBaseline: fresh repo full path succeeds', async () => {
 })
 
 // ---------------------------------------------------------------------------
-test('commitCheckpoint: status failure is a silent no-op', async () => {
+test('commitCheckpoint: status failure reports ok=false (no throw)', async () => {
   __setGitOverride(async (args) => {
     assert.deepEqual(args, ['status', '--porcelain'])
     throw new Error('index.lock exists')
   })
-  await commitCheckpoint('/x', 'label') // must not throw
+  const r = await commitCheckpoint('/x', 'label')
+  assert.equal(r.ok, false)
+  assert.ok(r.reason)
   __setGitOverride(null)
 })
 
-test('commitCheckpoint: clean tree -> no commit', async () => {
+test('commitCheckpoint: clean tree -> no commit, ok=true', async () => {
   const seen: string[][] = []
   __setGitOverride(async (args) => {
     seen.push(args)
     if (args[0] === 'status') return ''
     throw new Error(`unexpected ${args.join(' ')}`)
   })
-  await commitCheckpoint('/x', 'label')
+  const r = await commitCheckpoint('/x', 'label')
+  assert.equal(r.ok, true)
   assert.ok(!seen.some((a) => a[0] === 'commit' || a.includes('commit')))
   __setGitOverride(null)
 })
@@ -180,7 +183,8 @@ test('commitCheckpoint: dirty tree -> add + commit', async () => {
     if (args.includes('commit')) return 'done'
     throw new Error(`unexpected ${args.join(' ')}`)
   })
-  await commitCheckpoint('/x', 'my-label')
+  const r = await commitCheckpoint('/x', 'my-label')
+  assert.equal(r.ok, true)
   assert.ok(seen.some((a) => a[0] === 'add'))
   const commitArgs = seen.find((a) => a.includes('commit'))
   assert.ok(commitArgs)
@@ -189,14 +193,16 @@ test('commitCheckpoint: dirty tree -> add + commit', async () => {
   __setGitOverride(null)
 })
 
-test('commitCheckpoint: commit failure is silent (baseline still exists)', async () => {
+test('commitCheckpoint: commit failure reports ok=false (no throw)', async () => {
   __setGitOverride(async (args) => {
     if (args[0] === 'status') return ' M modified.txt\n'
     if (args[0] === 'add') return ''
     if (args.includes('commit')) throw new Error('hook rejected')
     throw new Error(`unexpected ${args.join(' ')}`)
   })
-  await commitCheckpoint('/x', 'label') // must not throw
+  const r = await commitCheckpoint('/x', 'label')
+  assert.equal(r.ok, false)
+  assert.ok(r.reason && r.reason.includes('hook rejected'))
   __setGitOverride(null)
 })
 

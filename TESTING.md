@@ -12,13 +12,35 @@
 | L1 | 构建可复现 | `npm run verify:build` | <1s | 发布前 / 工作树变更后 | CI + 本地 |
 | L2 | 包内容审计 | `npm run verify:pack` | <1s | 发布前 / 推送前 | CI + 本地 |
 | L3 | peer 兼容矩阵 | `npm run verify:peer` | <1s | 发布前 / 改动声明后 | CI + 本地 |
-| L4 | 全版本 host 矩阵冒烟 | 见 RELEASE §2 / L4（RELEASE.md 实机 host 段） | ~10min | **发布前（手动）** | 本地（需 macOS + TM + dsh host） |
+| L4 | 隔离 host 进程内活体冒烟（全版本矩阵 + 本版分叉命令经真实 harness 被门控） | 见下方 L4 段 / RELEASE §2 | ~10min | **发布前（手动，强制）** | 本地（需 macOS + TM + dsh host，硬隔离生产） |
 | L5 | 独立复核 | 委派 dsh 会话 | ~3min | **发布前（手动）** | 本地（需 dsh 会话） |
-| L6 | 内容隐私审查 | `npm run verify:pack` + 清单 | ~1min | **推送前（手动）** | 本地 |
+| L6 | 内容隐私审查（树/发布物自动；已 push 污染应急重写人工） | `npm run verify:hygiene` + `npm run verify:pack` | ~1min | 推送前（自动门；§6 应急手动） | CI + 本地 |
 
 > 耗时实测（2026-10-20，本机）：L0 ≈ 18s（TAP duration），L1 ≈ 0.7s，L2 ≈ 0.2s，L3 ≈ 0.25s。L1/L2 因无子进程/增量构建而为亚秒级。
 
-`npm run verify:fast` = L0+L1+L2+L3 一键全跑（发布门禁的自动部分）；`npm run release:check` 为 `verify:fast` 的别名。
+`npm run verify:fast` = L0+L1+L2+L3+L6 一键全跑（发布门禁的自动部分；L4/L5 仍手动）；`npm run release:check` 为 `verify:fast` 的别名，`prepublishOnly` 同样强制它。
+
+### 量化发布记分卡 `npm run release:gate`
+
+`release:check` 只保证自动门通过；`release:gate` 在其之上输出一张量化记分卡并直接给 GO/NO-GO。**所有自动门阈值都是"违规数 = 0"**，展示性计数（pass 数、文件数、WARN 数）不是放行线。
+
+| 门 | 硬阈值（必须为 0） | 展示（非阈值） |
+|---|---|---|
+| L0 单元测试 | `# fail = 0` | `# pass` 数（随版本增长，不设下限） |
+| L3 peer 矩阵 | violated expectations = 0 | `N/N` 命中 |
+| L1 可复现构建 | differ files = 0 | 逐字节一致文件数 |
+| L2 发布物审计 | leak violation = 0 | 白名单打包文件数 |
+| L6 树+历史卫生 | hard violation = 0 | WARN 计数（非阻断） |
+
+退出码与结论：
+- `0` = **RELEASE GO**：自动门全绿且 L4/L5 已显式确认；
+- `1` = **NO-GO**：任一自动门失败，修完再跑；
+- `2` = **AUTOMATIC GREEN, MANUAL PENDING**：自动门全绿但 L4/L5 未确认，尚不可发布。
+
+L4/L5 脚本无法自证，绝不自动判定；完成后用显式 flag 计入：
+`npm run release:gate -- --confirm-l4 --confirm-l5`。缺任一 flag，结论停在 PENDING（exit 2）。
+这两个 flag 只是人工 attestation（声明你已完成 L4/L5），脚本本身不连接 host、不复核 dsh 结论，
+不能替代真实实机与独立审查。push/tag/publish 始终由人在终端执行。
 
 ## 各层说明
 
@@ -85,6 +107,39 @@
 
 **写门控端到端补测（2026-10-02）**：3 个可端到端 host（0.1.7-rc.2/0.2.0-rc.1/0.2.0-rc.2）全部通过受保护内写放行、越界写拒（非临时路径）、敏感路径写拒三场景，行为一致。驱动为一次性临时脚本（记录于 gitignored 报告 `.smoke-out/verify-host-matrix-write-023.md`，不随仓库存档）。注意：`/tmp`/`/var/tmp`/`/var/folders` 是设计内一次性临时区放行（classifier.ts），越界写测试须用非临时路径。
 
+**发布前强制：隔离 host 进程内活体分叉命令冒烟（不可由单测或隔离脚本替代）**
+单测（mock/注入 tm 层）与 `/tmp` 隔离脚本（直接调 build 后的门控函数）只证明**函数本身正确**，不等于"命令经过真实 harness、在 host 进程内被门控拦住"。因此每个版本发布前必须：
+
+1. **硬隔离（5 条，缺一不可）**：
+   - 独立 profile 目录，**只挂本插件一个 bundle**；不加载生产 patch（模型桥 / atoll 灵动岛 / provider-failover / 真实模型 baseURL / 状态上报桥一律不带）。
+   - 独立新端口，避开生产端口（生产 3080）；**生产 host 不重启、不断连、不改任何配置文件**。
+   - 独立 cwd 专用测试目录；审计落 `<cwd>/.tm-guard`，绝不写生产审计（audit 按 workspaceDir/cwd 解析）。
+   - `protectedPaths` 只指向隔离测试目录，不指向真实项目 / 学科目录 / DSH_Work。
+   - 门控钩子只在一次 agent turn 由模型发起工具调用时触发；host 没有不经模型直接 POST 工具的 unary 通道（`tools/list/execute` 是事件名而非 RPC），catalog 无免费/本地 provider。因此触发方式为：隔离实例用其继承的默认轻量模型跑一次极简 turn（只读 allow + 敏感读 deny + 可恢复写放行各一条）；**不复制生产方舟配置、不把付费 key 写进任何文件、不碰生产额度以外的资源**。若环境完全无任何可用模型，则只记录 host 加载/钩子注册/TM health 证据，命令拦截层由单测 + `/tmp` 隔离脚本承担，并在报告中如实标注该边界，不得冒充 host 内拦截通过。
+2. **通过标准（host 进程内实测）**：启动日志含 `[tm-guard] Loaded`、`tm_status` 返回 HEALTHY、TM health passed；本版新增/改动的分叉破坏性命令在 harness 内真 `BLOCKED` 且命令未执行、审计落盘；同时一条良性只读命令仍 allow。
+3. **非目录隔离项（如实记录）**：`tmutil localsnapshot` 是 APFS 卷级 purgeable 快照，非目录级；隔离实例创建的快照由系统自动回收，不复制、不修改生产文件。
+4. 报告写入 gitignored `docs/`，不进公开仓库。
+
+#### 可复用隔离脚本（替代手动搭 profile）
+
+`scripts/l4-isolated-smoke.sh`（`npm run l4 -- <subcmd>`）把每次手动建 profile、选端口、写 patch、装依赖、抓证据的步骤固化；**只做环境准备与证据采集，不驱动模型 turn、不自动判 PASS**（host 无 unary 工具通道，模型 turn 与最终判定仍人工）。
+
+```bash
+# 1) 准备隔离 profile（生成 package.json/cordis.patch.yml、装依赖、建 git 基线）
+npm run l4 -- setup --version 0.2.8 --tgz "$PWD/dsh-tm-guard-0.2.8.tgz" \
+  --profile tm-live --port 3091 --workspace "$HOME/dsh-live/tm-live/workspace"
+# 2) 启动隔离 host（空闲端口预检，轮询 Loaded+TM health，校验实际绑定该端口，比对生产 3080 pid 不变）
+npm run l4 -- start --profile tm-live --port 3091 --workspace "$HOME/dsh-live/tm-live/workspace"
+# 3) 会话内跑一次极简 turn 后，采集证据（版本/Loaded/TM health/隔离 audit/生产 pid）
+npm run l4 -- collect --profile tm-live --port 3091 --workspace "$HOME/dsh-live/tm-live/workspace"
+# 4) 收尾：只杀本实例（按 cmdline 校验，绝不碰 3080）
+npm run l4 -- stop --profile tm-live
+```
+
+脚本 fail-closed 自动保证上面「硬隔离 5 条」中的可机检项：拒绝生产 3080 与非数字端口；workspace 先展开前导 `~` 再 `cd -P` 规范化解析，拒绝字面 `..`、拒绝解析后逃逸出 `$HOME`（含 symlinked `$HOME` 也按解析后真实家目录比较）、拒绝落到 `/tmp`/`/private/var/folders`（TM Excluded）、拒绝指向真实项目/DSH_Work/学科目录；保留名/已存在 profile 检查先于建目录执行，拒绝时不写任何文件、不留残留空目录，也不静默覆盖；生成 patch 不含模型凭据字段；启动前预检端口空闲，启动就绪门要求 `Loaded` + `TM health check passed` + 实际绑定该端口，启动前后生产 3080 pid 必须一致；stop 按锚定 cmdline 只杀本实例，绝不碰 3080。`--no-install` 仅用于干跑生成配置（不联网、不建基线）。
+
+仍需人工：在隔离会话里发「只读 allow / 敏感读 deny / 可恢复写 allow」三条 + 本版分叉破坏性命令，观察真 `BLOCKED` 且命令未执行；模型继承默认轻量模型，不复制方舟配置。
+
 **0.2.8 特性实机验证（git-ignored 删除兜底，2026-10-20）**：
 在真实 APFS + Time Machine 配置上验证新增的「被 `.gitignore` 忽略、git 无法恢复的删除目标」处理：
 - 场景：目标文件 git 探针 `state=no`（git-ignored，git 无法恢复）→ 绕过冷却**强制创建恰好 1 张新鲜 APFS 快照**兜底；**始终 allow 绝不 deny**（零干预哲学，默认决策不变）；`warnOnIgnoredDelete` 默认 false（仅 console.warn 不改决策）；`requireGitBaseline:false` 同时关闭探针与强制快照。
@@ -95,12 +150,17 @@
 委派 dsh 独立会话（不采信本文件/此前结论）：对 **npm 发布物**（安装目录 + registry 元数据）验证——peer 严格语义、发布物与 gitHead 重建 SHA 一致、函数级门控全量用例、生产审计活性。0.2.5/0.2.6/0.2.7/0.2.8 发布前均执行并 PASS；0.2.8 重写历史后 tarball SHA-256 与 dsh L5 记录逐字节一致（`c1e021af…`），证明裁剪历史未改发布物、dsh 审查直接成立。
 
 ### L6 内容隐私审查（推送前）
-除 L2 机器扫描外，人工检查：
-- `git log` 无本地路径/会话 id/端口/token 字样
-- 历史 blob 无敏感残留；**只查当前树不够，必须查历史**：`git rev-list --all | xargs git grep` 扫描全部可达 refs
-- 未 push 的本地污染：bundle 备份 → `git filter-branch --index-filter` 限定 `origin/main..HEAD` 重写 → 删 `refs/original` + `reflog expire` + `gc --prune=now` → 线性后代普通 push（无需 force）
-- 已 push 的污染：按 `RELEASE.md` 第 6 节应急流程（先备份，再重写，最后 force push）
-- 发布相关报告（guide/测试报告/实机报告）留在 `docs/` / `.smoke-out/`（已 gitignore），不进公开仓库
+分层：可确定性判断的部分已自动化进 `verify:fast`（=`release:check`=`prepublishOnly`），剩余需人工判断的应急动作保留。
+
+**自动门（`npm run verify:hygiene`，已并入 verify:fast 末尾）**：
+- L6-a 树卫生：porcelain 干净（先 commit/stash，与 L1 同前置）、无跟踪的 `docs/`/`research-proposal/`/`.smoke-out/` 目录与 `scratch-*.mts`/`*.log`/审查产物 basename、HEAD blob 无真实本机路径/会话 id/密钥。
+- L6-b 推送主线历史：扫 `origin/main` 基线树 + `origin/main..HEAD` 新提交（禁止路径与敏感串）；legacy 本地 author 身份与 orphan/backup 历史仅 WARN 不阻断。
+- L6-c 发布物内容：`verify:pack` 在白名单文件内进程内扫密钥/真实本机路径/审查 token（无 tar、无网络）。
+
+**仍需人工（脚本不代做）**：
+- 已 push 的污染：按 `RELEASE.md` 第 6 节应急流程（先备份，再重写，最后 force push）——破坏性历史重写不进自动门。
+- 未 push 本地污染的重写决策、bundle 备份与 `filter-branch`/reflog/gc 清理由人判断执行。
+- 发布相关报告（guide/测试报告/实机报告）留在 `docs/` / `.smoke-out/`（已 gitignore），不进公开仓库。
 
 ## 用例注册表（历史问题 → 固化用例）
 
@@ -122,9 +182,9 @@
 
 ## 环境要求
 
-- L0/L1/L2/L3：Node ≥ 20 + npm + git；其中 L1（verify:build）在本机构建需 Node ≥ 22.6 或 ≥ 20.19 LTS（stripTypeScriptTypes）。CI 用 macOS runner 可全跑。
-- L4/L5/L6：macOS + APFS + Time Machine 配置 + 本地 dsh 安装（不能进 CI）
+- L0/L1/L2/L3/L6：Node ≥ 20 + npm + git（L6 仅需 git 只读，可进 CI）；其中 L1（verify:build）在本机构建需 Node ≥ 22.6 或 ≥ 20.19 LTS（stripTypeScriptTypes）。CI 用 macOS runner 可全跑。
+- L4/L5：macOS + APFS + Time Machine 配置 + 本地 dsh 安装（需真实 host 与会话，不能进 CI）
 
 ## CI
 
-`.github/workflows/test.yml`：push/PR 自动跑 L0+L1+L2+L3（`npm run verify:fast`）。L4/L5 因需真实 TM 与 dsh 会话，保持本地手动（发布前执行）。
+`.github/workflows/test.yml`：push/PR 自动跑 L0+L1+L2+L3+L6（`npm run verify:fast`，checkout `fetch-depth:0` 供 L6-b 历史扫描）。L4/L5 因需真实 TM 与 dsh 会话，保持本地手动（发布前执行）。

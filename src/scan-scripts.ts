@@ -110,6 +110,11 @@ const RULES: Record<Lang, LangRules> = {
     dyn: [
       /\b__import__\s*\(\s*["']/,
       /\b(eval|exec)\s*\(/,
+      // G2: importlib dynamic import is the __import__ equivalent; the target
+      // module and its side effects cannot be proven innocent statically.
+      /\bimportlib\s*\.\s*import_module\s*\(/,
+      /\bfrom\s+importlib\s+import\s+import_module\b/,
+      /\bimport_module\s*\(\s*["']/,
     ],
   },
   node: {

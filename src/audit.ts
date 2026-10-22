@@ -127,9 +127,19 @@ export interface AuditRecord {
    * Per-target git recoverability for allowed file writes (ignored-file
    * recovery proposal). Absent on records that are not allowed file writes,
    * and absent in old JSONL written before this field existed — readers must
-   * tolerate that. 'no' means git cannot restore the target (ignored).
+   * tolerate that. 'no' means git cannot restore the target (ignored);
+   * 'unrecoverable' means tracked but a special layout (skip-worktree/sparse-
+   * excluded, gitlink, symlink-to-outside) a standard offline command cannot
+   * restore, so a fresh TM snapshot is forced.
    */
-  gitRecovery?: Array<{ path: string; state: 'yes' | 'no' | 'unknown' }>
+  gitRecovery?: Array<{
+    path: string
+    state: 'yes' | 'no' | 'unknown' | 'unrecoverable'
+    unrecoverableReason?:
+      | 'skip-worktree'
+      | 'gitlink'
+      | 'symlink'
+  }>
 }
 
 export class AuditLog {

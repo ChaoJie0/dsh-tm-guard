@@ -200,6 +200,37 @@ test('gate: mixed rm tracked + ignored -> both details, force by the no entry (M
   )
 })
 
+test('gate: skip-worktree tracked file -> unrecoverable, forces fresh snapshot (anti false-yes)', async () => {
+  setupRepoFiles()
+  const skipFile = join(REPO, 'skip.txt')
+  writeFileSync(skipFile, `skip-${Math.random()}`)
+  execSync(`git -C ${REPO} add skip.txt`)
+  execSync(`git -C ${REPO} commit -qm skip`)
+  execSync(`git -C ${REPO} update-index --skip-worktree skip.txt`)
+  tmHealthy(() => {
+    snapshotCalls++
+    lastSnapshotPathExisted = existsSync(skipFile)
+    snapSeq++
+    return { stdout: `Created local snapshot with date: 2026-10-20-15${String(snapSeq).padStart(4, '0')}\n` }
+  })
+  applyGate()
+  await gate({ name: 'write', arguments: { file_path: join(REPO, 'prime5.txt'), content: 'x' } })
+  const callsBefore = snapshotCalls
+  assert.ok(existsSync(skipFile), 'precondition: skip-worktree file exists')
+  const r = await gate({
+    name: 'bash',
+    arguments: { command: `rm ${skipFile}`, description: 'delete skip-worktree file' },
+  })
+  assert.equal(r.kind, 'allow')
+  assert.equal(snapshotCalls, callsBefore + 1, 'skip-worktree target forces exactly one fresh snapshot')
+  assert.equal(lastSnapshotPathExisted, true, 'forced snapshot observed the file still on disk')
+  const rec = lastAudit()
+  assert.deepEqual(rec.gitRecovery, [
+    { path: skipFile, state: 'unrecoverable', unrecoverableReason: 'skip-worktree' },
+  ])
+  assert.ok(rec.snapshotId, 'audit records the forced snapshot id')
+})
+
 test('gate: git add -f tracked file matching ignore -> yes, no force', async () => {
   tmHealthy()
   setupRepoFiles()
@@ -385,6 +416,44 @@ test('render: tm_audit marks git=no and old JSONL without the field still render
   assert.ok(legacyLine && !legacyLine.includes('git=no'))
 
   const statusOut: string = await findTool('tm_status').execute({})
-  assert.match(statusOut, /git-unrecoverable \(ignored\) targets in recent window: 1/)
+  assert.match(statusOut, /git-unrecoverable targets in recent window: 1/)
   assert.match(statusOut, /git=no\(1\)/)
+})
+
+test('gate: failed checkpoint in cooldown forces one fresh snapshot, observes pre-write file, downgrades yes->unknown (B1/M1)', async () => {
+  setupRepoFiles()
+  const tracked = join(REPO, 'tracked.txt')
+  const beforeBytes = readFileSync(tracked, 'utf8')
+  let snapshotSawFile: boolean | null = null
+  tmHealthy(() => {
+    snapshotCalls++
+    snapshotSawFile = existsSync(tracked) && readFileSync(tracked, 'utf8') === beforeBytes
+    snapSeq++
+    return { stdout: `Created local snapshot with date: 2026-10-20-16${String(snapSeq).padStart(4, '0')}\n` }
+  })
+  // Baseline establishes and reports HEAD, but the pre-write checkpoint's
+  // `git add -A` / commit fails (locked index) -> checkpointFailed = true.
+  __setGitOverride(async (args: string[]) => {
+    if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return REPO
+    if (args[0] === 'rev-parse' && args[1] === 'HEAD') return 'deadbeef'
+    if (args[0] === 'status') return ' M tracked.txt\n'
+    if (args[0] === 'add' || args[0] === 'commit') throw new Error('simulated index lock')
+    return ''
+  })
+  applyGate()
+  // Prime write opens the 300s cooldown window; its own checkpoint succeeds.
+  await gate({ name: 'write', arguments: { file_path: join(REPO, 'prime-b1.txt'), content: 'x' } })
+  const callsBefore = snapshotCalls
+  const r = await gate({
+    name: 'write',
+    arguments: { file_path: tracked, content: 'NEW-BYTES' },
+  })
+  assert.equal(r.kind, 'allow', 'checkpoint failure never denies the write')
+  assert.equal(snapshotCalls, callsBefore + 1, 'failed checkpoint forces exactly one fresh snapshot inside cooldown')
+  assert.equal(snapshotSawFile, true, 'forced snapshot observed the pre-write file before next()')
+  const rec = lastAudit()
+  const t = (rec.gitRecovery ?? []).find((g: any) => g.path === tracked)
+  assert.ok(t, 'gitRecovery lists the tracked target')
+  assert.equal(t.state, 'unknown', 'swallowed checkpoint failure must not claim yes')
+  assert.ok(rec.snapshotId, 'audit records the forced snapshot id')
 })

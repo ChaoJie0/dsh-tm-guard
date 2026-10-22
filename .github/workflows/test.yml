@@ -11,6 +11,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -32,5 +34,8 @@ jobs:
       - name: L2 包内容审计
         run: npm run verify:pack
 
-  # L4 双线隔离冒烟 / L5 独立复核 / L6 隐私审查：
+      - name: L6 树与历史卫生（密钥/真实路径/审查产物，自动）
+        run: npm run verify:hygiene
+
+  # L4 双线隔离冒烟 / L5 独立复核：
   # 需要真实 macOS + Time Machine + 本地 dsh host 与会话，保持本地发布前手动执行（见 TESTING.md / RELEASE.md）。

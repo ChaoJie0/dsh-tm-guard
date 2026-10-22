@@ -7,31 +7,265 @@ All notable changes to dsh-tm-guard will be documented in this file.
 ## [0.2.8] - 2026-10-20
 
 ### Added
-- **Per-file git recoverability probe + forced fresh snapshot for git-ignored
-  deletes.** Before an allowed file write/delete, each target is probed
+- **Per-file git recoverability probe + forced fresh snapshot for targets git
+  cannot restore.** Before an allowed file write/delete, each target is probed
   individually against the local git baseline: `yes` (tracked/committable, git
   can restore it), `no` (git-ignored — e.g. `.env.local`, which `git add -A`
   never commits, so git cannot restore it), `unknown` (no baseline or probe
-  failed). Targets classified `no` bypass the cooldown skip and force exactly
-  one fresh APFS snapshot before the write; the allow audit record carries
-  `git=no(n)`. The write is still **allowed, never denied** — zero-intervention
-  is unchanged; this only raises snapshot frequency for a file git cannot
-  roll back.
+  failed), and `unrecoverable` (tracked but a special layout a standard offline
+  command cannot restore: a skip-worktree/sparse-excluded entry, a gitlink
+  submodule directory `160000`, or a symlink `120000` pointing outside the
+  repo). Targets classified `no` or `unrecoverable` bypass the cooldown skip and
+  force exactly one fresh APFS snapshot before the write; the allow audit record
+  carries `git=no(n)` for ignored targets and `git=unsafe(n)` for special-layout
+  targets. The write is still **allowed, never denied** — zero-intervention is
+  unchanged; this only raises snapshot frequency for a file git cannot roll back.
 - Advisory-only `warnOnIgnoredDelete` (default `false`): when `true`, also
   `console.warn`s the ignored path(s); otherwise silent.
-- `tm_audit` and `tm_status` render the `git=no(n)` count and a
-  `git-unrecoverable targets in recent window` aggregate line.
+- `tm_audit` and `tm_status` render the `git=no(n)` and `git=unsafe(n)` counts
+  and a `git-unrecoverable targets in recent window` aggregate line.
+
+### Fixed
+- **B1: a failed pre-write checkpoint no longer reports a false git `yes`.**
+  `commitCheckpoint` now returns `{ ok, reason }` instead of swallowing
+  `add`/`commit` errors (locked `index.lock`, read-only `.git`, full disk, a
+  rejecting hook). When any checkpoint fails, the gate stops vouching for a
+  git restore point, downgrades per-target `yes` to `unknown` in the audit, and
+  forces one fresh Time Machine snapshot outside the cooldown window so the
+  TM backstop still covers the write; the write itself stays allowed.
+- **B2: destructive commands the read whitelist used to pass through.**
+  `find -delete`, every `find -exec/-execdir/-ok` that runs a destructive verb
+  (rm/rmdir/mv/cp/ln/...), and `fd -x/--exec rm` now classify as `file_write`
+  with the starting directory as the target (checkpoint + probe + snapshot).
+  Inline interpreters fail closed to `unknown` (deny) instead of riding
+  `read`/`local_exec`: `perl -e/-E` catches `unlink` (bare, `q()`/`qq()`),
+  `system(...)`, `qx`, backticks, and pipe-opener `open`, including the
+  space-less `perl -e'...'` form; `ruby -e` catches `File.unlink/delete`,
+  `FileUtils.rm/rm_f/rm_r/rm_rf`, `File.rmdir`, `Dir.rmdir`, and backticks.
+  Read-only `find -name/-type/-exec cat`, `perl -ne`/`perl print`, `ruby puts`,
+  and a plain `fd` listing are unaffected.
+- **B3: deletion hidden behind an interpreter wrapper.** A shell script carried
+  by `find -exec/-execdir sh|bash|dash|zsh -c '...'` / `fd -x bash -c '...'`
+  that itself calls `rm/rmdir/unlink/mv/...` now fails closed to `unknown` (the
+  in-script target cannot be resolved statically). Inline interpreters also catch
+  `Dir.delete`, `Kernel.system`/`Kernel.exec`, call-form `system`/`exec(...)`, and
+  the merged `ruby -ne` cluster; a read-only `sh -c 'echo'` wrapper stays
+  allowed. The quoted-block fallback runs only on an inline flag, and `system`
+  matches call forms (`system(`/`system "`)` rather than the bare word, so a
+  benign `ruby script.rb 'a system path'` or a `"system"` string is not denied.
+  Remaining non-deletion rewrites (perl bare-word write `open(F,">")`,
+  `perl -pi` in-place edit) are covered by the default snapshot net and tracked
+  as a minor backlog item.
+- **B4: absolute-path / variable interpreter wrappers.** The wrapped-shell
+  detector skips `env` at any absolute path (`/usr/bin/env bash`) and
+  basename-normalizes the interpreter token, so `/bin/sh`, `/bin/bash`,
+  `/bin/dash`, `/usr/local/bin/zsh`, `tcsh`, and `/usr/bin/env /bin/sh` behind
+  `-exec` are caught the same as a bare `sh`; an unresolved variable shell
+  (`"$SHELL" -c '...'`) fails closed because the interpreter cannot be proven
+  safe. `FileUtils` matching is narrowed to destructive methods
+  (`rm/rm_f/rm_r/rm_rf/remove_entry/remove_dir/rmdir`), so
+  `mkdir_p/cp/chmod/cd` no longer hard-deny.
+- **B5: deletion nested one layer deeper inside the wrapped shell body.** The
+  `-exec` wrapper now reads only the quoted script that follows `-c`, and treats
+  a non-resolvable inner deletion signal as fail-closed `unknown`: an inner
+  `find -delete`, another interpreter `-c/-e` (e.g. `python3 -c os.remove`),
+  `env -i <shell>` options before the interpreter, and a backtick/`$(`
+  substituted interpreter (`` `which sh` ``) can no longer ride `read`. A
+  read-only `sh -c 'echo'` wrapper stays allowed. `system` call matching splits
+  into `system(` and `system "arg"` so a benign trailing quote such as
+  `puts "operating system"` is not denied.
+- **B6: env variable assignments before the interpreter.** `env FOO=bar /bin/sh`
+  and `env -i PATH=/bin /bin/sh` behind `-exec`/`-x` no longer mis-locate the
+  interpreter at the `NAME=value` token; assignment tokens are skipped alongside
+  `env` and its options, so these fail closed to `unknown`. The wrapper body
+  heuristic is also narrowed: a bare command substitution (`$(...)`, backticks)
+  or an inner interpreter flag only fails closed when the body carries a real
+  delete signal, so read-only `$(basename)`, `$(wc -l)`, and a read-only inner
+  `python3 -c print` / `ruby -e puts` stay allowed.
+- **B7: inner interpreter delete-API completeness.** An inner `node -e` /
+  `node --eval` calling `fs.rmSync`, and an inner `ruby -e` calling
+  `FileUtils.rm_rf`/`FileUtils.rm`, inside a `-exec` shell, now fail closed.
+  The bare `\bremove\b` match is replaced by receiver-anchored FS delete APIs
+  (`os.remove`, `.unlink(Sync)`, `.rmSync`, `.rmdirSync`, `FileUtils.rm`,
+  `File/Dir.delete`, `shutil.rmtree`), so a list `.remove()` and the word
+  "remove" in a string stay allowed.
+- **B8: perl `File::Path::remove_tree`.** The modern recursive-deletion name
+  `remove_tree` (alongside the legacy `rmtree`) now fails closed in both the
+  direct inline detector and the find-exec shell body.
+- **B9: ruby `FileUtils.remove_dir` inside a find-exec shell, plus a shared
+  delete-API surface.** The direct inline detector and the find-exec shell-body
+  heuristic previously kept two separate delete-API word lists that drifted
+  (B8 `remove_tree`, B9 `remove_dir` were caught by one but missed by the
+  other). They now match a single `DELETE_API_SURFACE`, so adding a delete API
+  covers both channels; `FileUtils.remove_dir` (including the recursive
+  `force=true` form) and `FileUtils.remove_entry_secure` fail closed in both.
+  The bare `remove_dir`/`remove_entry` branches carry word boundaries so helper
+  identifiers that merely contain the substring (e.g. `my_remove_dir_helper`,
+  `remove_dirname`) stay allowed.
+- **G1: network/package install smuggled through a find/fd action rode `read`.**
+  The read path never runs the egress scan, so `find -exec sh -c 'curl …'`,
+  `fd -x wget …`, an env-prefixed `/bin/sh` wrapper, an inner inline
+  `python3 -c urllib`/`node -e fetch`, a package install in the wrapper, and a
+  direct `git push`/`pip install` as the action verb all classified as `read`
+  with no deny, audit, checkpoint, or snapshot. The find/fd branch now fails
+  closed to `unknown` on a network verb, a git remote subcommand, a package
+  manager install/add/update/download/publish/uninstall, or an inline interpreter
+  network call inside the wrapped shell. It fails closed to `unknown` (not
+  `network`) so a `denyNetwork:false` override cannot resurrect it. A plain
+  listing, `-exec cat/grep`, `sh -c 'echo'`, and a wrapped local `git log` stay
+  allowed.
+- **G2: `importlib.import_module` deletion/egress rode `local_exec`.** The
+  dynamic-import scan only recognized `__import__('…')`; `importlib.import_module`,
+  `import importlib as m; m.import_module(…)`, and `from importlib import
+  import_module` were treated as clean local exec, so a module fetched for
+  `os.remove`/`shutil.rmtree` or `urllib.request.urlopen` ran without a checkpoint
+  or probe. These now mark the inline code unverifiable and fail closed to
+  `unknown`, matching `__import__`; a plain `import importlib` with no call stays
+  allowed.
+- **G3: an interpreter run directly as the find/fd action verb, or inline in the
+  wrapped shell / one nested layer, rode `read`.** `find -exec perl -e unlink`,
+  `-exec ruby -e File.unlink/delete`, and `-exec python3 -c os.remove/shutil.rmtree`
+  deleted files with no checkpoint; `-exec python3 -c urlopen`, `-exec node -e
+  fetch`, `-exec ruby -rnet/http Net::HTTP.get`, `-exec perl -MLWP::UserAgent get`,
+  wrapped `node -e require("http"/"net")`, `perl -MLWP::Simple get`,
+  `ruby Net::HTTP.get`, and a nested `sh -c 'sh -c "curl …"'` reached the network
+  with no deny or egress scan. The find/fd branch now extracts the inline code from
+  a direct interpreter verb (perl/ruby/python/node) and from the wrapped shell body,
+  applies the shared delete surface and the inline egress API set, peels one nested
+  sh/bash -c layer, and fails closed to `unknown`. A plain `python3 -c print`,
+  `node -e console.log`, a benign `ruby puts`, and a nested `echo` stay allowed.
+- **G4: network capability carried on a load flag or launched through a
+  subprocess shell-out rode `read`.** A direct perl `-MLWP::Simple -e get/getstore`,
+  `-MLWP::UserAgent -e get`, `-MIO::Socket::INET`, a ruby `-ropen-uri open()`, a
+  python `subprocess.run(['curl',…])` / `shell=True`, and a node
+  `child_process.spawn('curl',…)` reached the network with no deny or egress scan,
+  because the module name lived on the `-M`/`-r` flag (outside the extracted code
+  body) or behind a subprocess call. The find/fd branch now inspects the perl
+  `-M`/`-m` and ruby `-r` load flags against a network-module set, recognizes
+  IO::Socket and open-uri in the body, and fails closed on a subprocess list /
+  `shell=True` or child_process spawn/execFile that launches a network command. A
+  local `-Mstrict`/`-rjson` flag and a non-network argv (`subprocess.run(['ls'])`)
+  stay allowed. Three-plus nested `sh -c` layers remain outside the single peel
+  disclosed for G3.
+- **G5/G6: direct-exec launchers inside a find action rode `read`.** A python
+  `os.execv/execvp/execvpe/posix_spawn`, the variadic `os.execl/execle/execlp/
+  execlpe` family, and `os.popen('curl …')`, plus a node
+  `child_process.fork/execSync/spawnSync/execFileSync('curl',…)`, reached the
+  network from a find action even though the plain command path already denied
+  them; the shell-out launcher list only covered `subprocess.*` and the async node
+  spawn/execFile/exec. The find/fd shell-out set now matches the whole `os.exec*`
+  family, `posix_spawn`, and `popen`, together with the node `fork` and `*Sync`
+  launchers, triggered only when the literal first argument / command string names
+  a network program; when nested quotes truncate the extracted code body the whole
+  action falls back to the same shell-out scan. `os.execvp('ls')`,
+  `os.execl('/bin/ls')`, `os.popen('ls')`, and `spawnSync('ls')` stay allowed; a
+  network verb mentioned only in an interpreter comment or string (e.g. a python
+  `-c` note about curl) no longer trips the bare-verb scan, which now applies only
+  to a real `sh`/`bash` wrapper.
+- **G7: `subprocess.getoutput` / `getstatusoutput` rode `read` inside a find
+  action.** Both convenience functions run a shell command string and reached the
+  network from a find action even though the plain command path already denied
+  them; the shell-out list covered `run/Popen/call/check_call/check_output` but not
+  these two. The find/fd shell-out set now also matches `getoutput` /
+  `getstatusoutput`, triggered only when the command string names a network program;
+  `getoutput('ls -la')` stays allowed.
+- **G8: a bare perl `-M`/`-m` or ruby `-r` network module load flag rode
+  `read`/`local_exec` outside a find action.** The module-flag egress check only ran
+  inside the find/fd `-exec` branch, so a direct `perl -MLWP::Simple -e get(...)`,
+  `perl -MIO::Socket::INET`, `perl -M=LWP::UserAgent`, `ruby -ropen-uri`, or
+  `ruby -rsocket` was classified read-only/local and actually reached the network.
+  The load-flag check now also runs on the plain perl (read) and ruby
+  (local_exec) paths; a non-network local flag (`-Mstrict`, `-MDigest::MD5`,
+  `-rdate`) stays allowed.
+- **G8-B1: a zero-argument env flag swallowed the interpreter.** The env wrapper
+  tokenizer treated every short flag as taking an optional argument, so
+  `env -i perl -MLWP::Simple …`, `env -0 …`, clustered `env -iv …`, and the ruby
+  equivalent consumed `perl`/`ruby` as a phantom option argument; the remnant
+  hit the unconditional `env help/flag` allow and the network module egressed.
+  Only argument-taking options (`-u NAME`, `-C DIR`, `--unset`, `--chdir`, …)
+  consume the next token; zero-argument flags (`-i`/`--ignore-environment`,
+  `-0`/`--null`, clusters) strip themselves and recurse into the surviving
+  command, so a benign `env -i ls` / `env -i perl -Mstrict` still stays allowed.
+- **G8-B2: a shell-quoted module token was not parsed.** `perl -M'LWP::Simple'`,
+  `perl -M"LWP::Simple"`, `perl -M='LWP::Simple'`, `ruby -r'socket'`, and
+  `ruby -r"socket"` were allowed because the flag regex's module character
+  class excluded the surrounding quote; the shell strips the quote at execution
+  and the module loads. Module extraction now tolerates and removes an optional
+  enclosing quote pair, on both the plain and find/fd paths; `perl -M'strict'`
+  stays allowed.
+- **G8-B3: an attached value on a value-taking env short letter collapsed to a
+  bare read.** The env tokenizer only recognized separate-argument `-C DIR` /
+  `-u NAME` and pure letter clusters, so the attached forms `env -C/ …`,
+  `env -C// …`, in-cluster `env -iC/ …`, and the ruby `-C/ … -rsocket/
+  -ropen-uri` variant broke out of the strip loop; the residual collapsed to a
+  bare `perl`/`ruby` read/local_exec and physically egressed. An attached value
+  on `C` (chdir) or `u` (unset) — `-C<dir>`, `-u<name>`, `-iC<dir>` — now
+  strips with its value and the surviving command is re-classified; benign
+  `env -C/ perl -Mstrict` and `env -C/ ls` stay allowed.
 
 ### Notes
 - No new deny surface; the default decision is unchanged. Setting
   `requireGitBaseline: false` disables this probe and its forced snapshot too.
 - Backlog (not in this release): large-batch `ls-files` over stdin (ARG_MAX),
-  dangling-symlink strict `unknown`, audit path-form normalization.
+  dangling-symlink strict `unknown`, audit path-form normalization; broader
+  perl/ruby network-library coverage (`HTTP::Tiny`, `Net::FTP`, `LWP::Protocol`,
+  `net/ftp`, `pty.spawn`) that is allowed identically on the
+  plain command path and inside a find action, alongside the asyncio
+  `create_subprocess_exec` / `create_subprocess_shell` helpers, all allowed
+  identically on both paths and to be widened together with the shared
+  scan-scripts language table.
 
 ### Test
-- 333 tests pass / 0 fail; peer matrix 19/19; real-machine APFS drill verified
-  end to end (one forced snapshot on an ignored delete, zero extra snapshot on
-  a tracked delete inside cooldown), independently re-run and rechecked.
+- 501 tests pass / 0 fail; peer matrix 19/19; pack audit clean; real-machine
+  APFS drill verified end to end (one forced snapshot on an ignored delete,
+  zero extra snapshot on a tracked delete inside cooldown), independently
+  re-run and rechecked. B1/B2/B3/B4/B5 covered by fault-injection cases for a
+  failed checkpoint and destructive find/fd/perl/ruby classification (incl.
+  round-3 residuals: perl -E/q()/system/qx/backticks, ruby FileUtils.rm_rf,
+  find -ok/multi-exec, fd -x; round-4 B3 wrappers: find -exec sh/bash -c 'rm',
+  ruby Dir.delete/Kernel.system/-ne, perl exec; round-5 B4: /bin/sh, env
+  /bin/sh, "$SHELL", /usr/bin/env bash, dash/zsh/tcsh, and FileUtils
+  narrowing; round-6 B5: inner find -delete, inner python3 -c os.remove,
+  env -i shell, backtick-substituted shell, and the system trailing-quote
+  false-positive control; round-7 B6: env NAME=value/PATH assignments, fd -x
+  env, and read-only $(basename)/$(wc -l)/inner print benign controls;
+  round-8 B7: inner node -e/--eval rmSync, inner ruby FileUtils.rm_rf, and the
+  list .remove()/"remove" string benign controls; round-9 B8: perl File::Path
+  remove_tree direct and find-exec body; round-10 B9: ruby FileUtils.remove_dir
+  and remove_entry_secure direct/find body under the shared delete surface, with
+  word-boundary controls for remove_dir/remove_entry substring identifiers;
+  G1: find/fd wrapped and direct curl/wget/pip-install/git-remote fail closed
+  with benign listing/`sh -c echo`/wrapped `git log`/grep controls; G2: all
+  four importlib forms fail unverifiable with a plain `import importlib`
+  control; G3: direct-interpreter-verb inline delete/egress (perl unlink, ruby
+  File.unlink/delete, python os.remove/rmtree/urlopen, node fetch, ruby
+  Net::HTTP, perl LWP), wrapped require(http/net)/LWP::Simple/Net::HTTP, and a
+  nested sh/bash -c layer fail closed, with benign print/console.log/puts/echo
+  controls; G4: perl -MLWP::Simple/UserAgent and -MIO::Socket::INET load flags,
+  ruby -ropen-uri, python subprocess list/shell=True, and node child_process
+  spawn/execFile launchers fail closed, with benign -Mstrict/-rjson and
+  subprocess(['ls'])/spawn('ls') controls; G5/G6: the whole python os.exec* family,
+  posix_spawn, popen (incl. inner-double-quote form), and node fork/execSync/
+  spawnSync/execFileSync network launchers fail closed, with benign
+  os.execvp('ls')/execl('/bin/ls')/popen('ls')/spawnSync('ls') controls; G7:
+  subprocess.getoutput/getstatusoutput network command strings fail closed, with a
+  benign getoutput('ls -la') control; G8: bare perl -MLWP::Simple, -MIO::Socket::INET,
+  -M=LWP::UserAgent and ruby -ropen-uri/-rsocket fail closed as network, with benign
+  -Mstrict/-MDigest::MD5/-rdate controls; G8-B1: env -i/-0/-iv/--ignore-environment
+  and env -u/-C network module loads fail closed, with benign env -i ls /
+  env -i perl -Mstrict controls; G8-B2: quoted perl -M'LWP::Simple'/-M"LWP::Simple"/
+  -M='LWP::Simple' and ruby -r'socket'/ -r"socket" fail closed on both plain and
+  find paths, with benign perl -M'strict' control; G8-B3: attached env chdir/
+  unset values env -C/, env -C//, env -iC/, env -C/tmp, env -C/ ruby -rsocket/
+  -ropen-uri fail closed as network, with benign env -C/ perl -Mstrict and
+  env -C/ ls controls).
+- Isolated real-host process smoke (separate profile/port/cwd, production host
+  untouched): read-only allowed, recoverable-write checkpointed+allowed, and a
+  sensitive read force-blocked inside the harness; independently re-reviewed
+  (PASS, no blockers). The network/system deny branches share the same
+  `decide()`/short-circuit and are covered by unit tests plus the isolated
+  delete/restore drill; a live network/system block sample is deferred to a
+  future isolated turn.
 
 ## [0.2.7] - 2026-10-14
 

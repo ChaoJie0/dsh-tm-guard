@@ -345,16 +345,21 @@ export function renderStatusReport(input: StatusInput): string {
   )
 
   /* --- 4. Recent decisions ---------------------------------------- */
-  // ignored-file recovery: total git-unrecoverable (ignored) targets across
-  // the recent window. Optional field — old records contribute 0.
+  // git recovery: total targets git cannot restore (ignored 'no' or special-
+  // layout 'unrecoverable') across the recent window. Optional field — old
+  // records contribute 0.
   const recentNoCount = input.recentDecisions.reduce(
-    (n, r) => n + (r.gitRecovery?.filter((g) => g.state === 'no').length ?? 0),
+    (n, r) =>
+      n +
+      (r.gitRecovery?.filter(
+        (g) => g.state === 'no' || g.state === 'unrecoverable',
+      ).length ?? 0),
     0,
   )
   out.push('', `【Recent】 last ${RECENT_STATUS_ITEMS} audit decision(s), newest first:`)
   if (recentNoCount > 0) {
     out.push(
-      `  git-unrecoverable (ignored) targets in recent window: ${recentNoCount} (marked git=no in tm_audit)`,
+      `  git-unrecoverable targets in recent window: ${recentNoCount} (marked git=no / git=unsafe in tm_audit)`,
     )
   }
   if (input.recentDecisions.length === 0) {
@@ -363,8 +368,11 @@ export function renderStatusReport(input: StatusInput): string {
     for (const r of input.recentDecisions) {
       const verdict = r.decision === 'deny' ? 'DENY' : 'ALLOW'
       const noCount = r.gitRecovery?.filter((g) => g.state === 'no').length ?? 0
+      const unsafeCount =
+        r.gitRecovery?.filter((g) => g.state === 'unrecoverable').length ?? 0
       const gitNo = noCount > 0 ? ` git=no(${noCount})` : ''
-      out.push(`  ${r.ts}  ${verdict.padEnd(5)} [${r.category}] ${r.tool}${gitNo}`)
+      const gitUnsafe = unsafeCount > 0 ? ` git=unsafe(${unsafeCount})` : ''
+      out.push(`  ${r.ts}  ${verdict.padEnd(5)} [${r.category}] ${r.tool}${gitNo}${gitUnsafe}`)
     }
   }
 

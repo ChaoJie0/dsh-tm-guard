@@ -7,7 +7,7 @@
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync, readFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync, readFileSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -101,6 +101,84 @@ test('recovery: mixed batch tracked+ignored+untracked parsed from stdout sets (S
   // remaining set excludes the tracked short-circuit member
   assert.ok(lsStdin?.includes('.env.local'))
   assert.ok(!lsStdin?.includes('tracked.txt'))
+})
+
+/** Build one `ls-files -v --stage -z` record: `flag mode hash stage\trel\0`. */
+function stageRec(flag: string, mode: string, rel: string, hash = 'aaaaaaaa'): string {
+  return `${flag} ${mode} ${hash} 0\t${rel}` + NUL
+}
+
+test('recovery: skip-worktree entry -> unrecoverable (skip-worktree), not yes', async () => {
+  fakeToplevel()
+  __setGitProbeOverride(async (args: string[]) => {
+    if (args[0] === 'ls-files') return { stdout: stageRec('S', '100644', 'f.txt'), code: 0 }
+    return { stdout: '', code: 1 }
+  })
+  const r = await probeGitRecovery([join(TOP, 'f.txt')])
+  assert.equal(r[0].state, 'unrecoverable')
+  assert.equal(r[0].unrecoverableReason, 'skip-worktree')
+})
+
+test('recovery: assume-unchanged (h) entry still restores -> yes, not unrecoverable', async () => {
+  fakeToplevel()
+  __setGitProbeOverride(async (args: string[]) => {
+    if (args[0] === 'ls-files') return { stdout: stageRec('h', '100644', 'f.txt'), code: 0 }
+    return { stdout: '', code: 1 }
+  })
+  const r = await probeGitRecovery([join(TOP, 'f.txt')])
+  assert.equal(r[0].state, 'yes')
+  assert.equal(r[0].unrecoverableReason, undefined)
+})
+
+test('recovery: gitlink (160000) -> unrecoverable (gitlink), not yes', async () => {
+  fakeToplevel()
+  __setGitProbeOverride(async (args: string[]) => {
+    if (args[0] === 'ls-files') return { stdout: stageRec('H', '160000', 'vendor/sub'), code: 0 }
+    return { stdout: '', code: 1 }
+  })
+  const r = await probeGitRecovery([join(TOP, 'vendor/sub')])
+  assert.equal(r[0].state, 'unrecoverable')
+  assert.equal(r[0].unrecoverableReason, 'gitlink')
+})
+
+test('recovery: symlink (120000) -> unrecoverable (symlink), not yes', async () => {
+  fakeToplevel()
+  __setGitProbeOverride(async (args: string[]) => {
+    if (args[0] === 'ls-files') return { stdout: stageRec('H', '120000', 'link.txt'), code: 0 }
+    return { stdout: '', code: 1 }
+  })
+  const r = await probeGitRecovery([join(TOP, 'link.txt')])
+  assert.equal(r[0].state, 'unrecoverable')
+  assert.equal(r[0].unrecoverableReason, 'symlink')
+})
+
+test('recovery: normal tracked H/100644 -> yes', async () => {
+  fakeToplevel()
+  __setGitProbeOverride(async (args: string[]) => {
+    if (args[0] === 'ls-files') return { stdout: stageRec('H', '100644', 'tracked.txt'), code: 0 }
+    return { stdout: '', code: 1 }
+  })
+  const r = await probeGitRecovery([join(TOP, 'tracked.txt')])
+  assert.equal(r[0].state, 'yes')
+  assert.equal(r[0].unrecoverableReason, undefined)
+})
+
+test('recovery: mixed batch flags bad layouts unrecoverable while normal stays yes', async () => {
+  fakeToplevel()
+  __setGitProbeOverride(async (args: string[]) => {
+    if (args[0] === 'ls-files') {
+      return {
+        stdout: stageRec('H', '100644', 'plain.txt') + stageRec('S', '100644', 'skip.txt'),
+        code: 0,
+      }
+    }
+    return { stdout: '', code: 1 }
+  })
+  const r = await probeGitRecovery([join(TOP, 'plain.txt'), join(TOP, 'skip.txt')])
+  assert.deepEqual(
+    r.map((p) => [p.state, p.unrecoverableReason]),
+    [['yes', undefined], ['unrecoverable', 'skip-worktree']],
+  )
 })
 
 test('recovery: check-ignore exit 1 (not ignored) vs 128 (fatal) are not conflated', async () => {
@@ -210,6 +288,31 @@ test('recovery: backfill fatal 128 on provisional target -> unknown, never yes',
   assert.equal(out[0].state, 'unknown')
 })
 
+test('recovery: backfill staged symlink (120000) -> unrecoverable (symlink), not yes', async () => {
+  fakeToplevel()
+  __setGitProbeOverride(async (args: string[]) => {
+    if (args[0] === 'ls-files') {
+      return { stdout: stageRec('H', '120000', 'link.txt'), code: 0 }
+    }
+    return { stdout: '', code: 1 }
+  })
+  const out = await backfillGitRecovery([
+    { path: join(TOP, 'link.txt'), state: 'untracked' as const },
+  ])
+  assert.equal(out[0].state, 'unrecoverable')
+  assert.equal(out[0].unrecoverableReason, 'symlink')
+})
+
+test('recovery: backfill carries through a pre-checkpoint unrecoverable reason', async () => {
+  fakeToplevel()
+  __setGitProbeOverride(async () => ({ stdout: '', code: 128 }))
+  const out = await backfillGitRecovery([
+    { path: join(TOP, 'skip.txt'), state: 'unrecoverable', unrecoverableReason: 'skip-worktree' },
+  ])
+  assert.equal(out[0].state, 'unrecoverable')
+  assert.equal(out[0].unrecoverableReason, 'skip-worktree')
+})
+
 test('recovery: two toplevels bucketed separately, inner ignore rules win (S3)', async () => {
   const OUTER = '/private/tmp/ifr-outer'
   const INNER = join(OUTER, 'inner')
@@ -310,6 +413,60 @@ test('recovery: real git — nested repo uses its own ignore rules', async () =>
     assert.deepEqual(r.map((p) => p.state), ['no', 'yes', 'no'])
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('recovery: real git — skip/gitlink/symlink unrecoverable; assume-unchanged still yes', async () => {
+  __setGitOverride(null)
+  __setGitProbeOverride(null)
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'ifr-layout-')))
+  try {
+    execFileSync('git', ['init', '-q'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 't@t'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 't'], { cwd: dir })
+    writeFileSync(join(dir, 'plain.txt'), 'plain')
+    writeFileSync(join(dir, 'skip.txt'), 'skip')
+    writeFileSync(join(dir, 'assume.txt'), 'assume')
+    execFileSync('git', ['add', 'plain.txt', 'skip.txt', 'assume.txt'], { cwd: dir })
+    execFileSync('git', ['commit', '-qm', 'base'], { cwd: dir })
+    execFileSync('git', ['update-index', '--skip-worktree', 'skip.txt'], { cwd: dir })
+    execFileSync('git', ['update-index', '--assume-unchanged', 'assume.txt'], { cwd: dir })
+    const outside = join(dir, '..', `ifr-outside-${process.pid}`)
+    writeFileSync(outside, 'external-bytes')
+    symlinkSync(outside, join(dir, 'link.txt'))
+    execFileSync('git', ['add', 'link.txt'], { cwd: dir })
+    const sub = join(dir, 'sub')
+    mkdirSync(sub)
+    writeFileSync(join(sub, 'inner.txt'), 'inner')
+    execFileSync('git', ['init', '-q'], { cwd: sub })
+    execFileSync('git', ['config', 'user.email', 't@t'], { cwd: sub })
+    execFileSync('git', ['config', 'user.name', 't'], { cwd: sub })
+    execFileSync('git', ['add', 'inner.txt'], { cwd: sub })
+    execFileSync('git', ['commit', '-qm', 'inner'], { cwd: sub })
+    execFileSync('git', ['add', 'sub'], { cwd: dir })
+    execFileSync('git', ['commit', '-qm', 'layouts'], { cwd: dir })
+
+    const r = await probeGitRecovery([
+      join(dir, 'plain.txt'),
+      join(dir, 'skip.txt'),
+      join(dir, 'assume.txt'),
+      join(dir, 'link.txt'),
+      join(dir, 'sub'),
+    ])
+    const byName = Object.fromEntries(
+      r.map((p) => [p.path.split('/').pop() ?? p.path, p]),
+    )
+    assert.equal(byName['plain.txt'].state, 'yes')
+    assert.equal(byName['skip.txt'].state, 'unrecoverable')
+    assert.equal(byName['skip.txt'].unrecoverableReason, 'skip-worktree')
+    assert.equal(byName['assume.txt'].state, 'yes')
+    assert.equal(byName['assume.txt'].unrecoverableReason, undefined)
+    assert.equal(byName['link.txt'].state, 'unrecoverable')
+    assert.equal(byName['link.txt'].unrecoverableReason, 'symlink')
+    assert.equal(byName['sub'].state, 'unrecoverable')
+    assert.equal(byName['sub'].unrecoverableReason, 'gitlink')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 

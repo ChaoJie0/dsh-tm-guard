@@ -68,6 +68,13 @@ await expectClean(`python3 ${dir}/loopback_py.py`, 'python loopback request NOT 
 // --- dynamic execution -------------------------------------------
 await expectUnverifiable(`python3 ${dir}/dyn_py.py`, 'python exec() unverifiable')
 
+// G2: importlib.import_module is the __import__ equivalent; cannot prove
+// the target module/side effects innocent, so fail closed as unverifiable.
+await expectUnverifiable(`python3 -c "import importlib;importlib.import_module('os').remove('/x')"`, 'G2 importlib.import_module remove unverifiable')
+await expectUnverifiable(`python3 -c "import importlib as m;m.import_module('shutil').rmtree('/d')"`, 'G2 aliased importlib rmtree unverifiable')
+await expectUnverifiable(`python3 -c "from importlib import import_module;import_module('os').remove('/x')"`, 'G2 from importlib import import_module unverifiable')
+await expectUnverifiable(`python3 -c "import importlib;importlib.import_module('urllib.request').urlopen('http://x')"`, 'G2 importlib urlopen unverifiable')
+
 // --- chaining / cd -------------------------------------------------
 await expectHit(`cd ${dir} && python3 evil_py.py`, 'relative path after cd resolves')
 await expectHit(`cd ${dir} && python3 evil_py.py && echo done`, 'chain: smuggler segment flagged')

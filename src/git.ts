@@ -200,16 +200,25 @@ export async function ensureGitBaseline(dir: string): Promise<BaselineResult> {
  * No-op when the tree is already clean (avoids empty checkpoint commits).
  * Uses the same ad-hoc committer identity as ensureGitBaseline.
  */
-export async function commitCheckpoint(root: string, label: string): Promise<void> {
+/** Outcome of a pre-write checkpoint. ok=false means the pending bytes were
+ *  NOT proven to be in the object store, so the caller must not vouch for a
+ *  git `yes` and should force a fresh Time Machine snapshot instead. */
+export interface CheckpointResult {
+  ok: boolean
+  reason?: string
+}
+
+export async function commitCheckpoint(root: string, label: string): Promise<CheckpointResult> {
   // Only commit if there is something to commit (tracked changes, staged,
   // or new files that aren't gitignored).
   let status: string
   try {
     status = await git(['status', '--porcelain'], root)
-  } catch {
-    return
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    return { ok: false, reason: `status: ${reason}` }
   }
-  if (!status.trim()) return // clean tree — nothing to checkpoint
+  if (!status.trim()) return { ok: true, reason: 'clean' } // nothing to checkpoint
 
   try {
     await git(['add', '-A'], root)
@@ -223,9 +232,13 @@ export async function commitCheckpoint(root: string, label: string): Promise<voi
       ],
       root,
     )
-  } catch {
-    // Best-effort: if the commit fails (e.g. pre-commit hook, locked index),
-    // fall through — the baseline layer still exists, just at an older point.
+    return { ok: true }
+  } catch (err) {
+    // Best-effort: the add/commit failed (locked index, read-only .git, disk
+    // full, rejecting hook). Report the failure instead of swallowing it so
+    // the caller does not keep a false `yes` and skips a fresh snapshot.
+    const reason = err instanceof Error ? err.message : String(err)
+    return { ok: false, reason }
   }
 }
 /* ------------------------------------------------------------------ */
@@ -241,28 +254,42 @@ export async function commitCheckpoint(root: string, label: string): Promise<voi
  *              never stages it)
  *  - unknown : probe error / git unavailable / checkpoint outcome unproven
  */
-export type GitRecoveryState = 'yes' | 'no' | 'unknown'
+export type GitRecoveryState = 'yes' | 'no' | 'unknown' | 'unrecoverable'
 
 /** Pre-checkpoint provisional classification (never audited verbatim). */
 export type GitRecoveryProbeState = GitRecoveryState | 'untracked'
+
+/** Why a tracked entry is NOT restorable by a standard offline git command. */
+export type GitUnrecoverableReason =
+  | 'skip-worktree'
+  | 'gitlink'
+  | 'symlink'
 
 export interface GitRecoveryProbe {
   /** Absolute, normalized target path. */
   path: string
   /**
    * provisional state before the checkpoint settles:
-   *   yes       — tracked (confirmed)
-   *   no        — ignored (confirmed)
-   *   untracked — neither matched; resolved by the post-checkpoint backfill
-   *   unknown   — fatal probe error / target outside every work tree
+   *   yes           — tracked and restorable by a standard offline git command
+   *   no            — ignored (confirmed)
+   *   untracked     — neither matched; resolved by the post-checkpoint backfill
+   *   unrecoverable — tracked but skip-worktree/sparse-excluded, gitlink, or
+   *                   symlink-to-outside; plain restore/checkout/reset cannot
+   *                   restore it, rely on TM. (assume-unchanged still restores,
+   *                   so it is NOT flagged.)
+   *   unknown       — fatal probe error / target outside every work tree
    */
   state: GitRecoveryProbeState
+  /** Present only when state is 'unrecoverable'. */
+  unrecoverableReason?: GitUnrecoverableReason
 }
 
 /** Final per-target shape written to AuditRecord.gitRecovery. */
 export interface GitRecoveryTarget {
   path: string
   state: GitRecoveryState
+  /** Present only when state is 'unrecoverable'. */
+  unrecoverableReason?: GitUnrecoverableReason
 }
 
 /** Structured git probe outcome: stdout plus the process exit signal. */
@@ -391,20 +418,51 @@ function canonicalizeForToplevel(absPath: string, toplevel: string): string {
 }
 
 /**
- * Parse the tracked set from `ls-files --error-unmatch -z` stdout.
+ * Parse tracked entries from `ls-files -v --stage -z --error-unmatch` stdout.
  *
  * Load-bearing (S1): the batch exits 1 whenever ANY pathspec is untracked
  * while still echoing the matched tracked paths, NUL-separated and repo-
  * relative (even when the input pathspec was absolute). The tracked set is
- * derived ONLY from echoed paths joined back to the toplevel — never from the
- * exit code.
+ * derived ONLY from echoed records joined back to the toplevel — never from
+ * the exit code.
+ *
+ * Each `--v --stage` record is `flag mode hash stage\tpath\0`. A plain
+ * (no-tab) record is tolerated for callers/tests that echo bare paths and
+ * is treated as a normal restorable file. Entries carrying the skip-worktree
+ * 'S' bit, a gitlink (160000), or a symlink (120000) are NOT restorable by a
+ * standard offline restore/checkout/reset and are returned separately. The
+ * assume-unchanged 'h' bit still restores, so it stays in the normal set.
  */
-function parseTrackedEcho(stdout: string, toplevel: string): Set<string> {
-  const out = new Set<string>()
+function parseStageEcho(
+  stdout: string,
+  toplevel: string,
+): { ok: Set<string>; bad: Map<string, GitUnrecoverableReason> } {
+  const ok = new Set<string>()
+  const bad = new Map<string, GitUnrecoverableReason>()
   for (const part of stdout.split('\0')) {
-    if (part) out.add(resolve(toplevel, part))
+    if (!part) continue
+    const tab = part.indexOf('\t')
+    if (tab === -1) {
+      // Bare relative path (legacy/mock output): a normal restorable entry.
+      ok.add(resolve(toplevel, part))
+      continue
+    }
+    const meta = part.slice(0, tab).trim().split(/\s+/)
+    const rel = part.slice(tab + 1)
+    const abs = resolve(toplevel, rel)
+    const flag = meta[0]?.[0] ?? ''
+    const mode = meta[1] ?? ''
+    let reason: GitUnrecoverableReason | null = null
+    // 'S' = skip-worktree or sparse-excluded: checkout/restore/reset do not
+    // write the file back after deletion. 'h' (assume-unchanged) still restores
+    // via checkout/reset, so it is intentionally left as a normal ok entry.
+    if (flag === 'S') reason = 'skip-worktree'
+    else if (mode === '160000') reason = 'gitlink'
+    else if (mode === '120000') reason = 'symlink'
+    if (reason) bad.set(abs, reason)
+    else ok.add(abs)
   }
-  return out
+  return { ok, bad }
 }
 
 /**
@@ -485,25 +543,36 @@ export async function probeGitRecovery(paths: string[]): Promise<GitRecoveryProb
     else buckets.set(top, [canonical])
   }
   const stateByCanonical = new Map<string, GitRecoveryProbeState>()
-  const setCanonical = (c: string, s: GitRecoveryProbeState): void => {
-    if (!stateByCanonical.has(c)) stateByCanonical.set(c, s)
+  const reasonByCanonical = new Map<string, GitUnrecoverableReason>()
+  const setCanonical = (
+    c: string,
+    s: GitRecoveryProbeState,
+    reason?: GitUnrecoverableReason,
+  ): void => {
+    if (!stateByCanonical.has(c)) {
+      stateByCanonical.set(c, s)
+      if (reason) reasonByCanonical.set(c, reason)
+    }
   }
 
   for (const [toplevel, targets] of buckets) {
     // --- Stage 1: batched tracked probe (short-circuit) ---------------
     const rel = targets.map((p) => relative(toplevel, p))
     const ls = await gitProbe(
-      ['ls-files', '--error-unmatch', '-z', '--', ...rel],
+      ['ls-files', '-v', '--stage', '-z', '--error-unmatch', '--', ...rel],
       toplevel,
       null,
     )
     if (ls.code === 0 || ls.code === 1) {
       // 0: all tracked; 1: ≥1 untracked. Either way stdout echoes exactly
-      // the tracked members — parse stdout, never the exit code.
-      const tracked = parseTrackedEcho(ls.stdout, toplevel)
+      // the tracked members — parse stdout, never the exit code. Entries
+      // carrying the skip-worktree 'S' bit, gitlink, or symlink are tracked but
+      // not restorable by a standard offline command -> unrecoverable, not yes.
+      const { ok: tracked, bad } = parseStageEcho(ls.stdout, toplevel)
       const remaining: string[] = []
       for (const c of targets) {
         if (tracked.has(c)) setCanonical(c, 'yes') // never check-ignored
+        else if (bad.has(c)) setCanonical(c, 'unrecoverable', bad.get(c))
         else remaining.push(c)
       }
       if (remaining.length === 0) continue
@@ -532,10 +601,14 @@ export async function probeGitRecovery(paths: string[]): Promise<GitRecoveryProb
     }
   }
 
-  return absPaths.map((p) => ({
-    path: p,
-    state: stateByCanonical.get(canonicalOf.get(p) ?? p) ?? states.get(p) ?? 'unknown',
-  }))
+  return absPaths.map((p) => {
+    const canonical = canonicalOf.get(p) ?? p
+    const state = stateByCanonical.get(canonical) ?? states.get(p) ?? 'unknown'
+    const reason = reasonByCanonical.get(canonical)
+    const out: GitRecoveryProbe = { path: p, state }
+    if (reason) out.unrecoverableReason = reason
+    return out
+  })
 }
 
 /**
@@ -554,6 +627,7 @@ export async function backfillGitRecovery(
 ): Promise<GitRecoveryTarget[]> {
   const provisional = probes.filter((p) => p.state === 'untracked')
   const committed = new Set<string>()
+  const badCommitted = new Map<string, GitUnrecoverableReason>()
 
   const dirs = [...new Set(provisional.map((p) => dirnameOf(p.path)))]
   const topByDir = new Map<string, string | null>()
@@ -580,14 +654,15 @@ export async function backfillGitRecovery(
   for (const [toplevel, targets] of buckets) {
     const rel = targets.map((c) => relative(toplevel, c))
     const ls = await gitProbe(
-      ['ls-files', '--error-unmatch', '-z', '--', ...rel],
+      ['ls-files', '-v', '--stage', '-z', '--error-unmatch', '--', ...rel],
       toplevel,
       null,
     )
     if (ls.code === 0 || ls.code === 1) {
-      const tracked = parseTrackedEcho(ls.stdout, toplevel)
+      const { ok: tracked, bad } = parseStageEcho(ls.stdout, toplevel)
       for (const c of targets) {
         if (tracked.has(c)) committed.add(c)
+        else if (bad.has(c)) badCommitted.set(c, bad.get(c)!)
         else unknownCanonical.add(c) // checkpoint did not stage/commit it
       }
     } else {
@@ -598,8 +673,14 @@ export async function backfillGitRecovery(
   return probes.map((p) => {
     if (p.state === 'untracked') {
       const key = canonicalOf.get(p.path) ?? p.path
-      return { path: p.path, state: committed.has(key) ? 'yes' : 'unknown' }
+      if (committed.has(key)) return { path: p.path, state: 'yes' }
+      if (badCommitted.has(key)) {
+        return { path: p.path, state: 'unrecoverable', unrecoverableReason: badCommitted.get(key) }
+      }
+      return { path: p.path, state: 'unknown' }
     }
-    return { path: p.path, state: p.state }
+    const out: GitRecoveryTarget = { path: p.path, state: p.state }
+    if (p.unrecoverableReason) out.unrecoverableReason = p.unrecoverableReason
+    return out
   })
 }
