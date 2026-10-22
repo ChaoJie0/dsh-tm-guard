@@ -38,8 +38,12 @@
     "verify:peer": "node scripts/verify-peer-matrix.mjs",
     "verify:build": "node scripts/verify-reproducible-build.mjs",
     "verify:pack": "node scripts/verify-pack-audit.mjs",
-    "verify:fast": "npm run test && npm run verify:peer && npm run verify:build && npm run verify:pack",
-    "release:check": "npm run verify:fast"
+    "verify:hygiene": "node scripts/verify-hygiene.mjs",
+    "verify:fast": "npm run test && npm run verify:peer && npm run verify:build && npm run verify:pack && npm run verify:hygiene",
+    "release:check": "npm run verify:fast",
+    "release:gate": "node scripts/release-gate.mjs",
+    "release:decision": "node scripts/release-decision.mjs",
+    "l4": "bash scripts/l4-isolated-smoke.sh"
   },
   "files": [
     "lib",
