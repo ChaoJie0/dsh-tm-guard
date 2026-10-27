@@ -4,6 +4,32 @@ All notable changes to dsh-tm-guard will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-10-27
+
+### Fixed
+- **Fresh-workspace one-shot mkdir+write no longer blocked.** A command such
+  as `mkdir -p fresh && echo hi > fresh/f.txt` inside a brand-new (no git)
+  workspace is decided before `mkdir` runs, so the target directory does not
+  exist yet. The gate previously called `git init` with the missing directory
+  as cwd, hit ENOENT and fail-closed denied the whole command. The git
+  baseline is now anchored at the nearest existing ancestor directory when the
+  target's parent is absent; the command then runs and the files fall under
+  the anchor's work tree, so they remain rollback-able. No directory is
+  pre-created by the fallback.
+- **Concurrent baseline init no longer races on `.git/index.lock`.** The gate
+  runs one check per write target in parallel; after the nearest-ancestor
+  fallback, several targets of the same command can anchor on the same
+  directory. Concurrent `git init` + commit previously raced on the index lock
+  and one randomly failed, which could deny an otherwise-safe command.
+  `ensureGitBaseline` now deduplicates in-flight initialization per directory,
+  so concurrent callers share a single init/commit.
+
+### Security (unchanged boundaries)
+- The ancestor fallback happens only after the canonical inside-workspace
+  check passes; targets outside the session cwd, `/`, home and system roots
+  are still denied, and auto-init is never performed on them. `temp` writes
+  still take their existing branch.
+
 ## [0.2.9] - 2026-10-26
 
 ### Security
