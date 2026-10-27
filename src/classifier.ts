@@ -505,6 +505,7 @@ function hasSinkInClause(clause: string): boolean {
       // A positional argument is tolerated (bash allows one) — keep scanning
       // for a later -c instead of bailing, so `-exop pipefail -c …` and
       // `+eo pipefail -c …` still reach the recursion.
+      const shellName = (t.split('/').pop() ?? t).toLowerCase()
       let j = i + 1
       let posArgs = 0
       while (j < tokens.length) {
@@ -538,18 +539,33 @@ function hasSinkInClause(clause: string): boolean {
             if (ch === 'c') {
               // bash/zsh ignore remaining flags after 'c' in the cluster and
               // take the NEXT argv token as the command string. Fail-closed
-              // inversion (review-029-f2h): a whitelist per shell is
-              // unbounded (bash needs -I, zsh accepts a far wider set), so
-              // only characters every shell definitively rejects
-              // (non-alphabetic) mark the cluster as never executing; any
-              // alphabetic flag recurses into the next argv token. Rejected
-              // clusters (-cz, -c1) are at worst a safe over-denial.
+              // by shell (review-029-f2h/f2i): a whitelist per shell is
+              // unbounded, so only characters the shell definitively rejects
+              // mark the cluster as never executing. bash/sh/dash accept
+              // alphabetic flags only; zsh additionally accepts digits and a
+              // single trailing '-'. Rejected clusters are at worst a safe
+              // over-denial.
               const rest = body.slice(p + 1)
-              for (const rc of rest) {
-                if (!(rc >= 'a' && rc <= 'z') && !(rc >= 'A' && rc <= 'Z')) {
-                  return false
+              let legal = true
+              if (shellName === 'zsh') {
+                for (let r = 0; r < rest.length; r++) {
+                  const rc = rest[r]
+                  const alpha = (rc >= 'a' && rc <= 'z') || (rc >= 'A' && rc <= 'Z')
+                  const digit = rc >= '0' && rc <= '9'
+                  if (alpha || digit) continue
+                  if (rc === '-' && r === rest.length - 1) continue
+                  legal = false
+                  break
+                }
+              } else {
+                for (const rc of rest) {
+                  if (!(rc >= 'a' && rc <= 'z') && !(rc >= 'A' && rc <= 'Z')) {
+                    legal = false
+                    break
+                  }
                 }
               }
+              if (!legal) return false
               const inner = tokens.slice(j + 1).join(' ')
               if (hasArchiveExecSink(inner)) return true
               return false

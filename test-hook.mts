@@ -424,6 +424,26 @@ check('bash zsh -cZ "tar -I sh -xf a" (zsh wide charset, deny)',
   { name: 'bash', arguments: { command: 'zsh -cZ "tar -I sh -xf a"', description: 'zsh -cZ tar sink' } },
   { allow: false, category: 'local_exec' })
 
+check('bash zsh -c9 "tar -I sh -xf a" (zsh digit, deny)',
+  { name: 'bash', arguments: { command: 'zsh -c9 "tar -I sh -xf a"', description: 'zsh -c9 tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash zsh -c- "tar -I sh -xf a" (zsh trailing dash, deny)',
+  { name: 'bash', arguments: { command: 'zsh -c- "tar -I sh -xf a"', description: 'zsh -c- tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash zsh -c9x "tar -I sh -xf a" (zsh digit + letter, deny)',
+  { name: 'bash', arguments: { command: 'zsh -c9x "tar -I sh -xf a"', description: 'zsh -c9x tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash zsh -c-9 "tar -I sh -xf a" (zsh rejected shape, allow)',
+  { name: 'bash', arguments: { command: 'zsh -c-9 "tar -I sh -xf a"', description: 'zsh -c-9 never executes' } },
+  { allow: true, category: 'local_exec' })
+
+check('bash bash -c9 "tar -I sh -xf a" (bash digit never executes, allow)',
+  { name: 'bash', arguments: { command: 'bash -c9 "tar -I sh -xf a"', description: 'bash -c9 never executes' } },
+  { allow: true, category: 'local_exec' })
+
 // Read-only archive operations are classified read and must stay allowed
 // even in an unprotected cwd.
 check('bash tar -tf (listing, allow)',
