@@ -35,6 +35,19 @@ All notable changes to dsh-tm-guard will be documented in this file.
   (`/System`, `/Library`, `/usr`, `/opt`, `/private`, `/home`, ...) and their
   subpaths are blocked by prefix match, and `/private/tmp`, `/private/var`,
   `/private/etc` (macOS rootless links) are covered.
+- **Archive exec-sink denials (bytes → interpreter).** Archive commands whose
+  options hand archive bytes to an interpreter are force-denied in every
+  workspace (fail-closed): `tar --to-command`, `--checkpoint-action=...exec`,
+  `--rmt-command` / `--rsh-command`, `-I` / `--use-compress-program` with a
+  non-whitelisted compressor, and `cpio -r` (rename) forms. Detection also
+  recurses into shell wrappers (`bash -c 'tar ...'` / `sh -c`), option-cluster
+  forms (`bash -exop pipefail -c ...`, getopts clusters), env-prefixed
+  commands, and quote/escape-obfuscated option names, with per-shell
+  validation of the `-c` remainder (bash/sh/dash letters; zsh also digits and
+  a trailing `-`); unsupported shells fail closed. This closes the RCE path
+  where an untrusted archive could execute a command on extract. Read-only
+  archive listing ops (`tar -t/-O`, `unzip -l/-p/-Z`, `7z l/i`, `rsync -n`)
+  remain allowed.
 
 ### Added
 - **Zero-config new workspaces.** The first write inside a session's working
