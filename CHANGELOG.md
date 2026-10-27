@@ -23,12 +23,26 @@ All notable changes to dsh-tm-guard will be documented in this file.
   and one randomly failed, which could deny an otherwise-safe command.
   `ensureGitBaseline` now deduplicates in-flight initialization per directory,
   so concurrent callers share a single init/commit.
+- **Symlink escape through a missing component is now closed (O1).** A
+  symlink ancestor pointing outside the workspace, followed by one or more
+  not-yet-existing components (`elink -> /outside`, then `echo > elink/newdir/f.txt`),
+  previously fell back to the lexical path in `canonicalTarget` and was judged
+  inside the workspace; with the ancestor fallback above it could be allowed,
+  and the baseline init followed the link and created a `.git` in the external
+  real directory. The parent now resolves to its nearest existing ancestor's
+  REAL location before the missing suffix is re-appended (dangling links
+  followed through their chain), so such targets are denied; `isAutoInitSafe`
+  additionally refuses any anchor whose realpath escapes the session cwd, so a
+  baseline can never be created outside the workspace.
 
 ### Security (unchanged boundaries)
 - The ancestor fallback happens only after the canonical inside-workspace
   check passes; targets outside the session cwd, `/`, home and system roots
   are still denied, and auto-init is never performed on them. `temp` writes
-  still take their existing branch.
+  still take their existing branch. Symlink ancestors that resolve outside
+  the workspace are now canonicalised to their real location before the
+  inside-workspace check, so the boundary also holds for links followed by
+  not-yet-existing path components (O1).
 
 ## [0.2.9] - 2026-10-26
 
