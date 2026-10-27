@@ -412,9 +412,17 @@ check('bash sh -cx "tar -I sh -xf a" (sh -cx, deny)',
   { name: 'bash', arguments: { command: 'sh -cx "tar -I sh -xf a"', description: 'sh -cx tar sink' } },
   { allow: false, category: 'local_exec' })
 
-check('bash bash -cz "tar -I sh -xf a" (c then illegal char, allow)',
-  { name: 'bash', arguments: { command: 'bash -cz "tar -I sh -xf a"', description: '-cz never executes' } },
+check('bash bash -c1 "tar -I sh -xf a" (c then digit, allow)',
+  { name: 'bash', arguments: { command: 'bash -c1 "tar -I sh -xf a"', description: '-c1 never executes' } },
   { allow: true, category: 'local_exec' })
+
+check('bash bash -cI "tar -I sh -xf a" (c then I, deny)',
+  { name: 'bash', arguments: { command: 'bash -cI "tar -I sh -xf a"', description: '-cI tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash zsh -cZ "tar -I sh -xf a" (zsh wide charset, deny)',
+  { name: 'bash', arguments: { command: 'zsh -cZ "tar -I sh -xf a"', description: 'zsh -cZ tar sink' } },
+  { allow: false, category: 'local_exec' })
 
 // Read-only archive operations are classified read and must stay allowed
 // even in an unprotected cwd.

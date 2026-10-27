@@ -338,12 +338,6 @@ const COMMAND_SHELLS = new Set([
   'sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'csh', 'tcsh', 'fish',
 ])
 
-// Single-character shell options bash accepts inside a short-option cluster
-// (review-029-f2g): flags bash tolerates after `-c` before taking the next
-// argv token as the command string. Any other character makes the cluster a
-// bash error that never executes.
-const BASH_SHORT_OPTS = 'abcefhiklmnoprstuvxBCEHPT'
-
 function hasTarSink(tokens: string[], start: number): boolean {
   const rest = tokens.slice(start).map((t) => t.toLowerCase())
   const c = rest.join(' ')
@@ -542,17 +536,20 @@ function hasSinkInClause(clause: string): boolean {
           for (let p = 0; p < body.length; p++) {
             const ch = body[p]
             if (ch === 'c') {
-              // bash ignores any remaining short flags after 'c' in the
-              // cluster (-cx, -cxe, -ecx, +cx) and takes the NEXT argv token
-              // as the command string (review-029-f2g). If the remainder
-              // contains a character bash rejects (-cz, -c1, -c-), the
-              // command never executes — mirror that by bailing.
+              // bash/zsh ignore remaining flags after 'c' in the cluster and
+              // take the NEXT argv token as the command string. Fail-closed
+              // inversion (review-029-f2h): a whitelist per shell is
+              // unbounded (bash needs -I, zsh accepts a far wider set), so
+              // only characters every shell definitively rejects
+              // (non-alphabetic) mark the cluster as never executing; any
+              // alphabetic flag recurses into the next argv token. Rejected
+              // clusters (-cz, -c1) are at worst a safe over-denial.
               const rest = body.slice(p + 1)
-              let allLegal = true
               for (const rc of rest) {
-                if (!BASH_SHORT_OPTS.includes(rc)) { allLegal = false; break }
+                if (!(rc >= 'a' && rc <= 'z') && !(rc >= 'A' && rc <= 'Z')) {
+                  return false
+                }
               }
-              if (!allLegal) return false
               const inner = tokens.slice(j + 1).join(' ')
               if (hasArchiveExecSink(inner)) return true
               return false
