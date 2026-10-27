@@ -916,21 +916,30 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
           (args.code as string) ??
           ''
         if (typeof rawCmd === 'string' && rawCmd) {
-          const egress = await scanCommandForEgress(rawCmd)
-          if (egress.hits.length > 0) {
-            const h = egress.hits[0]
-            classification.category = 'network'
+          // review-029-f2d GAP-A: `bash -x -c "tar -I sh …"` classifies as
+          // local_exec (Shell execution: bash -x); the archive exec sink must
+          // deny it here too — the local_exec gate only scans network egress.
+          if (hasArchiveExecSink(rawCmd)) {
             classification.forceDeny = true
             classification.reason +=
-              ` [static-script-egress: ${egress.hits.length} network hit(s) at ` +
-              `${h.where} (${h.language}): ${h.snippet}]`
-            if (config.verbose) {
-              console.warn(`[tm-guard] STATIC-EGRESS ${toolName}: ${h.where} — ${h.snippet}`)
+              ' [archive exec sink (bytes -> interpreter): denied in every workspace]'
+          } else {
+            const egress = await scanCommandForEgress(rawCmd)
+            if (egress.hits.length > 0) {
+              const h = egress.hits[0]
+              classification.category = 'network'
+              classification.forceDeny = true
+              classification.reason +=
+                ` [static-script-egress: ${egress.hits.length} network hit(s) at ` +
+                `${h.where} (${h.language}): ${h.snippet}]`
+              if (config.verbose) {
+                console.warn(`[tm-guard] STATIC-EGRESS ${toolName}: ${h.where} — ${h.snippet}`)
+              }
+            } else if (egress.unverifiable) {
+              classification.category = 'unknown'
+              classification.reason +=
+                ' [static-script-egress: dynamic eval/exec/__import__ — cannot verify no network egress]'
             }
-          } else if (egress.unverifiable) {
-            classification.category = 'unknown'
-            classification.reason +=
-              ' [static-script-egress: dynamic eval/exec/__import__ — cannot verify no network egress]'
           }
         }
       }

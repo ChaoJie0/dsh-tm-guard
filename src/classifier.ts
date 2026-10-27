@@ -328,6 +328,11 @@ const PASSTHROUGH_PREFIXES = new Set([
   'env', 'command', 'nohup', 'time', 'nice', 'ionice', 'strace',
   'xargs', 'busybox', 'exec', 'builtin', 'sudo', 'doas',
 ])
+// Options of a pass-through prefix that consume their own argument token
+// (env -u FOO, --unset NAME, env -C dir). env -i takes no argument.
+const OPT_TAKES_ARG: Record<string, ReadonlySet<string>> = {
+  env: new Set(['-u', '--unset', '-C', '--chdir', '--directory']),
+}
 // Shells whose -c STRING form executes a command string.
 const COMMAND_SHELLS = new Set([
   'sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'csh', 'tcsh', 'fish',
@@ -376,6 +381,40 @@ function hasCpioSink(tokens: string[], start: number): boolean {
 }
 
 /**
+ * Split on shell control operators (`;`, `&&`, `||`, `|`, `&`, newline)
+ * OUTSIDE quotes. A sink in any clause of a compound command must deny
+ * (review-029-f2d GAP-C), so every clause is scanned independently.
+ */
+function splitCommandClauses(command: string): string[] {
+  const clauses: string[] = []
+  let cur = ''
+  let quote: string | null = null
+  const push = () => {
+    if (cur.trim()) clauses.push(cur)
+    cur = ''
+  }
+  for (const ch of command) {
+    if (quote) {
+      if (ch === quote) quote = null
+      cur += ch
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      cur += ch
+      continue
+    }
+    if (ch === ';' || ch === '&' || ch === '|' || ch === '\n') {
+      push()
+      continue
+    }
+    cur += ch
+  }
+  push()
+  return clauses
+}
+
+/**
  * Archive "bytes -> interpreter" sinks (review-029-r1 F2 / f1f2 closeout).
  * A tar archive can be told to pipe every extracted member through a shell
  * (`--to-command=sh`), execute a command at each checkpoint
@@ -397,42 +436,95 @@ function hasCpioSink(tokens: string[], start: number): boolean {
  * - Only a resolved tar-family program is tested for tar sinks, only a
  *   resolved cpio for rename sinks — sed -i / perl -i / gzip -i are never
  *   swept by a generic -i match.
+ *
+ * review-029-f2d closeout hardening (GAP-A/B/C):
+ * - Compound commands: scan every clause split on `;`/`&&`/`||`/`|`/`&`/
+ *   newline outside quotes — a sink in the tail of a compound command no
+ *   longer hides behind the leading clause.
+ * - Shell startup options before `-c`: `bash -x -c "STRING"`, `sh -e -c`,
+ *   `bash -xc`, `sh -o pipefail -c`, `bash --norc -c` — skip the shell's
+ *   leading options (short clusters, `-o NAME`, long no-arg flags) until the
+ *   `-c`/`-cSTRING` command string is reached, then recurse.
+ * - Environment assignments (`FOO=1 tar …`, `env FOO=1 tar …`, `FOO=1 env
+ *   tar …`) are skipped as non-program tokens, and option-with-argument
+ *   flags of pass-through prefixes (`env -u FOO`, `env --unset NAME`,
+ *   `env -C dir`) consume their argument token.
  * Single source of truth: index.ts and test-hook.mts import this function.
  */
 export function hasArchiveExecSink(command: string): boolean {
+  for (const clause of splitCommandClauses(command ?? '')) {
+    if (hasSinkInClause(clause)) return true
+  }
+  return false
+}
+
+function hasSinkInClause(clause: string): boolean {
   // Shell consumes backslash escapes and quotes before the tool sees its
   // argv; strip both so the matcher sees the real option string.
-  const norm = (command ?? '').replace(/\\/g, '').replace(/["']/g, '')
+  const norm = clause.replace(/\\/g, '').replace(/["']/g, '')
   const tokens = tokenize(norm)
   let i = 0
+  let lastPrefix = ''
   while (i < tokens.length) {
     const t = tokens[i]
     if (PASSTHROUGH_PREFIXES.has(t)) {
+      lastPrefix = t
       i++
       continue
     }
     if (t.startsWith('-')) {
-      // Leading options of a pass-through prefix (env -i, xargs -I{} ...).
+      // Leading options of a pass-through prefix. Options that take an
+      // argument consume the following token (env -u FOO, --unset NAME).
+      if (lastPrefix && OPT_TAKES_ARG[lastPrefix]?.has(t)) i++
+      i++
+      continue
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+      // Environment assignment (FOO=1 tar …): not a program name.
       i++
       continue
     }
     if (COMMAND_SHELLS.has((t.split('/').pop() ?? t).toLowerCase())) {
-      // shell -c "STRING" executes a command string: recurse into it.
-      const next = tokens[i + 1] ?? ''
-      if (next === '-c') {
-        const strIdx = i + 2
-        if (strIdx < tokens.length) {
-          const inner = tokens.slice(strIdx).join(' ')
-          if (hasArchiveExecSink(inner)) return true
+      // shell [-opts] -c "STRING" executes a command string: skip the shell's
+      // startup options (short clusters, -o NAME, long no-arg flags) until
+      // the -c form, then recurse into the string.
+      let j = i + 1
+      while (j < tokens.length) {
+        const opt = tokens[j]
+        if (opt === '-c') {
+          const strIdx = j + 1
+          if (strIdx < tokens.length) {
+            const inner = tokens.slice(strIdx).join(' ')
+            if (hasArchiveExecSink(inner)) return true
+          }
+          return false
         }
+        if (opt.startsWith('-') && !opt.startsWith('--') && opt.length > 2) {
+          // Short-option cluster. A lowercase 'c' in the cluster means a
+          // glued -cSTRING (e.g. -xc "cmd", -cfoo): recurse into the string
+          // that follows the 'c'.
+          const cIdx = opt.indexOf('c')
+          if (cIdx > 0) {
+            const inner = opt.slice(cIdx + 1) + ' ' + tokens.slice(j + 1).join(' ')
+            if (hasArchiveExecSink(inner)) return true
+          }
+          j++
+          continue
+        }
+        if (opt === '-o' || opt === '--option') {
+          // -o NAME consumes its argument.
+          j += 2
+          continue
+        }
+        if (opt.startsWith('-')) {
+          // Other leading option (-x, -e, --norc, --noprofile, ...): skip.
+          j++
+          continue
+        }
+        // A non-option before -c: script file / interactive shell. Not a
+        // sink by itself.
         return false
       }
-      if (next.startsWith('-c')) {
-        const inner = next.slice(2) + ' ' + tokens.slice(i + 2).join(' ')
-        if (hasArchiveExecSink(inner)) return true
-        return false
-      }
-      // Plain shell invocation (interactive / script file): not itself a sink.
       return false
     }
     const base = (t.split('/').pop() ?? t).toLowerCase()
