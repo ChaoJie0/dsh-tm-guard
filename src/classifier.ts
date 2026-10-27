@@ -523,6 +523,110 @@ function extractWritePaths(command: string): string[] {
     }
   }
 
+  // Archive / sync commands with implicit targets (review-029-r1 F1):
+  // without extraction these were classified file_write with 0 targets, and
+  // the zero-target protection branch could not enforce a workspace boundary,
+  // so `tar -cf /out/…` / `rsync -a S/ OUT/` / `unzip -d OUT …` could write
+  // outside the session with no baseline. Extract their real write targets so
+  // they flow through the normal per-target boundary + git-baseline checks.
+  if (cmd === 'tar') {
+    let archivePath: string | undefined
+    let changeDir: string | undefined
+    let mode = 'create' // tar with no action letter creates an archive
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i]
+      if (t === '-f' || t === '--file') {
+        const v = tokens[i + 1]
+        if (v && !v.startsWith('-')) { archivePath = v; i++ }
+        continue
+      }
+      if (t.startsWith('--file=')) { archivePath = t.slice(7); continue }
+      if (t === '-C' || t === '--directory') {
+        const v = tokens[i + 1]
+        if (v) { changeDir = v; i++ }
+        continue
+      }
+      if (t === '-x' || t === '--extract' || t === '--get' || t === '-t' ||
+          t === '--list' || t === '-d' || t === '--diff' || t === '--compare') {
+        mode = 'extract'
+        continue
+      }
+      if (t === '-c' || t === '--create' || t === '-r' || t === '--append' ||
+          t === '-u' || t === '--update') {
+        mode = 'create'
+        continue
+      }
+      if (t.startsWith('-') && !t.startsWith('--')) {
+        // Short-option cluster: `-czf` contains the `f` marker whose value is
+        // the next token; `-C` consumes the next token as the directory. An
+        // action letter (x/c/t/d/r/u) re-marks the mode.
+        const letters = t.slice(1)
+        if (letters.includes('x') || letters.includes('t') || letters.includes('d')) mode = 'extract'
+        if (letters.includes('c') || letters.includes('r') || letters.includes('u')) mode = 'create'
+        if (letters.includes('f') && i + 1 < tokens.length && !tokens[i + 1].startsWith('-')) {
+          archivePath = tokens[i + 1]
+          i++
+        }
+      }
+    }
+    if (mode === 'extract') {
+      if (changeDir) paths.push(changeDir)
+      else if (!tokens.some((t) => t === '--to-stdout' || t === '-O')) {
+        // Extraction lands in the session cwd; synthesize it so the boundary
+        // check can approve only rollback-covered directories.
+        paths.push(process.cwd())
+      }
+    } else if (archivePath) {
+      paths.push(archivePath)
+    }
+  }
+  if (cmd === 'unzip') {
+    // -p / -Z print/scan modes write nothing to disk.
+    if (tokens.some((t) => t === '-p' || t === '-Z' || t === '--pipe')) {
+      // no write target
+    } else {
+      let outDir: string | undefined
+      for (let i = 1; i < tokens.length; i++) {
+        if (tokens[i] === '-d' && tokens[i + 1]) { outDir = tokens[i + 1]; break }
+      }
+      paths.push(outDir ?? process.cwd())
+    }
+  }
+  if (cmd === 'rsync') {
+    // Local-only rsync (remote forms are classified network): the last
+    // positional argument is the destination. `--dry-run` writes nothing.
+    if (!tokens.some((t) => t === '--dry-run' || t === '-n')) {
+      const positionals = tokens.slice(1).filter(
+        (t) => !t.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t),
+      )
+      if (positionals.length >= 2) {
+        const dst = positionals[positionals.length - 1]
+        if (!dst.includes(':') && !dst.includes('::')) paths.push(dst)
+      }
+    }
+  }
+  if (cmd === '7z' || cmd === '7zz' || cmd === '7za') {
+    // Subcommand `x`/`e` extract (to -o<dir> or cwd); `a`/`u`/`d` operate on
+    // the archive named as the first positional.
+    const sub = (tokens[1] ?? '').toLowerCase()
+    if (sub === 'x' || sub === 'e') {
+      const o = tokens.find((t) => t.startsWith('-o'))
+      if (o && o.length > 2) paths.push(o.slice(2))
+      else paths.push(process.cwd())
+    } else if (sub === 'a' || sub === 'u' || sub === 'd' || sub === 'i') {
+      const first = tokens.slice(2).find((t) => !t.startsWith('-'))
+      if (first) paths.push(first)
+    }
+  }
+  if (cmd === 'zip' || cmd === 'zipinfo' || cmd === 'unzip') {
+    if (cmd === 'zip') {
+      // `zip out.zip files…`: the first positional is the archive being
+      // written; `-d`/`-x` are membership filters, not write targets.
+      const first = tokens.slice(1).find((t) => !t.startsWith('-'))
+      if (first) paths.push(first)
+    }
+  }
+
   return paths.filter(
     (p) => p.length > 0 && p !== '/dev/null' && p !== '/dev/stdout',
   )

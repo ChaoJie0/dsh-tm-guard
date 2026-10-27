@@ -364,6 +364,26 @@ function canonicalTarget(p: string): string {
   return base ? join(realDir, base) : realDir
 }
 
+/**
+ * Archive-command "bytes -> interpreter" sinks (review-029-r1 F2). A tar
+ * archive can be told to pipe every extracted member through a shell
+ * (`--to-command=sh`) or to execute a command at each checkpoint
+ * (`--checkpoint-action=exec=…`); cpio's interactive rename (`-r`) is the
+ * same family. These are B1-class primitives: untrusted archive bytes reach
+ * an interpreter with zero extracted write targets, so no per-target
+ * rollback check can gate them. They are denied in every workspace state.
+ */
+function hasArchiveExecSink(command: string): boolean {
+  const c = command ?? ''
+  const first = c.trim().split(/\s+/)[0] ?? ''
+  const lower = c.toLowerCase()
+  if (lower.includes('--to-command')) return true
+  if (lower.includes('--checkpoint-action=exec')) return true
+  if (lower.includes('--checkpoint-action exec')) return true
+  if (first === 'cpio' && /\s-r\b/.test(c)) return true
+  return false
+}
+
 function isAutoInitSafe(dir: string): boolean {
   const d = resolve(dir)
   const home = resolve(homedir())
@@ -946,22 +966,55 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       // workspace or vouch for an out-of-scope write.
       let pathsProtected = true
       let protectedTargetChecks: boolean[] = []
-      if (
+      const commandText = (args.command as string) ?? ''
+      if (hasArchiveExecSink(commandText)) {
+        // review-029-r1 F2: archive "bytes -> interpreter" sinks
+        // (tar --to-command=sh / --checkpoint-action=exec, cpio -r) are
+        // B1-class RCE primitives. They are denied in EVERY workspace state,
+        // regardless of how many write targets were extracted — the archive
+        // content reaches a shell without any extracted file being checked.
+        pathsProtected = false
+        classification.reason += ' [archive exec sink (bytes -> interpreter): denied in every workspace]'
+      } else if (
         classification.category === 'file_write' &&
         classification.targetPaths.length === 0 &&
         classification.reason.startsWith('Read-only curl download') &&
         !downgradedToFileWrite
       ) {
         // A strict-GET curl download with no concrete file target (e.g.
-        // `-o --`) cannot be proven rollbackable; fail closed. Other
-        // file_write commands with implicit targets (tar/unzip/gzip/rsync/
-        // xargs... ) keep their normal semantics: they are evaluated by the
-        // protection layer below (protected workspace -> allow + baseline,
-        // unprotected -> deny). (A denyNetwork=false / denySystem=false
-        // downgrade is an explicit user widening and keeps its old allow
-        // semantics.)
+        // `-o --`) cannot be proven rollbackable: fail closed in every
+        // workspace state. (A denyNetwork=false / denySystem=false downgrade
+        // is an explicit user widening and keeps its old allow semantics.)
         pathsProtected = false
         classification.reason += ' [no concrete local write target]'
+      } else if (
+        classification.category === 'file_write' &&
+        classification.targetPaths.length === 0 &&
+        !downgradedToFileWrite
+      ) {
+        // Implicit-target archive/transform commands (tar/unzip/gzip/rsync/
+        // xargs... ) keep their normal availability, but their rollback
+        // coverage is judged by the SESSION CWD rather than a vacuous true:
+        // cwd covered by TM (protectedPaths), an existing local git baseline,
+        // or a freshly auto-initialized baseline -> allow (the write lands in
+        // a rollback-able workspace); a cwd with no rollback coverage (e.g. an
+        // unprotected scratch root) -> deny. This closes the F1 out-of-workspace
+        // write gap for implicit-target tools while keeping new workspaces
+        // zero-config.
+        const sessionCwd = canonicalTarget(process.cwd())
+        let cwdCovered = await isPathProtected(sessionCwd, config.protectedPaths)
+        if (!cwdCovered) {
+          if (existsSync(join(sessionCwd, '.git'))) {
+            cwdCovered = true
+          } else if (!isTempPath(sessionCwd) && isAutoInitSafe(sessionCwd)) {
+            const r = await ensureGitBaseline(sessionCwd)
+            cwdCovered = r.ok
+          }
+        }
+        pathsProtected = cwdCovered
+        if (!pathsProtected) {
+          classification.reason += ' [cwd has no rollback coverage for implicit-target write]'
+        }
       } else if (classification.category === 'file_write' && classification.targetPaths.length > 0) {
         // TM / protectedPaths coverage is evaluated on the LEXICAL targets
         // (as in 0.2.8): the configured protectedPaths are lexical and must
