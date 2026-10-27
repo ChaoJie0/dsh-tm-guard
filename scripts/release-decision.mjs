@@ -141,8 +141,8 @@ if (!hasBaseline) {
 // ---- stage 1: automatic gates (reuse verify:fast chain) ---------------------
 const autoGates = [
   ['L0 unit tests', ['run', 'test', '--silent'], (o) => {
-    const fail = Number((o.match(/# fail\s+(\d+)/) || [])[1] ?? NaN)
-    const pass = Number((o.match(/# pass\s+(\d+)/) || [])[1] ?? NaN)
+    const fail = Number((o.match(/(?:#|ℹ)\s*fail\s+(\d+)/) || [])[1] ?? NaN)
+    const pass = Number((o.match(/(?:#|ℹ)\s*pass\s+(\d+)/) || [])[1] ?? NaN)
     return { ok: fail === 0 && Number.isFinite(fail), detail: `fail ${fail} / pass ${pass}` }
   }],
   ['L3 peer matrix', ['run', 'verify:peer', '--silent'], (o) => {
