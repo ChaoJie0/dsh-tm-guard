@@ -337,6 +337,28 @@ check('bash sh script.sh (plain script, allow)',
   { name: 'bash', arguments: { command: 'sh script.sh', description: 'plain shell script' } },
   { allow: true, category: 'local_exec' })
 
+// review-029-f2e: GAP-A residual — cluster ending in -o and +o-prefixed
+// options must still reach the -c recursion.
+check('bash bash -exo pipefail -c "tar -I sh -xf a" (cluster tail -o, deny)',
+  { name: 'bash', arguments: { command: 'bash -exo pipefail -c "tar -I sh -xf a"', description: 'cluster -o tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash sh -eo pipefail -c "tar -I sh -xf a" (cluster tail -o, sh, deny)',
+  { name: 'bash', arguments: { command: 'sh -eo pipefail -c "tar -I sh -xf a"', description: 'sh cluster -o tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash +o history -c "tar -I sh -xf a" (+o option, deny)',
+  { name: 'bash', arguments: { command: 'bash +o history -c "tar -I sh -xf a"', description: '+o tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash -o pipefail +o emacs -c "tar -I sh -xf a" (-o then +o, deny)',
+  { name: 'bash', arguments: { command: 'bash -o pipefail +o emacs -c "tar -I sh -xf a"', description: '-o +o tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash echo a\\; tar -I sh -xf a > notes.txt (escaped operator, allow)',
+  { name: 'bash', arguments: { command: 'echo a\\; tar -I sh -xf a > notes.txt', description: 'escaped semicolon echo' } },
+  { allow: true, category: 'file_write' })
+
 // Read-only archive operations are classified read and must stay allowed
 // even in an unprotected cwd.
 check('bash tar -tf (listing, allow)',

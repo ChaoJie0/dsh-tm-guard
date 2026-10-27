@@ -393,10 +393,22 @@ function splitCommandClauses(command: string): string[] {
     if (cur.trim()) clauses.push(cur)
     cur = ''
   }
-  for (const ch of command) {
+  for (let k = 0; k < command.length; k++) {
+    const ch = command[k]
     if (quote) {
       if (ch === quote) quote = null
       cur += ch
+      continue
+    }
+    if (ch === '\\') {
+      // Escaped character: `\;` is a literal semicolon, not a separator
+      // (review-029-f2e (5) — avoid over-splitting on escaped operators).
+      if (k + 1 < command.length) {
+        cur += ch + command[k + 1]
+        k++
+      } else {
+        cur += ch
+      }
       continue
     }
     if (ch === '"' || ch === "'") {
@@ -486,8 +498,10 @@ function hasSinkInClause(clause: string): boolean {
     }
     if (COMMAND_SHELLS.has((t.split('/').pop() ?? t).toLowerCase())) {
       // shell [-opts] -c "STRING" executes a command string: skip the shell's
-      // startup options (short clusters, -o NAME, long no-arg flags) until
-      // the -c form, then recurse into the string.
+      // startup options until the -c form, then recurse into the string.
+      // review-029-f2e: also accept `+`-prefixed options (+o NAME, +x) and a
+      // short cluster ENDING in `o` (bash -exo pipefail -c …), which consume
+      // the next token as the option name.
       let j = i + 1
       while (j < tokens.length) {
         const opt = tokens[j]
@@ -500,19 +514,34 @@ function hasSinkInClause(clause: string): boolean {
           return false
         }
         if (opt.startsWith('-') && !opt.startsWith('--') && opt.length > 2) {
-          // Short-option cluster. A lowercase 'c' in the cluster means a
-          // glued -cSTRING (e.g. -xc "cmd", -cfoo): recurse into the string
-          // that follows the 'c'.
-          const cIdx = opt.indexOf('c')
+          // Short-option cluster (-xc "cmd", -exo pipefail …). A lowercase
+          // 'c' means a glued -cSTRING: recurse into the string after 'c'.
+          // A trailing 'o' consumes the next token as the option name.
+          const body = opt.slice(1)
+          const cIdx = body.indexOf('c')
           if (cIdx > 0) {
-            const inner = opt.slice(cIdx + 1) + ' ' + tokens.slice(j + 1).join(' ')
+            const inner = body.slice(cIdx + 1) + ' ' + tokens.slice(j + 1).join(' ')
             if (hasArchiveExecSink(inner)) return true
+          }
+          if (body.endsWith('o')) {
+            j += 2
+            continue
           }
           j++
           continue
         }
-        if (opt === '-o' || opt === '--option') {
-          // -o NAME consumes its argument.
+        if (opt === '-o' || opt === '+o') {
+          // -o NAME / +o NAME consumes its argument.
+          j += 2
+          continue
+        }
+        if (opt.startsWith('+')) {
+          // +-prefixed option (+x, +o handled above, +e ...): skip.
+          j++
+          continue
+        }
+        if (opt === '--option' || opt === '--rcfile' || opt === '--init-file') {
+          // Long option that consumes an argument.
           j += 2
           continue
         }
