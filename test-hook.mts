@@ -359,6 +359,37 @@ check('bash echo a\\; tar -I sh -xf a > notes.txt (escaped operator, allow)',
   { name: 'bash', arguments: { command: 'echo a\\; tar -I sh -xf a > notes.txt', description: 'escaped semicolon echo' } },
   { allow: true, category: 'file_write' })
 
+// review-029-f2f: getopts — a non-terminal 'o' in a short cluster takes the
+// cluster remainder as its option name, so the next token is a positional
+// argument bash tolerates before -c; +-clusters parse identically.
+check('bash bash -exop pipefail -c "tar -I sh -xf a" (cluster non-tail -o, deny)',
+  { name: 'bash', arguments: { command: 'bash -exop pipefail -c "tar -I sh -xf a"', description: 'cluster non-tail -o tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash -op pipefail -c "tar -I sh -xf a" (bare -op, deny)',
+  { name: 'bash', arguments: { command: 'bash -op pipefail -c "tar -I sh -xf a"', description: '-op tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash -eop pipefail -c "tar -I sh -xf a" (-eop, deny)',
+  { name: 'bash', arguments: { command: 'bash -eop pipefail -c "tar -I sh -xf a"', description: '-eop tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash +eo pipefail -c "tar -I sh -xf a" (+-cluster tail o, deny)',
+  { name: 'bash', arguments: { command: 'bash +eo pipefail -c "tar -I sh -xf a"', description: '+eo tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash +exo pipefail -c "tar -I sh -xf a" (+exo, deny)',
+  { name: 'bash', arguments: { command: 'bash +exo pipefail -c "tar -I sh -xf a"', description: '+exo tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash --rcfile /tmp/rc -c "tar -I sh -xf a" (long opt with arg, deny)',
+  { name: 'bash', arguments: { command: 'bash --rcfile /tmp/rc -c "tar -I sh -xf a"', description: '--rcfile tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash -x script.sh (script positional arg, allow)',
+  { name: 'bash', arguments: { command: 'bash -x script.sh', description: 'script with -x' } },
+  { allow: true, category: 'local_exec' })
+
 // Read-only archive operations are classified read and must stay allowed
 // even in an unprotected cwd.
 check('bash tar -tf (listing, allow)',

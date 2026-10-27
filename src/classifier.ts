@@ -497,12 +497,16 @@ function hasSinkInClause(clause: string): boolean {
       continue
     }
     if (COMMAND_SHELLS.has((t.split('/').pop() ?? t).toLowerCase())) {
-      // shell [-opts] -c "STRING" executes a command string: skip the shell's
-      // startup options until the -c form, then recurse into the string.
-      // review-029-f2e: also accept `+`-prefixed options (+o NAME, +x) and a
-      // short cluster ENDING in `o` (bash -exo pipefail -c …), which consume
-      // the next token as the option name.
+      // shell [-opts] [-c STRING | script] executes a command string when a
+      // -c form is present. Parse the startup options with getopts semantics
+      // (review-029-f2f): within a short cluster, 'o' takes the REMAINDER of
+      // the cluster as its option name (or the next token when it is last);
+      // 'c' takes the remainder of the cluster as the glued command string.
+      // A positional argument is tolerated (bash allows one) — keep scanning
+      // for a later -c instead of bailing, so `-exop pipefail -c …` and
+      // `+eo pipefail -c …` still reach the recursion.
       let j = i + 1
+      let posArgs = 0
       while (j < tokens.length) {
         const opt = tokens[j]
         if (opt === '-c') {
@@ -513,46 +517,59 @@ function hasSinkInClause(clause: string): boolean {
           }
           return false
         }
-        if (opt.startsWith('-') && !opt.startsWith('--') && opt.length > 2) {
-          // Short-option cluster (-xc "cmd", -exo pipefail …). A lowercase
-          // 'c' means a glued -cSTRING: recurse into the string after 'c'.
-          // A trailing 'o' consumes the next token as the option name.
+        if (opt.startsWith('-c')) {
+          const inner = opt.slice(2) + ' ' + tokens.slice(j + 1).join(' ')
+          if (hasArchiveExecSink(inner)) return true
+          return false
+        }
+        if (opt === '--option' || opt === '--rcfile' || opt === '--init-file') {
+          j += 2
+          continue
+        }
+        if (opt.startsWith('--')) {
+          // Other long option, no argument: --norc, --noprofile, ...
+          j++
+          continue
+        }
+        if (opt.startsWith('-') || opt.startsWith('+')) {
           const body = opt.slice(1)
-          const cIdx = body.indexOf('c')
-          if (cIdx > 0) {
-            const inner = body.slice(cIdx + 1) + ' ' + tokens.slice(j + 1).join(' ')
-            if (hasArchiveExecSink(inner)) return true
+          if (!body) {
+            j++
+            continue
           }
-          if (body.endsWith('o')) {
+          let consumedNext = false
+          for (let p = 0; p < body.length; p++) {
+            const ch = body[p]
+            if (ch === 'c') {
+              const inner = body.slice(p + 1) + ' ' + tokens.slice(j + 1).join(' ')
+              if (hasArchiveExecSink(inner)) return true
+              return false
+            }
+            if (ch === 'o') {
+              if (p + 1 < body.length) {
+                // Option name is the remainder of the cluster (-op NAME:
+                // NAME stays inline); do NOT consume the next token.
+                break
+              }
+              // -o / +o at the end of the cluster consumes the next token.
+              consumedNext = true
+              break
+            }
+            // Other single-char option (x, e, v, ...): no argument.
+          }
+          if (consumedNext) {
             j += 2
             continue
           }
           j++
           continue
         }
-        if (opt === '-o' || opt === '+o') {
-          // -o NAME / +o NAME consumes its argument.
-          j += 2
-          continue
-        }
-        if (opt.startsWith('+')) {
-          // +-prefixed option (+x, +o handled above, +e ...): skip.
-          j++
-          continue
-        }
-        if (opt === '--option' || opt === '--rcfile' || opt === '--init-file') {
-          // Long option that consumes an argument.
-          j += 2
-          continue
-        }
-        if (opt.startsWith('-')) {
-          // Other leading option (-x, -e, --norc, --noprofile, ...): skip.
-          j++
-          continue
-        }
-        // A non-option before -c: script file / interactive shell. Not a
-        // sink by itself.
-        return false
+        // Non-option token: bash tolerates a single positional argument
+        // before -c; a second one means the command is not executed.
+        posArgs++
+        if (posArgs > 1) return false
+        j++
+        continue
       }
       return false
     }
