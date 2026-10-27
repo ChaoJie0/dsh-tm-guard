@@ -163,10 +163,6 @@ check('bash tar --rmt-command=sh --force-local (exec sink deny, F2)',
   { name: 'bash', arguments: { command: 'tar --rmt-command=sh --force-local -xf a', description: 'remote hook' } },
   { allow: false, category: 'file_write' })
 
-check('bash cpio -ir (exec sink deny, F2)',
-  { name: 'bash', arguments: { command: 'cpio -ir < a.cpio', description: 'interactive rename' } },
-  { allow: false, category: 'file_write' })
-
 // Known compressors must keep working through -I / --use-compress-program.
 check('bash tar -I zstd (compressor allow, F2)',
   { name: 'bash', arguments: { command: 'tar -I zstd -xf a.tar', description: 'decompress via zstd' } },
@@ -175,6 +171,52 @@ check('bash tar -I zstd (compressor allow, F2)',
 check('bash tar --use-compress-program=zstd (compressor allow, F2)',
   { name: 'bash', arguments: { command: 'tar --use-compress-program=zstd -xf a.tar', description: 'decompress via zstd' } },
   { allow: true, category: 'file_write' })
+
+// review-029-f2b-closeout: injected quotes / backslash escapes in the option
+// NAME must not break the matcher (the shell consumes them, tar sees the real
+// option) — all of these are B1-class RCE primitives and must be denied.
+check('bash tar --to-com""mand=sh (quote-injected name, deny)',
+  { name: 'bash', arguments: { command: 'tar --to-com""mand=sh -xf a.tar', description: 'injected quote in --to-command' } },
+  { allow: false, category: 'file_write' })
+
+check('bash tar --check""point-action=exec=sh (quote-injected name, deny)',
+  { name: 'bash', arguments: { command: 'tar --check""point-action=exec=sh -xf a.tar', description: 'injected quote in --checkpoint-action' } },
+  { allow: false, category: 'file_write' })
+
+check('bash tar --use-compress-program\\=sh (backslash-escaped =, deny)',
+  { name: 'bash', arguments: { command: 'tar --use-compress-program\\=sh -xf a.tar', description: 'backslash-escaped equals' } },
+  { allow: false, category: 'file_write' })
+
+check('bash tar --rmt-com""mand=sh --force-local (quote-injected, deny)',
+  { name: 'bash', arguments: { command: 'tar --rmt-com""mand=sh --force-local -xf a', description: 'injected quote in --rmt-command' } },
+  { allow: false, category: 'file_write' })
+
+// Scoping: -i/-I must only mean tar's --use-compress-program when the first
+// word is tar. sed -i / perl -i and plain cpio -idmv extraction are normal
+// writes that keep working in a covered cwd.
+check('bash sed -i "" (not an archive sink, allow)',
+  { name: 'bash', arguments: { command: 'sed -i "" s/foo/bar/ f.txt', description: 'in-place edit' } },
+  { allow: true, category: 'file_write' })
+
+check('bash perl -i -pe (not an archive sink, allow)',
+  { name: 'bash', arguments: { command: 'perl -i -pe s/foo/bar/ f.txt', description: 'in-place edit' } },
+  { allow: true, category: 'file_write' })
+
+check('bash cpio -idmv < a.cpio (plain extraction, allow)',
+  { name: 'bash', arguments: { command: 'cpio -idmv < a.cpio', description: 'standard cpio extraction' } },
+  { allow: true, category: 'file_write' })
+
+check('bash cpio -R owner -idmv < a.cpio (restore owner, allow)',
+  { name: 'bash', arguments: { command: 'cpio -R owner -idmv < a.cpio', description: 'restore ownership, not rename' } },
+  { allow: true, category: 'file_write' })
+
+check('bash cpio -ir < a.cpio (interactive rename, deny)',
+  { name: 'bash', arguments: { command: 'cpio -ir < a.cpio', description: 'interactive rename' } },
+  { allow: false, category: 'file_write' })
+
+check('bash cpio --rename < a.cpio (interactive rename, deny)',
+  { name: 'bash', arguments: { command: 'cpio --rename < a.cpio', description: 'interactive rename long form' } },
+  { allow: false, category: 'file_write' })
 
 // Read-only archive operations are classified read and must stay allowed
 // even in an unprotected cwd.

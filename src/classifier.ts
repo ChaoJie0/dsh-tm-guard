@@ -304,50 +304,72 @@ function tokenize(command: string): string[] {
  * (`--rmt-command` / `--rsh-command`), or decompress through an arbitrary
  * program (`-I` / `--use-compress-program`); cpio's interactive rename (`-r`)
  * is the same family. These are B1-class primitives: untrusted archive bytes
- * reach an interpreter with zero checked write targets. tokenize() strips
- * shell quotes, so `--checkpoint-action="exec=sh"` normalises to
- * `--checkpoint-action=exec=sh` and cannot bypass the match. The
- * `-I`/`--use-compress-program` value is gated by a compressor allowlist so
- * legitimate `tar -I zstd` keeps working while `tar -I sh` is denied.
+ * reach an interpreter with zero checked write targets.
+ *
+ * review-029-f2b-closeout hardening:
+ * - Normalise shell quoting AND backslash escapes first (`\=`, `--to-com""mand`)
+ *   so injected quotes/escapes cannot break the substring match (the shell
+ *   consumes them, GNU tar sees the real option).
+ * - Scope long-option matching to a tar-family first word (tar/gtar/bsdtar);
+ *   scope -I/--use-compress-program to tar only, and cpio rename detection to
+ *   cpio only — never a generic -i sweep (that wrongly denied sed -i,
+ *   perl -i and plain cpio -idmv extraction).
+ * - cpio rename is checked on ORIGINAL-case tokens so `-R owner` (restore
+ *   ownership) is not mistaken for `-r`.
  * Single source of truth: index.ts and test-hook.mts import this function.
  */
+const ARCHIVE_COMPRESSORS = new Set([
+  'gzip', 'gunzip', 'bzip2', 'bunzip2', 'xz', 'unxz',
+  'zstd', 'unzstd', 'lz4', 'lzip', 'zcat', 'bzcat',
+  'xzcat', 'zstdcat', 'lzop', 'pigz', 'pbzip2', 'pixz', 'cat',
+])
 export function hasArchiveExecSink(command: string): boolean {
-  const c = (command ?? '').toLowerCase()
-  const first = c.trim().split(/\s+/)[0] ?? ''
-  if (c.includes('--to-command')) return true
-  const cpa = c.indexOf('--checkpoint-action')
-  if (cpa !== -1) {
-    const rest = c.slice(cpa)
-    const val = rest.match(/^--checkpoint-action[=\s]+([^\s]+)/)
-    if (val && val[1].includes('exec')) return true
+  // Shell consumes backslash escapes and quotes before the archive tool sees
+  // its argv; strip both so the matcher sees the real option string.
+  const norm = (command ?? '').replace(/\\/g, '').replace(/["']/g, '')
+  const first = norm.trim().split(/\s+/)[0] ?? ''
+  const firstLower = first.toLowerCase()
+  if (firstLower === 'tar' || firstLower === 'gtar' || firstLower === 'bsdtar') {
+    const c = norm.toLowerCase()
+    if (c.includes('--to-command')) return true
+    const cpa = c.indexOf('--checkpoint-action')
+    if (cpa !== -1) {
+      const rest = c.slice(cpa)
+      const val = rest.match(/^--checkpoint-action[=\s]+([^\s]+)/)
+      if (val && val[1].includes('exec')) return true
+    }
+    if (c.includes('--rmt-command') || c.includes('--rsh-command')) return true
+    const tokens = tokenize(norm)
+    for (let i = 0; i < tokens.length; i++) {
+      const tl = tokens[i].toLowerCase()
+      if (tl === '-i' || tl === '--use-compress-program') {
+        const v = (tokens[i + 1] ?? '').toLowerCase()
+        if (!ARCHIVE_COMPRESSORS.has(v)) return true
+        i++
+        continue
+      }
+      if (tl.startsWith('-i') && tl.length > 2 && !tl.startsWith('--')) {
+        // Glued form: -Ish
+        const v = tl.slice(2)
+        if (!ARCHIVE_COMPRESSORS.has(v)) return true
+      }
+      if (tl.startsWith('--use-compress-program=')) {
+        const v = tl.slice('--use-compress-program='.length)
+        if (!ARCHIVE_COMPRESSORS.has(v)) return true
+      }
+    }
+    return false
   }
-  if (c.includes('--rmt-command') || c.includes('--rsh-command')) return true
-  const COMPRESSORS = new Set([
-    'gzip', 'gunzip', 'bzip2', 'bunzip2', 'xz', 'unxz',
-    'zstd', 'unzstd', 'lz4', 'lzip', 'zcat', 'bzcat',
-    'xzcat', 'zstdcat', 'lzop', 'pigz', 'pbzip2', 'pixz', 'cat',
-  ])
-  const tokens = tokenize(command)
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i]
-    const tl = t.toLowerCase()
-    if (tl === '-i' || tl === '--use-compress-program') {
-      const v = (tokens[i + 1] ?? '').toLowerCase()
-      if (!COMPRESSORS.has(v)) return true
-      i++
-      continue
+  if (firstLower === 'cpio') {
+    // Interactive rename (-r / --rename) is an exec-style sink; check on
+    // original-case tokens so -R owner is not confused with -r.
+    const tokens = tokenize(norm)
+    for (const t of tokens) {
+      if (t === '--rename') return true
+      if (t.startsWith('-') && !t.startsWith('--') && t.slice(1).includes('r')) return true
     }
-    if (tl.startsWith('-i') && tl.length > 2 && !tl.startsWith('--')) {
-      // Glued form: -Ish
-      const v = tl.slice(2)
-      if (!COMPRESSORS.has(v)) return true
-    }
-    if (tl.startsWith('--use-compress-program=')) {
-      const v = tl.slice('--use-compress-program='.length)
-      if (!COMPRESSORS.has(v)) return true
-    }
+    return false
   }
-  if (first === 'cpio' && c.includes('-r')) return true
   return false
 }
 
