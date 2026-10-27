@@ -16,8 +16,16 @@ function check(label: string, execLike: { name: string; arguments: unknown }, op
   const c = classifyToolCall(toolName, args)
 
   // Path protection (only file_write with paths is checked in index.ts)
+  // Mirror src/index.ts zero-target fail-closed: ONLY a strict-GET curl
+  // download with no concrete target is forced unprotected. Archive and
+  // transform commands with implicit targets (tar/unzip/gzip/rsync/xargs...)
+  // keep protection-layer semantics: protected workspace -> allow,
+  // unprotected -> deny. This mirrors the apply() integration branch that a
+  // pure decide() call would miss (see dsh review-029-b1b2-closeout R1).
   let pathsProtected = true
-  if (c.category === 'file_write' && c.targetPaths.length > 0) {
+  if (c.category === 'file_write' && c.targetPaths.length === 0) {
+    if (c.reason.startsWith('Read-only curl download')) pathsProtected = false
+  } else if (c.category === 'file_write' && c.targetPaths.length > 0) {
     pathsProtected = c.targetPaths.every((p: string) => {
       const abs = p.startsWith('/') ? p : `${process.cwd()}/${p}`
       return protectedPaths.some((pref) => abs === pref || abs.startsWith(pref + '/'))
@@ -73,6 +81,24 @@ check('bash read-only ls (allow)',
 check('tm_status internal',
   { name: 'tm_status', arguments: {} },
   { allow: true, category: 'read' })
+
+// R1 integration regression (dsh review-029-b1b2-closeout): archive and
+// transform commands with implicit targets must NOT be denied by the
+// zero-target fail-closed branch — they keep protection-layer semantics
+// (protected workspace -> allow).
+check('bash tar extract in protected workspace (allow, R1)',
+  { name: 'bash', arguments: { command: 'tar -xzf /tmp/tm-guard-home/pkg.tgz', description: 'extract' } },
+  { allow: true, category: 'file_write' })
+
+check('bash unzip in protected workspace (allow, R1)',
+  { name: 'bash', arguments: { command: 'unzip -d /tmp/tm-guard-home/out /tmp/tm-guard-home/a.zip', description: 'unzip' } },
+  { allow: true, category: 'file_write' })
+
+// A strict-GET curl download with no concrete file target stays fail-closed
+// (R1 scope: `curl -o -- URL` must remain denied).
+check('bash curl -o -- (zero target, fail-closed, R1)',
+  { name: 'bash', arguments: { command: 'curl -o -- https://example.com/x', description: 'download' } },
+  { allow: false, category: 'file_write' })
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail > 0 ? 1 : 0)
