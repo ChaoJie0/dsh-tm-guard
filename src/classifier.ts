@@ -338,6 +338,12 @@ const COMMAND_SHELLS = new Set([
   'sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'csh', 'tcsh', 'fish',
 ])
 
+// Single-character shell options bash accepts inside a short-option cluster
+// (review-029-f2g): flags bash tolerates after `-c` before taking the next
+// argv token as the command string. Any other character makes the cluster a
+// bash error that never executes.
+const BASH_SHORT_OPTS = 'abcefhiklmnoprstuvxBCEHPT'
+
 function hasTarSink(tokens: string[], start: number): boolean {
   const rest = tokens.slice(start).map((t) => t.toLowerCase())
   const c = rest.join(' ')
@@ -517,11 +523,6 @@ function hasSinkInClause(clause: string): boolean {
           }
           return false
         }
-        if (opt.startsWith('-c')) {
-          const inner = opt.slice(2) + ' ' + tokens.slice(j + 1).join(' ')
-          if (hasArchiveExecSink(inner)) return true
-          return false
-        }
         if (opt === '--option' || opt === '--rcfile' || opt === '--init-file') {
           j += 2
           continue
@@ -541,7 +542,18 @@ function hasSinkInClause(clause: string): boolean {
           for (let p = 0; p < body.length; p++) {
             const ch = body[p]
             if (ch === 'c') {
-              const inner = body.slice(p + 1) + ' ' + tokens.slice(j + 1).join(' ')
+              // bash ignores any remaining short flags after 'c' in the
+              // cluster (-cx, -cxe, -ecx, +cx) and takes the NEXT argv token
+              // as the command string (review-029-f2g). If the remainder
+              // contains a character bash rejects (-cz, -c1, -c-), the
+              // command never executes — mirror that by bailing.
+              const rest = body.slice(p + 1)
+              let allLegal = true
+              for (const rc of rest) {
+                if (!BASH_SHORT_OPTS.includes(rc)) { allLegal = false; break }
+              }
+              if (!allLegal) return false
+              const inner = tokens.slice(j + 1).join(' ')
               if (hasArchiveExecSink(inner)) return true
               return false
             }

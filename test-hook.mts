@@ -390,6 +390,32 @@ check('bash bash -x script.sh (script positional arg, allow)',
   { name: 'bash', arguments: { command: 'bash -x script.sh', description: 'script with -x' } },
   { allow: true, category: 'local_exec' })
 
+// review-029-f2g: bash ignores legal short flags after -c in a cluster and
+// takes the NEXT argv token as the command string (-cx, -cxe, -ecx, +cx).
+check('bash bash -cx "tar -I sh -xf a" (c then legal flag, deny)',
+  { name: 'bash', arguments: { command: 'bash -cx "tar -I sh -xf a"', description: '-cx tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash -cxe "tar -I sh -xf a" (c then x e, deny)',
+  { name: 'bash', arguments: { command: 'bash -cxe "tar -I sh -xf a"', description: '-cxe tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash -ecx "tar -I sh -xf a" (c non-first, deny)',
+  { name: 'bash', arguments: { command: 'bash -ecx "tar -I sh -xf a"', description: '-ecx tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash +cx "tar -I sh -xf a" (+ cluster c, deny)',
+  { name: 'bash', arguments: { command: 'bash +cx "tar -I sh -xf a"', description: '+cx tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash sh -cx "tar -I sh -xf a" (sh -cx, deny)',
+  { name: 'bash', arguments: { command: 'sh -cx "tar -I sh -xf a"', description: 'sh -cx tar sink' } },
+  { allow: false, category: 'local_exec' })
+
+check('bash bash -cz "tar -I sh -xf a" (c then illegal char, allow)',
+  { name: 'bash', arguments: { command: 'bash -cz "tar -I sh -xf a"', description: '-cz never executes' } },
+  { allow: true, category: 'local_exec' })
+
 // Read-only archive operations are classified read and must stay allowed
 // even in an unprotected cwd.
 check('bash tar -tf (listing, allow)',
