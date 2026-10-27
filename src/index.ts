@@ -76,7 +76,7 @@ import {
   refineBaselineReportTm,
 } from './baseline-report.ts'
 import { verifyTurn } from './verify.ts'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { execSync } from 'node:child_process'
 import { existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, writeFileSync } from 'node:fs'
@@ -316,7 +316,7 @@ const AUTO_INIT_FORBIDDEN_ROOTS = new Set([
 // existing parent is realpath'd. This holds the boundary against an absolute
 // `/cwd/../outside` target, a symlinked directory, a symlinked file, a
 // single dangling link, and a chained dangling link.
-function canonicalTarget(p: string): string {
+export function canonicalTarget(p: string): string {
   const lex = resolve(p.startsWith('/') ? p : join(process.cwd(), p))
   try {
     return realpathSync(lex)
@@ -357,13 +357,68 @@ function canonicalTarget(p: string): string {
   if (followed) return '/.tmguard-symlink-cap'
   const dir = dirname(lex)
   const base = lex.slice(dir.length + 1)
-  let realDir = dir
-  try {
-    realDir = realpathSync(dir)
-  } catch {
-    // Parent does not exist yet; fall back to the lexical resolution.
-  }
+  // The basename does not exist yet: realpath the parent. When the parent
+  // itself does not resolve (a symlink ancestor followed by a not-yet-existing
+  // component, e.g. `elink -> /outside` then `elink/newdir/f.txt`), resolve the
+  // nearest EXISTING ancestor to its REAL location first, then re-append the
+  // missing suffix. Without this, the lexical fallback would place the target
+  // inside the workspace even though the OS write follows the link and lands
+  // outside it (symlink-escape review, F4/O1).
+  const realDir = resolveParentToReal(dir)
   return base ? join(realDir, base) : realDir
+}
+
+// Resolve a not-yet-fully-existing parent path to its real on-disk location:
+// walk upward to the nearest ancestor that exists (a symlink counts as
+// existing), realpath that ancestor, then re-append the missing suffix. A
+// dangling symlink ancestor is followed through its readlink chain so the
+// final target is the link's lexical destination rather than the link path
+// itself. Falls back to the lexical form only when nothing on the path exists.
+function resolveParentToReal(dir: string): string {
+  const missing: string[] = []
+  let cur = dir
+  for (;;) {
+    // A symlink entry itself counts as existing (lstat, no follow): a dangling
+    // link is then resolved through its readlink chain below. existsSync would
+    // return false for a dangling link and wrongly treat it as a missing
+    // component, collapsing the escape back to a lexical in-cwd path.
+    let curSt
+    try {
+      curSt = lstatSync(cur)
+    } catch {
+      curSt = undefined
+    }
+    if (curSt) {
+      let real = ''
+      try {
+        real = realpathSync(cur)
+      } catch {
+        // cur is a dangling symlink: follow its chain lexically.
+        let t = cur
+        const seen = new Set<string>([t])
+        for (let hops = 0; hops < 40; hops++) {
+          let st
+          try {
+            st = lstatSync(t)
+          } catch {
+            break
+          }
+          if (!st.isSymbolicLink()) break
+          const link = readlinkSync(t)
+          const next = resolve(link.startsWith('/') ? link : join(dirname(t), link))
+          if (seen.has(next)) return join(t, ...missing)
+          seen.add(next)
+          t = next
+        }
+        real = t
+      }
+      return missing.length ? join(real, ...missing) : real
+    }
+    const parent = dirname(cur)
+    if (parent === cur) return dir
+    missing.unshift(basename(cur))
+    cur = parent
+  }
 }
 
 /**
@@ -379,7 +434,7 @@ function canonicalTarget(p: string): string {
  * state.
  */
 
-function isAutoInitSafe(dir: string): boolean {
+export function isAutoInitSafe(dir: string, cwd: string): boolean {
   const d = resolve(dir)
   const home = resolve(homedir())
   if (d === '/' || d === '/Users' || d === home) return false
@@ -390,6 +445,18 @@ function isAutoInitSafe(dir: string): boolean {
     // Directory does not exist yet; judge the lexical form.
   }
   if (real === '/' || real === '/Users' || real === home) return false
+  // The baseline repo must never be placed outside the session cwd. Even when
+  // canonical insideWorkspace already passed, an anchor that is a symlink can
+  // point its realpath outside (e.g. `elink -> /outside`): git would then
+  // initialize a repo in the external real directory, mutating state outside
+  // the workspace (symlink-escape review, O1 defense-in-depth).
+  let cwdReal = cwd
+  try {
+    cwdReal = realpathSync(cwd)
+  } catch {
+    // cwd itself is canonical; keep the lexical form.
+  }
+  if (!(real === cwdReal || real.startsWith(cwdReal + '/'))) return false
   // Note: a normal project lives under the home (e.g. ~/Self_Work/proj) and
   // must still be auto-initialized, so the home subtree is NOT blanket-banned
   // here. A symlink that escapes the session cwd into the home tree is
@@ -1010,7 +1077,7 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         if (!cwdCovered) {
           if (existsSync(join(sessionCwd, '.git'))) {
             cwdCovered = true
-          } else if (!isTempPath(sessionCwd) && isAutoInitSafe(sessionCwd)) {
+          } else if (!isTempPath(sessionCwd) && isAutoInitSafe(sessionCwd, sessionCwd)) {
             const r = await ensureGitBaseline(sessionCwd)
             cwdCovered = r.ok
           }
@@ -1054,7 +1121,7 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
           // directory is created prematurely.
           const initDir = cp === sessionCwd ? cp : dirname(cp)
           const anchor = existsSync(initDir) ? initDir : nearestExistingAncestor(initDir)
-          if (!isAutoInitSafe(anchor)) return false
+          if (!isAutoInitSafe(anchor, sessionCwd)) return false
           const r = await ensureGitBaseline(anchor)
           return r.ok
         }))
