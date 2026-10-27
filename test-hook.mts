@@ -1,7 +1,7 @@
 // Verifies the pre-execute gate reads dsh's ToolExecution fields correctly.
 // dsh passes exec = { name, arguments, callId, ... } — NOT { tool, args, input }.
 // This replicates exactly the extraction + classification the hook performs.
-import { classifyToolCall, decide, isTempPath } from './src/classifier.ts'
+import { classifyToolCall, decide, isTempPath, hasArchiveExecSink } from './src/classifier.ts'
 
 let pass = 0
 let fail = 0
@@ -26,13 +26,10 @@ function check(label: string, execLike: { name: string; arguments: unknown }, op
   let pathsProtected = true
   const command = (args.command as string) ?? ''
   const isCurlZeroTarget = c.reason.startsWith('Read-only curl download')
-  const isArchiveExecSink =
-    command.includes('--to-command') ||
-    command.includes('--checkpoint-action=exec') ||
-    (/^cpio\b/.test(command.trim()) && /\s-r\b/.test(command))
   // F2: archive exec sinks are denied in EVERY workspace state (mirror of the
-  // first index.ts branch, which precedes the zero-target branch).
-  if (isArchiveExecSink) {
+  // first index.ts branch, which precedes the zero-target branch). Uses the
+  // classifier's exported single source of truth — no hand-written duplicate.
+  if (hasArchiveExecSink(command)) {
     pathsProtected = false
   } else if (c.category === 'file_write' && c.targetPaths.length === 0) {
     if (isCurlZeroTarget) pathsProtected = false
@@ -137,6 +134,61 @@ check('bash tar --to-command=/bin/sh (exec sink deny, F2)',
 check('bash tar --checkpoint-action=exec (exec sink deny, F2)',
   { name: 'bash', arguments: { command: 'tar --checkpoint-action=exec=sh -cf o.tar d', description: 'checkpoint exec' } },
   { allow: false, category: 'file_write' })
+
+// review-029-f1f2-closeout: equivalent exec-sink forms must also be denied —
+// -I / --use-compress-program with a non-compressor, quoted checkpoint
+// actions, and remote-command hooks. The quoted form used to bypass because
+// the substring match broke on `--checkpoint-action="exec=sh"`.
+check('bash tar -I sh (exec sink deny, F2)',
+  { name: 'bash', arguments: { command: 'tar -I sh -xf a.tar', description: 'decompress via shell' } },
+  { allow: false, category: 'file_write' })
+
+check('bash tar -Ish (glued exec sink deny, F2)',
+  { name: 'bash', arguments: { command: 'tar -Ish -xf a.tar', description: 'decompress via shell' } },
+  { allow: false, category: 'file_write' })
+
+check('bash tar --use-compress-program=sh (exec sink deny, F2)',
+  { name: 'bash', arguments: { command: 'tar --use-compress-program=sh -xf a.tar', description: 'decompress via shell' } },
+  { allow: false, category: 'file_write' })
+
+check('bash tar --use-compress-program="sh -c id" (exec sink deny, F2)',
+  { name: 'bash', arguments: { command: 'tar --use-compress-program="sh -c id" -xf a.tar', description: 'decompress via shell' } },
+  { allow: false, category: 'file_write' })
+
+check('bash tar --checkpoint-action="exec=sh" (quoted exec sink deny, F2)',
+  { name: 'bash', arguments: { command: 'tar --checkpoint-action="exec=sh" -xf a.tar', description: 'quoted checkpoint exec' } },
+  { allow: false, category: 'file_write' })
+
+check('bash tar --rmt-command=sh --force-local (exec sink deny, F2)',
+  { name: 'bash', arguments: { command: 'tar --rmt-command=sh --force-local -xf a', description: 'remote hook' } },
+  { allow: false, category: 'file_write' })
+
+check('bash cpio -ir (exec sink deny, F2)',
+  { name: 'bash', arguments: { command: 'cpio -ir < a.cpio', description: 'interactive rename' } },
+  { allow: false, category: 'file_write' })
+
+// Known compressors must keep working through -I / --use-compress-program.
+check('bash tar -I zstd (compressor allow, F2)',
+  { name: 'bash', arguments: { command: 'tar -I zstd -xf a.tar', description: 'decompress via zstd' } },
+  { allow: true, category: 'file_write' })
+
+check('bash tar --use-compress-program=zstd (compressor allow, F2)',
+  { name: 'bash', arguments: { command: 'tar --use-compress-program=zstd -xf a.tar', description: 'decompress via zstd' } },
+  { allow: true, category: 'file_write' })
+
+// Read-only archive operations are classified read and must stay allowed
+// even in an unprotected cwd.
+check('bash tar -tf (listing, allow)',
+  { name: 'bash', arguments: { command: 'tar -tf a.tar', description: 'list archive' } },
+  { allow: true, category: 'read' }, [], false)
+
+check('bash unzip -l (listing, allow)',
+  { name: 'bash', arguments: { command: 'unzip -l a.zip', description: 'list archive' } },
+  { allow: true, category: 'read' }, [], false)
+
+check('bash rsync -an (dry-run cluster, allow)',
+  { name: 'bash', arguments: { command: 'rsync -an /tmp/src/ /srv/dst/', description: 'dry run' } },
+  { allow: true, category: 'read' }, [], false)
 
 // review-029-r1-closeout F1: implicit-target writes are judged by the SESSION
 // CWD's rollback coverage. Extracted targets (tar/unzip/rsync/7z) outside any

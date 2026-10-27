@@ -41,6 +41,7 @@ import {
   classifyToolCall,
   decide,
   isTempPath,
+  hasArchiveExecSink,
   type GateDecision,
 } from './classifier.ts'
 import { scanCommandForEgress } from './scan-scripts.ts'
@@ -365,24 +366,17 @@ function canonicalTarget(p: string): string {
 }
 
 /**
- * Archive-command "bytes -> interpreter" sinks (review-029-r1 F2). A tar
- * archive can be told to pipe every extracted member through a shell
- * (`--to-command=sh`) or to execute a command at each checkpoint
- * (`--checkpoint-action=exec=…`); cpio's interactive rename (`-r`) is the
- * same family. These are B1-class primitives: untrusted archive bytes reach
- * an interpreter with zero extracted write targets, so no per-target
- * rollback check can gate them. They are denied in every workspace state.
+ * Archive-command "bytes -> interpreter" sinks (review-029-r1 F2) are
+ * detected in classifier.ts's exported hasArchiveExecSink (single source of
+ * truth shared with test-hook.mts). A tar archive can be told to pipe every
+ * extracted member through a shell (`--to-command=sh`), to execute a command
+ * at each checkpoint (`--checkpoint-action=exec=…`), or to decompress through
+ * an arbitrary program (`-I` / `--use-compress-program`); cpio's interactive
+ * rename (`-r`) is the same family. These are B1-class primitives: untrusted
+ * archive bytes reach an interpreter with zero checked write targets, so no
+ * per-target rollback check can gate them. They are denied in every workspace
+ * state.
  */
-function hasArchiveExecSink(command: string): boolean {
-  const c = command ?? ''
-  const first = c.trim().split(/\s+/)[0] ?? ''
-  const lower = c.toLowerCase()
-  if (lower.includes('--to-command')) return true
-  if (lower.includes('--checkpoint-action=exec')) return true
-  if (lower.includes('--checkpoint-action exec')) return true
-  if (first === 'cpio' && /\s-r\b/.test(c)) return true
-  return false
-}
 
 function isAutoInitSafe(dir: string): boolean {
   const d = resolve(dir)

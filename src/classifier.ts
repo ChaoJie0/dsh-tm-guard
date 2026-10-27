@@ -90,7 +90,7 @@ const FILE_WRITE_COMMANDS = new Set([
   'setfattr', 'truncate', 'dd', 'mknod', 'mkfifo', 'install',
   'trash', // delete-to-trash: recoverable, treated like a write (TM-rollback-able)
   'tar', 'zip', 'unzip', 'gzip', 'gunzip', 'bzip2', 'bunzip2',
-  'xz', 'unxz', 'zstd', 'unzstd', '7z', 'rar', 'unrar',
+  'xz', 'unxz', 'zstd', 'unzstd', '7z', 'rar', 'unrar', 'cpio',
   'patch', 'diff', 'ed', 'ex', 'vi', 'vim', 'nvim', 'nano',
   'pico', 'emacs', 'code --wait', 'sed -i', 'perl -i', 'ruby -i',
   'tee', '>file', '>>append', 'clobber',
@@ -294,6 +294,93 @@ function tokenize(command: string): string[] {
   }
   push()
   return tokens
+}
+
+/**
+ * Archive "bytes -> interpreter" sinks (review-029-r1 F2 / f1f2 closeout).
+ * A tar archive can be told to pipe every extracted member through a shell
+ * (`--to-command=sh`), execute a command at each checkpoint
+ * (`--checkpoint-action=exec=…`), run a remote shell hook
+ * (`--rmt-command` / `--rsh-command`), or decompress through an arbitrary
+ * program (`-I` / `--use-compress-program`); cpio's interactive rename (`-r`)
+ * is the same family. These are B1-class primitives: untrusted archive bytes
+ * reach an interpreter with zero checked write targets. tokenize() strips
+ * shell quotes, so `--checkpoint-action="exec=sh"` normalises to
+ * `--checkpoint-action=exec=sh` and cannot bypass the match. The
+ * `-I`/`--use-compress-program` value is gated by a compressor allowlist so
+ * legitimate `tar -I zstd` keeps working while `tar -I sh` is denied.
+ * Single source of truth: index.ts and test-hook.mts import this function.
+ */
+export function hasArchiveExecSink(command: string): boolean {
+  const c = (command ?? '').toLowerCase()
+  const first = c.trim().split(/\s+/)[0] ?? ''
+  if (c.includes('--to-command')) return true
+  const cpa = c.indexOf('--checkpoint-action')
+  if (cpa !== -1) {
+    const rest = c.slice(cpa)
+    const val = rest.match(/^--checkpoint-action[=\s]+([^\s]+)/)
+    if (val && val[1].includes('exec')) return true
+  }
+  if (c.includes('--rmt-command') || c.includes('--rsh-command')) return true
+  const COMPRESSORS = new Set([
+    'gzip', 'gunzip', 'bzip2', 'bunzip2', 'xz', 'unxz',
+    'zstd', 'unzstd', 'lz4', 'lzip', 'zcat', 'bzcat',
+    'xzcat', 'zstdcat', 'lzop', 'pigz', 'pbzip2', 'pixz', 'cat',
+  ])
+  const tokens = tokenize(command)
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]
+    const tl = t.toLowerCase()
+    if (tl === '-i' || tl === '--use-compress-program') {
+      const v = (tokens[i + 1] ?? '').toLowerCase()
+      if (!COMPRESSORS.has(v)) return true
+      i++
+      continue
+    }
+    if (tl.startsWith('-i') && tl.length > 2 && !tl.startsWith('--')) {
+      // Glued form: -Ish
+      const v = tl.slice(2)
+      if (!COMPRESSORS.has(v)) return true
+    }
+    if (tl.startsWith('--use-compress-program=')) {
+      const v = tl.slice('--use-compress-program='.length)
+      if (!COMPRESSORS.has(v)) return true
+    }
+  }
+  if (first === 'cpio' && c.includes('-r')) return true
+  return false
+}
+
+/**
+ * Pure-listing / print / dry-run archive operations that write nothing to
+ * disk: `tar -t|--list|-O|--to-stdout`, `unzip -l|-p|-Z`, `7z l|i`,
+ * `rsync -n|--dry-run` (including glued short clusters such as -an). These
+ * are classified read so an unprotected system cwd (e.g. /usr/local) does
+ * not deny a zero-write operation (review-029-f1f2 (c)).
+ */
+function isReadOnlyArchiveOp(cmd: string, command: string): boolean {
+  const tokens = tokenize(command)
+  if (cmd === 'tar') {
+    for (const t of tokens) {
+      if (t === '--list' || t === '--to-stdout' || t === '-t' || t === '-O') return true
+      if (t.startsWith('-') && !t.startsWith('--') && t.length > 2 &&
+          (t.slice(1).includes('t') || t.slice(1).includes('O'))) return true
+    }
+    return false
+  }
+  if (cmd === 'unzip') {
+    return tokens.some((t) => t === '-l' || t === '--list' || t === '-p' || t === '-Z')
+  }
+  if (cmd === '7z' || cmd === '7zz' || cmd === '7za') {
+    const sub = (tokens[1] ?? '').toLowerCase()
+    return sub === 'l' || sub === 'i'
+  }
+  if (cmd === 'rsync') {
+    const short = tokens.filter((t) => t.startsWith('-') && !t.startsWith('--') && t.length > 1)
+    return tokens.some((t) => t === '--dry-run' || t === '-n') ||
+      short.some((t) => t.slice(1).includes('n'))
+  }
+  return false
 }
 
 /**
@@ -573,16 +660,21 @@ function extractWritePaths(command: string): string[] {
       if (changeDir) paths.push(changeDir)
       else if (!tokens.some((t) => t === '--to-stdout' || t === '-O')) {
         // Extraction lands in the session cwd; synthesize it so the boundary
-        // check can approve only rollback-covered directories.
-        paths.push(process.cwd())
+        // check can approve only rollback-covered directories. Pure listing
+        // (-t/--list) and member-to-stdout (-O/--to-stdout) write nothing and
+        // must NOT synthesize a write target (review-029-f1f2 (c)).
+        const listing = tokens.some((t) => t === '-t' || t === '--list' ||
+          (t.startsWith('-') && !t.startsWith('--') && t.slice(1).includes('t')))
+        if (!listing) paths.push(process.cwd())
       }
     } else if (archivePath) {
       paths.push(archivePath)
     }
   }
   if (cmd === 'unzip') {
-    // -p / -Z print/scan modes write nothing to disk.
-    if (tokens.some((t) => t === '-p' || t === '-Z' || t === '--pipe')) {
+    // -p / -Z / -l / -q -l print/scan/list modes write nothing to disk.
+    if (tokens.some((t) => t === '-p' || t === '-Z' || t === '--pipe' ||
+        t === '-l' || t === '--list')) {
       // no write target
     } else {
       let outDir: string | undefined
@@ -594,8 +686,12 @@ function extractWritePaths(command: string): string[] {
   }
   if (cmd === 'rsync') {
     // Local-only rsync (remote forms are classified network): the last
-    // positional argument is the destination. `--dry-run` writes nothing.
-    if (!tokens.some((t) => t === '--dry-run' || t === '-n')) {
+    // positional argument is the destination. `--dry-run`/`-n` (including a
+    // glued short cluster such as -an) writes nothing.
+    const short = tokens.filter((t) => t.startsWith('-') && !t.startsWith('--') && t.length > 1)
+    const dryRun = tokens.some((t) => t === '--dry-run' || t === '-n') ||
+      short.some((t) => t.slice(1).includes('n'))
+    if (!dryRun) {
       const positionals = tokens.slice(1).filter(
         (t) => !t.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t),
       )
@@ -607,13 +703,14 @@ function extractWritePaths(command: string): string[] {
   }
   if (cmd === '7z' || cmd === '7zz' || cmd === '7za') {
     // Subcommand `x`/`e` extract (to -o<dir> or cwd); `a`/`u`/`d` operate on
-    // the archive named as the first positional.
+    // the archive named as the first positional. `l` (list) and `i` (info)
+    // write nothing.
     const sub = (tokens[1] ?? '').toLowerCase()
     if (sub === 'x' || sub === 'e') {
       const o = tokens.find((t) => t.startsWith('-o'))
       if (o && o.length > 2) paths.push(o.slice(2))
       else paths.push(process.cwd())
-    } else if (sub === 'a' || sub === 'u' || sub === 'd' || sub === 'i') {
+    } else if ((sub === 'a' || sub === 'u' || sub === 'd')) {
       const first = tokens.slice(2).find((t) => !t.startsWith('-'))
       if (first) paths.push(first)
     }
@@ -2346,6 +2443,13 @@ function stripUvRunFlags(s: string): string {
     // Remote forms: user@host:path, host::path (daemon), host:path (rsh, no user).
     if (firstWord === 'rsync' &&
         !/(?:^|\s)[\w.-]+@[\w.-]+:|(?:^|\s)[\w.-]+::|(?:^|\s)[\w][\w.-]*:[^\s]/.test(rest)) {
+      if (isReadOnlyArchiveOp('rsync', trimmed) && !hasOutputRedirect(trimmed)) {
+        return {
+          category: 'read',
+          reason: 'read-only archive operation: ' + fullCmd,
+          targetPaths: [],
+        }
+      }
       return {
         category: 'file_write',
         reason: 'Local rsync (no remote host)',
@@ -2483,6 +2587,16 @@ function stripUvRunFlags(s: string): string {
         category: 'file_write',
         reason: 'tee writes to file',
         targetPaths: extractWritePaths(trimmed),
+      }
+    }
+
+    // Pure-listing/print/dry-run archive ops write nothing to disk (unless an
+    // explicit output redirection makes them a real write).
+    if (isReadOnlyArchiveOp(firstWord, trimmed) && !hasOutputRedirect(trimmed)) {
+      return {
+        category: 'read',
+        reason: `read-only archive operation: ${fullCmd}`,
+        targetPaths: [],
       }
     }
 
