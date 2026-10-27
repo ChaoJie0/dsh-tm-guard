@@ -10,7 +10,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { ensureGitBaseline, commitCheckpoint, repoRoot } from './src/git.ts'
+import { ensureGitBaseline, commitCheckpoint, repoRoot, nearestExistingAncestor } from './src/git.ts'
 
 function freshRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), 'tm-git-real-'))
@@ -82,5 +82,66 @@ test('repoRoot walks up to the enclosing repo', async () => {
     const sub = join(dir, 'a', 'b')
     execFileSync('mkdir', ['-p', sub])
     assert.equal(await repoRoot(sub), realpathSync(dir)) // macOS /var → /private/var symlink
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('nearestExistingAncestor returns the dir itself when it exists', () => {
+  const dir = freshRepo()
+  try {
+    // lexical helper: returns the input form, does not resolve symlinks
+    assert.equal(nearestExistingAncestor(dir), dir)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('nearestExistingAncestor walks up to the first existing ancestor', () => {
+  const dir = freshRepo()
+  try {
+    const deep = join(dir, 'a', 'b', 'c')
+    // none of a/b/c exist yet
+    assert.equal(nearestExistingAncestor(deep), dir)
+    // once the top-most segment exists, it becomes the anchor
+    execFileSync('mkdir', ['-p', join(dir, 'a')])
+    assert.equal(nearestExistingAncestor(deep), join(dir, 'a'))
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('missing target dir falls back to nearest existing ancestor baseline', async () => {
+  // Mirrors the gate fix: `mkdir -p fresh && echo > fresh/f.txt` is decided
+  // BEFORE mkdir runs, so fresh/ does not exist yet. The git baseline is
+  // anchored at the nearest existing ancestor (the repo root) instead.
+  const dir = freshRepo()
+  try {
+    writeFileSync(join(dir, 'seed.txt'), 's')
+    await ensureGitBaseline(dir)
+    const missing = join(dir, 'fresh', 'nested', 'f.txt') // fresh/ + nested/ absent
+    const anchor = nearestExistingAncestor(missing)
+    // lexical walk returns the input form; git resolves the real path
+    assert.equal(anchor, dir)
+    const r = await ensureGitBaseline(anchor)
+    assert.equal(r.ok, true, JSON.stringify(r))
+    assert.equal(r.root, realpathSync(dir))
+    // no premature directory creation by the fallback itself
+    assert.equal(existsSync(join(dir, 'fresh')), false)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('concurrent ensureGitBaseline on the same dir both succeed (inflight dedupe)', async () => {
+  // The gate runs one gitCheck per write target in Promise.all; after the
+  // nearest-ancestor fallback, several targets can anchor on the SAME dir.
+  // Without dedupe, concurrent git init + add + commit race on index.lock and
+  // one randomly fails.
+  const dir = freshRepo()
+  try {
+    writeFileSync(join(dir, 'seed.txt'), 's')
+    const [a, b] = await Promise.all([
+      ensureGitBaseline(dir),
+      ensureGitBaseline(dir),
+    ])
+    assert.equal(a.ok, true, JSON.stringify(a))
+    assert.equal(b.ok, true, JSON.stringify(b))
+    // exactly one baseline commit exists (baseline is idempotent)
+    const log = execFileSync('git', ['log', '--oneline'], { cwd: dir, encoding: 'utf8' })
+    const commits = log.split('\n').filter(Boolean).length
+    assert.equal(commits, 1)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })

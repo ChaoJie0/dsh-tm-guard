@@ -12,7 +12,7 @@
 
 import { execFile, execFileSync } from 'node:child_process'
 import { existsSync, realpathSync, writeFileSync } from 'node:fs'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { isAbsolute, join, relative, resolve, dirname, sep } from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
@@ -70,6 +70,25 @@ export async function repoRoot(dir: string): Promise<string | null> {
   } catch {
     return null
   }
+}
+
+/**
+ * Nearest existing ancestor of `dir`, walking up until a directory that
+ * exists on disk. Used when a write target's own directory does not exist
+ * yet at gate time — `mkdir -p newdir && echo > newdir/f.txt` is classified
+ * and decided BEFORE the mkdir runs, so the baseline cannot be anchored at
+ * `newdir`. The baseline is anchored at the closest existing ancestor, which
+ * is where the write will land once the command executes (and which is
+ * already bounded to the session cwd by the caller's insideWorkspace check).
+ */
+export function nearestExistingAncestor(dir: string): string {
+  let d = resolve(dir)
+  while (!existsSync(d)) {
+    const parent = dirname(d)
+    if (parent === d) break
+    d = parent
+  }
+  return d
 }
 
 /**
@@ -144,8 +163,28 @@ export interface BaselineResult {
  * Ensure `dir` is a git work tree with at least one committed baseline.
  * Idempotent per directory within a process. Uses an ad-hoc local committer
  * identity so it works without any global git config.
+ *
+ * Concurrency note: the gate may call this for several write targets in one
+ * command (Promise.all over targetPaths), and after the nearest-ancestor
+ * fallback several of those can share the SAME anchor directory. Without a
+ * per-directory inflight dedupe, two concurrent runs would both see no cache,
+ * both `git init` and both `git add`+commit the same repo — racing on
+ * .git/index.lock and randomly failing one of them. The inflight map makes
+ * concurrent callers for the same dir share a single in-flight promise.
  */
 export async function ensureGitBaseline(dir: string): Promise<BaselineResult> {
+  const cached = ensuredDirs.get(dir)
+  if (cached) return { ok: true, root: cached }
+  const inFlight = inflightBaselines.get(dir)
+  if (inFlight) return inFlight
+  const p = doEnsureGitBaseline(dir).finally(() => inflightBaselines.delete(dir))
+  inflightBaselines.set(dir, p)
+  return p
+}
+
+const inflightBaselines = new Map<string, Promise<BaselineResult>>()
+
+async function doEnsureGitBaseline(dir: string): Promise<BaselineResult> {
   const cached = ensuredDirs.get(dir)
   if (cached) return { ok: true, root: cached }
 

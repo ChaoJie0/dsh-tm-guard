@@ -61,6 +61,7 @@ import {
   commitCheckpoint,
   probeGitRecovery,
   backfillGitRecovery,
+  nearestExistingAncestor,
   type GitRecoveryTarget,
   type GitRecoveryProbe,
 } from './git.ts'
@@ -1045,10 +1046,16 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
           if (!insideWorkspace) return false
           // A curl -O download synthesises the cwd itself as the target;
           // anchor the baseline at cwd rather than its parent. A concrete
-          // file is covered by a baseline in its directory.
+          // file is covered by a baseline in its directory. When that
+          // directory does not exist yet at gate time (`mkdir -p newdir &&
+          // echo > newdir/f.txt` is decided before mkdir runs), fall back to
+          // the nearest existing ancestor — the write lands inside it once
+          // the command executes, so coverage there is equivalent and no
+          // directory is created prematurely.
           const initDir = cp === sessionCwd ? cp : dirname(cp)
-          if (!isAutoInitSafe(initDir)) return false
-          const r = await ensureGitBaseline(initDir)
+          const anchor = existsSync(initDir) ? initDir : nearestExistingAncestor(initDir)
+          if (!isAutoInitSafe(anchor)) return false
+          const r = await ensureGitBaseline(anchor)
           return r.ok
         }))
 
