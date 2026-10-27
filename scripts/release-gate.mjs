@@ -50,10 +50,11 @@ function addGate(label, threshold, runner, parse) {
   gates.push({ label, threshold, runner, parse })
 }
 
-// L0 unit tests: TAP "# pass N" / "# fail M"; threshold fail = 0.
+// L0 unit tests: TAP "# pass N" / "# fail M" (node <22) or "ℹ pass N" /
+// "ℹ fail M" (node 22+ spec summary); threshold fail = 0.
 addGate('L0 unit tests', 'fail = 0', () => run('npm', ['run', 'test', '--silent']), (out) => {
-  const fail = Number((out.match(/# fail\s+(\d+)/) || [])[1] ?? NaN)
-  const pass = Number((out.match(/# pass\s+(\d+)/) || [])[1] ?? NaN)
+  const fail = Number((out.match(/(?:#|ℹ)\s*fail\s+(\d+)/) || [])[1] ?? NaN)
+  const pass = Number((out.match(/(?:#|ℹ)\s*pass\s+(\d+)/) || [])[1] ?? NaN)
   return { value: `fail ${fail} / pass ${pass}`, pass: fail === 0 && Number.isFinite(fail) }
 })
 
