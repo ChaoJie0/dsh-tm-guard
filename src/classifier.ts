@@ -323,51 +323,126 @@ const ARCHIVE_COMPRESSORS = new Set([
   'zstd', 'unzstd', 'lz4', 'lzip', 'zcat', 'bzcat',
   'xzcat', 'zstdcat', 'lzop', 'pigz', 'pbzip2', 'pixz', 'cat',
 ])
-export function hasArchiveExecSink(command: string): boolean {
-  // Shell consumes backslash escapes and quotes before the archive tool sees
-  // its argv; strip both so the matcher sees the real option string.
-  const norm = (command ?? '').replace(/\\/g, '').replace(/["']/g, '')
-  const first = norm.trim().split(/\s+/)[0] ?? ''
-  const firstLower = first.toLowerCase()
-  if (firstLower === 'tar' || firstLower === 'gtar' || firstLower === 'bsdtar') {
-    const c = norm.toLowerCase()
-    if (c.includes('--to-command')) return true
-    const cpa = c.indexOf('--checkpoint-action')
-    if (cpa !== -1) {
-      const rest = c.slice(cpa)
-      const val = rest.match(/^--checkpoint-action[=\s]+([^\s]+)/)
-      if (val && val[1].includes('exec')) return true
-    }
-    if (c.includes('--rmt-command') || c.includes('--rsh-command')) return true
-    const tokens = tokenize(norm)
-    for (let i = 0; i < tokens.length; i++) {
-      const tl = tokens[i].toLowerCase()
-      if (tl === '-i' || tl === '--use-compress-program') {
-        const v = (tokens[i + 1] ?? '').toLowerCase()
-        if (!ARCHIVE_COMPRESSORS.has(v)) return true
-        i++
-        continue
-      }
-      if (tl.startsWith('-i') && tl.length > 2 && !tl.startsWith('--')) {
-        // Glued form: -Ish
-        const v = tl.slice(2)
-        if (!ARCHIVE_COMPRESSORS.has(v)) return true
-      }
-      if (tl.startsWith('--use-compress-program=')) {
-        const v = tl.slice('--use-compress-program='.length)
-        if (!ARCHIVE_COMPRESSORS.has(v)) return true
-      }
-    }
-    return false
+// No-op / pass-through prefixes: the real program is the next token.
+const PASSTHROUGH_PREFIXES = new Set([
+  'env', 'command', 'nohup', 'time', 'nice', 'ionice', 'strace',
+  'xargs', 'busybox', 'exec', 'builtin', 'sudo', 'doas',
+])
+// Shells whose -c STRING form executes a command string.
+const COMMAND_SHELLS = new Set([
+  'sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'csh', 'tcsh', 'fish',
+])
+
+function hasTarSink(tokens: string[], start: number): boolean {
+  const rest = tokens.slice(start).map((t) => t.toLowerCase())
+  const c = rest.join(' ')
+  if (c.includes('--to-command')) return true
+  const cpa = c.indexOf('--checkpoint-action')
+  if (cpa !== -1) {
+    const tail = c.slice(cpa)
+    const val = tail.match(/^--checkpoint-action[=\s]+([^\s]+)/)
+    if (val && val[1].includes('exec')) return true
   }
-  if (firstLower === 'cpio') {
-    // Interactive rename (-r / --rename) is an exec-style sink; check on
-    // original-case tokens so -R owner is not confused with -r.
-    const tokens = tokenize(norm)
-    for (const t of tokens) {
-      if (t === '--rename') return true
-      if (t.startsWith('-') && !t.startsWith('--') && t.slice(1).includes('r')) return true
+  if (c.includes('--rmt-command') || c.includes('--rsh-command')) return true
+  for (let i = 0; i < rest.length; i++) {
+    const tl = rest[i]
+    if (tl === '-i' || tl === '--use-compress-program') {
+      const v = rest[i + 1] ?? ''
+      if (!ARCHIVE_COMPRESSORS.has(v)) return true
+      i++
+      continue
     }
+    if (tl.startsWith('-i') && tl.length > 2 && !tl.startsWith('--')) {
+      // Glued form: -Ish
+      const v = tl.slice(2)
+      if (!ARCHIVE_COMPRESSORS.has(v)) return true
+    }
+    if (tl.startsWith('--use-compress-program=')) {
+      const v = tl.slice('--use-compress-program='.length)
+      if (!ARCHIVE_COMPRESSORS.has(v)) return true
+    }
+  }
+  return false
+}
+
+function hasCpioSink(tokens: string[], start: number): boolean {
+  // Interactive rename (-r / --rename) is an exec-style sink; check on
+  // ORIGINAL-case tokens so -R owner is not confused with -r.
+  for (const t of tokens.slice(start)) {
+    if (t === '--rename') return true
+    if (t.startsWith('-') && !t.startsWith('--') && t.slice(1).includes('r')) return true
+  }
+  return false
+}
+
+/**
+ * Archive "bytes -> interpreter" sinks (review-029-r1 F2 / f1f2 closeout).
+ * A tar archive can be told to pipe every extracted member through a shell
+ * (`--to-command=sh`), execute a command at each checkpoint
+ * (`--checkpoint-action=exec=…`), run a remote shell hook
+ * (`--rmt-command` / `--rsh-command`), or decompress through an arbitrary
+ * program (`-I` / `--use-compress-program`); cpio's interactive rename (`-r`)
+ * is the same family. These are B1-class primitives: untrusted archive bytes
+ * reach an interpreter with zero checked write targets.
+ *
+ * review-029-f2b/f2c closeout hardening:
+ * - Normalise shell quoting AND backslash escapes first (`\=`, `--to-com""mand`)
+ *   so injected quotes/escapes cannot break the match (the shell consumes
+ *   them, tar sees the real option).
+ * - Wrapper-aware program resolution instead of a bare first-word equality:
+ *   skip pass-through prefixes (env/command/nohup/time/nice/ionice/strace/
+ *   xargs/busybox/exec/builtin/sudo/doas) and their leading options, resolve
+ *   the program by basename (`/usr/bin/tar`, `./tar`, `tar.exe`), and recurse
+ *   into `sh -c "STRING"` command strings (the agent's common composite form).
+ * - Only a resolved tar-family program is tested for tar sinks, only a
+ *   resolved cpio for rename sinks — sed -i / perl -i / gzip -i are never
+ *   swept by a generic -i match.
+ * Single source of truth: index.ts and test-hook.mts import this function.
+ */
+export function hasArchiveExecSink(command: string): boolean {
+  // Shell consumes backslash escapes and quotes before the tool sees its
+  // argv; strip both so the matcher sees the real option string.
+  const norm = (command ?? '').replace(/\\/g, '').replace(/["']/g, '')
+  const tokens = tokenize(norm)
+  let i = 0
+  while (i < tokens.length) {
+    const t = tokens[i]
+    if (PASSTHROUGH_PREFIXES.has(t)) {
+      i++
+      continue
+    }
+    if (t.startsWith('-')) {
+      // Leading options of a pass-through prefix (env -i, xargs -I{} ...).
+      i++
+      continue
+    }
+    if (COMMAND_SHELLS.has((t.split('/').pop() ?? t).toLowerCase())) {
+      // shell -c "STRING" executes a command string: recurse into it.
+      const next = tokens[i + 1] ?? ''
+      if (next === '-c') {
+        const strIdx = i + 2
+        if (strIdx < tokens.length) {
+          const inner = tokens.slice(strIdx).join(' ')
+          if (hasArchiveExecSink(inner)) return true
+        }
+        return false
+      }
+      if (next.startsWith('-c')) {
+        const inner = next.slice(2) + ' ' + tokens.slice(i + 2).join(' ')
+        if (hasArchiveExecSink(inner)) return true
+        return false
+      }
+      // Plain shell invocation (interactive / script file): not itself a sink.
+      return false
+    }
+    const base = (t.split('/').pop() ?? t).toLowerCase()
+    if (base === 'tar' || base === 'gtar' || base === 'bsdtar' || base.endsWith('tar.exe')) {
+      return hasTarSink(tokens, i)
+    }
+    if (base === 'cpio' || base.endsWith('cpio.exe')) {
+      return hasCpioSink(tokens, i)
+    }
+    // A real non-archive command (sed, perl, gzip, ...): its -i is its own.
     return false
   }
   return false

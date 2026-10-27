@@ -218,6 +218,49 @@ check('bash cpio --rename < a.cpio (interactive rename, deny)',
   { name: 'bash', arguments: { command: 'cpio --rename < a.cpio', description: 'interactive rename long form' } },
   { allow: false, category: 'file_write' })
 
+// review-029-f2c-closeout: wrapper-aware resolution — env/absolute paths/
+// xargs/command/nohup/time and sh -c command strings must not blind the
+// matcher, while non-archive -i flags stay untouched.
+check('bash env tar --to-command=sh (wrapped, deny)',
+  { name: 'bash', arguments: { command: 'env tar --to-command=sh -xf a.tar', description: 'env-wrapped tar sink' } },
+  { allow: false, category: 'file_write' })
+
+check('bash /usr/bin/tar --to-command=sh (absolute path, deny)',
+  { name: 'bash', arguments: { command: '/usr/bin/tar --to-command=sh -xf a.tar', description: 'absolute-path tar sink' } },
+  { allow: false, category: 'file_write' })
+
+check('bash xargs tar --to-command=sh < list (xargs-wrapped, deny)',
+  { name: 'bash', arguments: { command: 'xargs tar --to-command=sh < list', description: 'xargs-wrapped tar sink' } },
+  { allow: false, category: 'file_write' })
+
+check('bash command tar -I sh -xf a.tar (command-wrapped, deny)',
+  { name: 'bash', arguments: { command: 'command tar -I sh -xf a.tar', description: 'command-wrapped tar sink' } },
+  { allow: false, category: 'file_write' })
+
+check('bash nohup tar --checkpoint-action=exec=sh (nohup-wrapped, deny)',
+  { name: 'bash', arguments: { command: 'nohup tar --checkpoint-action=exec=sh -cf o.tar d', description: 'nohup-wrapped tar sink' } },
+  { allow: false, category: 'file_write' })
+
+check('bash sh -c "tar -I sh -xf a.tar" (shell -c string, deny)',
+  { name: 'bash', arguments: { command: 'sh -c "tar -I sh -xf a.tar"', description: 'shell -c tar sink' } },
+  { allow: false, category: 'file_write' })
+
+check('bash bash -c "tar --to-command=sh -xf a.tar" (bash -c string, deny)',
+  { name: 'bash', arguments: { command: 'bash -c "tar --to-command=sh -xf a.tar"', description: 'bash -c tar sink' } },
+  { allow: false, category: 'file_write' })
+
+check('bash /bin/sh -c "tar -I sh -xf a.tar" (absolute shell -c, deny)',
+  { name: 'bash', arguments: { command: '/bin/sh -c "tar -I sh -xf a.tar"', description: 'absolute shell -c tar sink' } },
+  { allow: false, category: 'file_write' })
+
+check('bash env gzip f (wrapped normal command, allow)',
+  { name: 'bash', arguments: { command: 'env gzip f', description: 'env-wrapped gzip' } },
+  { allow: true, category: 'file_write' })
+
+check('bash /usr/bin/cpio -idmv < a.cpio (absolute cpio extraction, allow)',
+  { name: 'bash', arguments: { command: '/usr/bin/cpio -idmv < a.cpio', description: 'absolute-path cpio extraction' } },
+  { allow: true, category: 'file_write' })
+
 // Read-only archive operations are classified read and must stay allowed
 // even in an unprotected cwd.
 check('bash tar -tf (listing, allow)',
