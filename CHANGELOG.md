@@ -4,6 +4,61 @@ All notable changes to dsh-tm-guard will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-10-26
+
+### Security
+- **Strict-GET download exemption switched from a denylist to a flag
+  allowlist.** The readonly curl download path now tokenizes the command and
+  approves only when every flag is on an explicit benign allowlist, there is
+  exactly one http(s) URL, and at least one output is present. Closes gaps
+  where the previous denylist was bypassed by: proxy redirection (`-x`,
+  `--proxy1.0`); credential flags (`-b`, `-c`, `--oauth2-bearer`, `--netrc`,
+  `--cert`, `--key`, `-u`); TLS weakening (`--cacert`, `--pinnedpubkey`,
+  `-k`); connection-destination overrides (`--resolve`, `--connect-to`,
+  `--socks5`, `--interface`); and non-download verbs (`-I`/HEAD, `-J`, `-A`,
+  `-e`, `-H`, `-X`, `-d`, `-T`, `-F`, `-K`).
+- **Symlink escape hardening.** Target paths are canonicalized before the
+  inside-workspace boundary check: the whole path is realpath'd when it exists
+  (covers an existing file-symlink pointing outside); dangling (broken) links
+  are resolved with lstat/readlink and followed hop by hop (covers single-hop
+  and chained dangling links, including a target containing `..`); a chain
+  that exhausts the hop cap is denied. A cwd-internal symlink pointing outside
+  no longer vouches the write or creates a git repo outside the session.
+- **Non-file curl output sinks rejected.** `-o -` / `-o /dev/stdout` /
+  `/dev/stderr` / `/dev/fd/*` (stdout that can be piped into a shell) and
+  process substitution (`>(sh)`, `<(sh)`) or shell-metacharacter targets are
+  classified as network, closing the RCE-whitening path where a "download"
+  fed the response body to a shell.
+- **Auto-init scope guard.** Automatic `git init` for a new workspace is
+  restricted to the session cwd: absolute paths containing literal `..` and
+  cwd-internal symlinks to outside are canonicalized first, system roots
+  (`/System`, `/Library`, `/usr`, `/opt`, `/private`, `/home`, ...) and their
+  subpaths are blocked by prefix match, and `/private/tmp`, `/private/var`,
+  `/private/etc` (macOS rootless links) are covered.
+
+### Added
+- **Zero-config new workspaces.** The first write inside a session's working
+  directory that is not Time Machine protected now auto-initializes a local git
+  baseline and is then treated as rollback-protected and allowed, so a freshly
+  created project works without manual setup. Temp paths (`/tmp`, ...) keep
+  using the temp branch; an unprotected temp write is never given a git net,
+  so a session whose cwd is the temp root itself cannot `git init` at a
+  forbidden root.
+- **No-target file writes fail closed.** A file-write classified command with
+  no concrete local target path is denied instead of being treated as
+  vacuously protected.
+
+### Changed
+- `curl -O`/`--remote-name`/`--remote-name-all` now correctly count as an
+  output and anchor the baseline at the session cwd rather than its parent.
+- URL scheme detection is case-insensitive (accepts `HTTP://`).
+
+### Documentation
+- README documents the curl download exception, the allowlist model, the three
+  locations where writes are allowed, and that a proxy set through an
+  environment variable (e.g. `env https_proxy=... curl`) is not inspected and
+  should be controlled with an external firewall.
+
 ## [0.2.8] - 2026-10-20
 
 ### Added

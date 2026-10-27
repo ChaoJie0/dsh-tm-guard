@@ -40,6 +40,7 @@ import {
 import {
   classifyToolCall,
   decide,
+  isTempPath,
   type GateDecision,
 } from './classifier.ts'
 import { scanCommandForEgress } from './scan-scripts.ts'
@@ -74,8 +75,9 @@ import {
 } from './baseline-report.ts'
 import { verifyTurn } from './verify.ts'
 import { dirname, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
 import { execSync } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, writeFileSync } from 'node:fs'
 
 /* ------------------------------------------------------------------ */
 /* Plugin configuration                                                */
@@ -271,6 +273,116 @@ export const DEFAULT_CONFIG: TmGuardConfig = {
   // advisory noise for repos full of regenerable artifacts. When true it
   // warns; it NEVER denies. See TmGuardConfig.warnOnIgnoredDelete.
   warnOnIgnoredDelete: false,
+}
+
+/* ------------------------------------------------------------------ */
+/* Automatic git-baseline scope guard                                 */
+/* ------------------------------------------------------------------ */
+
+// System roots under which an automatic `git init` must never run. They are
+// matched by PREFIX (with a directory boundary), so any subpath is covered
+// too — this closes the exact-equality gap (e.g. /usr/local/work). /private
+// is included because macOS rootless links /etc, /tmp and /var into it
+// (/etc -> /private/etc); realpath canonicalisation below makes those
+// aliases resolve to this set. /Users is intentionally NOT here: a normal
+// project lives under the user's home (e.g. /Users/alice/proj);
+// the home directory itself and /Users are blocked by exact match.
+const AUTO_INIT_FORBIDDEN_ROOTS = new Set([
+  '/System',
+  '/Library',
+  '/Applications',
+  '/private',
+  '/usr',
+  '/opt',
+  '/bin',
+  '/sbin',
+  '/dev',
+  '/Volumes',
+  '/Network',
+  '/home',
+])
+
+// Resolve a target to a canonical absolute path: lexical `.`/`..` first, then
+// symlinks. When the whole path already exists (including a basename that is
+// itself a symlink), it is realpath'd fully so a link pointing outside the
+// workspace is resolved to its real target. When the basename is a DANGLING
+// symlink (the link exists but its target does not), the link chain is
+// followed hop by hop via readlink, because an OS write traverses the whole
+// chain (a -> b -> outside); the final target is resolved lexically so a
+// write that would create the file outside the workspace is not treated as
+// inside. When the basename does not exist yet (a new file), only the
+// existing parent is realpath'd. This holds the boundary against an absolute
+// `/cwd/../outside` target, a symlinked directory, a symlinked file, a
+// single dangling link, and a chained dangling link.
+function canonicalTarget(p: string): string {
+  const lex = resolve(p.startsWith('/') ? p : join(process.cwd(), p))
+  try {
+    return realpathSync(lex)
+  } catch {
+    // The whole path does not resolve; it may be a new file or a dangling link.
+  }
+  // Follow a possibly-chained dangling symlink. Each hop that is itself a
+  // link must be followed; a hop that now resolves is realpath'd.
+  let cur = lex
+  const seen = new Set<string>([cur])
+  let followed = false
+  for (let hops = 0; hops < 40; hops++) {
+    let st
+    try {
+      st = lstatSync(cur)
+    } catch {
+      // cur does not exist and is not a link: this is the final dangling
+      // target reached through at least one link hop.
+      if (cur !== lex) return cur
+      break
+    }
+    if (!st.isSymbolicLink()) return cur
+    followed = true
+    const link = readlinkSync(cur)
+    const next = resolve(link.startsWith('/') ? link : join(dirname(cur), link))
+    if (seen.has(next)) return next
+    seen.add(next)
+    cur = next
+    try {
+      return realpathSync(cur)
+    } catch {
+      // Still dangling; keep following the chain.
+    }
+  }
+  // A link chain exhausted the hop cap without reaching a terminal target:
+  // deny rather than fall through (the kernel already rejects such a chain
+  // with ELOOP, so this is defense in depth).
+  if (followed) return '/.tmguard-symlink-cap'
+  const dir = dirname(lex)
+  const base = lex.slice(dir.length + 1)
+  let realDir = dir
+  try {
+    realDir = realpathSync(dir)
+  } catch {
+    // Parent does not exist yet; fall back to the lexical resolution.
+  }
+  return base ? join(realDir, base) : realDir
+}
+
+function isAutoInitSafe(dir: string): boolean {
+  const d = resolve(dir)
+  const home = resolve(homedir())
+  if (d === '/' || d === '/Users' || d === home) return false
+  let real = d
+  try {
+    real = realpathSync(d)
+  } catch {
+    // Directory does not exist yet; judge the lexical form.
+  }
+  if (real === '/' || real === '/Users' || real === home) return false
+  // Note: a normal project lives under the home (e.g. ~/Self_Work/proj) and
+  // must still be auto-initialized, so the home subtree is NOT blanket-banned
+  // here. A symlink that escapes the session cwd into the home tree is
+  // rejected by the canonical insideWorkspace boundary before this is called.
+  for (const root of AUTO_INIT_FORBIDDEN_ROOTS) {
+    if (real === root || real.startsWith(root + '/')) return false
+  }
+  return true
 }
 
 /* ------------------------------------------------------------------ */
@@ -810,27 +922,84 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       }
 
       // Config overrides for network/system
+      let downgradedToFileWrite = false
       if (!config.denyNetwork && classification.category === 'network') {
         classification.category = 'file_write'
         classification.reason += ' [network denial disabled by config]'
+        downgradedToFileWrite = true
       }
       if (!config.denySystem && classification.category === 'process') {
         classification.category = 'file_write'
         classification.reason += ' [system denial disabled by config]'
+        downgradedToFileWrite = true
       }
 
-      // Check path protection for file writes
+      // Check rollback coverage for file writes. A target is covered when it
+      // is Time-Machine protected (protectedPaths) OR a local git baseline
+      // exists. A brand-new workspace (the session cwd) that is not yet a git
+      // repo gets its baseline established on the first write (auto git init),
+      // so the write is rollback-able with no manual configuration. Auto-init
+      // is scoped strictly inside the session cwd, never at a system root or
+      // the home directory. Targets are canonicalised (lexical `..` resolved
+      // and symlinks followed) BEFORE the boundary test, so a path that looks
+      // inside cwd but resolves outside cannot place a repo outside the
+      // workspace or vouch for an out-of-scope write.
       let pathsProtected = true
-      if (classification.category === 'file_write' && classification.targetPaths.length > 0) {
-        const checks = await Promise.all(
-          classification.targetPaths.map((p) =>
-            isPathProtected(p, config.protectedPaths),
-          ),
+      let protectedTargetChecks: boolean[] = []
+      if (
+        classification.category === 'file_write' &&
+        classification.targetPaths.length === 0 &&
+        classification.reason.startsWith('Read-only curl download') &&
+        !downgradedToFileWrite
+      ) {
+        // A strict-GET curl download with no concrete file target (e.g.
+        // `-o --`) cannot be proven rollbackable; fail closed. Other
+        // file_write commands with implicit targets (tar/unzip/gzip/rsync/
+        // xargs... ) keep their normal semantics: they are evaluated by the
+        // protection layer below (protected workspace -> allow + baseline,
+        // unprotected -> deny). (A denyNetwork=false / denySystem=false
+        // downgrade is an explicit user widening and keeps its old allow
+        // semantics.)
+        pathsProtected = false
+        classification.reason += ' [no concrete local write target]'
+      } else if (classification.category === 'file_write' && classification.targetPaths.length > 0) {
+        // TM / protectedPaths coverage is evaluated on the LEXICAL targets
+        // (as in 0.2.8): the configured protectedPaths are lexical and must
+        // match a lexical target. Feeding them a realpath breaks the match —
+        // a TMPDIR target is /var/folders but its realpath is /private/var/
+        // folders, and the configured prefix would no longer match.
+        protectedTargetChecks = await Promise.all(
+          classification.targetPaths.map((p) => isPathProtected(p, config.protectedPaths)),
         )
-        pathsProtected = checks.every(Boolean)
+
+        // For a target not yet TM-covered, establish a local git baseline so
+        // the write is reversible. This is scoped to a NON-temp path inside
+        // the session cwd: temp paths are scratch and take decide()'s temp
+        // branch (the post-decide block still runs the fail-closed net for
+        // them). The boundary is tested on canonical paths (lexical `..`
+        // resolved and symlinks followed), so a target that looks inside
+        // cwd but resolves outside cannot place a repo outside the
+        // workspace or vouch for an out-of-scope write.
+        const sessionCwd = canonicalTarget(process.cwd())
+        const gitChecks = await Promise.all(classification.targetPaths.map(async (p, i) => {
+          if (protectedTargetChecks[i]) return true
+          if (isTempPath(p)) return false
+          const cp = canonicalTarget(p)
+          const insideWorkspace = cp === sessionCwd || cp.startsWith(sessionCwd + '/')
+          if (!insideWorkspace) return false
+          // A curl -O download synthesises the cwd itself as the target;
+          // anchor the baseline at cwd rather than its parent. A concrete
+          // file is covered by a baseline in its directory.
+          const initDir = cp === sessionCwd ? cp : dirname(cp)
+          if (!isAutoInitSafe(initDir)) return false
+          const r = await ensureGitBaseline(initDir)
+          return r.ok
+        }))
+
+        pathsProtected = classification.targetPaths.every((_p, i) => protectedTargetChecks[i] || gitChecks[i])
         if (!pathsProtected) {
           const unprotected = classification.targetPaths.filter(
-            (_p, i) => !checks[i],
+            (_p, i) => !protectedTargetChecks[i] && !gitChecks[i],
           )
           classification.reason += ` [unprotected: ${unprotected.join(', ')}]`
         }
@@ -860,15 +1029,27 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       // bytes into the object store; forces a fresh TM snapshot instead of a
       // false git `yes` inside the cooldown window.
       let checkpointFailed = false
+      // Every file write - including a scratch/temp-dir write - must pass
+      // through the rollback net here. The pre-decide block may have already
+      // established a baseline (a protected workspace or a new workspace);
+      // for a temp write it deliberately did not, so this is where the
+      // baseline (and the final fail-closed check) is enforced.
       if (isFileWrite && !isTmInternalTool) {
+        const postCwd = canonicalTarget(process.cwd())
         const dirs = new Set<string>()
-        for (const p of classification.targetPaths) {
-          const abs = p.startsWith('/') ? p : resolve(process.cwd(), p)
-          dirs.add(dirname(abs))
+        for (let i = 0; i < classification.targetPaths.length; i++) {
+          const p = classification.targetPaths[i]
+          // An UNPROTECTED temp target is disposable scratch (decide()'s
+          // temp branch allows it without a rollback net), so no git net is
+          // built for it. This keeps a session cwd that is itself a temp
+          // root (/private/tmp) from ever running `git init` at the
+          // forbidden root. Protected or non-temp targets keep the net.
+          if (!(protectedTargetChecks[i] ?? false) && isTempPath(p)) continue
+          const abs = canonicalTarget(p)
+          dirs.add(abs === postCwd ? postCwd : dirname(abs))
         }
-        if (dirs.size === 0) dirs.add(process.cwd())
         const dirList = [...dirs]
-        if (config.requireGitBaseline) {
+        if (config.requireGitBaseline && dirList.length > 0) {
           const results = await Promise.all(dirList.map((d) => ensureGitBaseline(d)))
           gitNetReady = results.every((r) => r.ok)
 
@@ -938,7 +1119,11 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         !isTmInternalTool &&
         (needsTmBackstop || blockReads)
       ) {
-        const health = await getTmHealth(config.protectedPaths)
+        // When the git net is missing, a write's reversibility now depends on
+        // the real current TM state - a stale cached "healthy" from an earlier
+        // (possibly simulated) check must not be used to let it through. Force
+        // a refresh in that case; a read-block uses the cached health.
+        const health = await getTmHealth(config.protectedPaths, needsTmBackstop)
         if (!health.healthy) {
           const issueList = health.issues.join('; ')
           const denyReason = gitNetReady === false && isFileWrite

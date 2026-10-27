@@ -345,16 +345,33 @@ function extractWritePaths(command: string): string[] {
   // curl -o/--output SEPARATE values (`-o /tmp/x`): the download lands on a
   // local path, so it must be extracted or legitimate `curl -o /tmp/x`
   // downloads get blocked as unprotected writes (0.2.6 edge 2 fix side).
+  // -O/--remote-name writes into cwd using the remote basename; there is no
+  // explicit target token, so synthesize cwd for the rollback check.
   if (cmd === 'curl') {
+    let hasRemoteName = false
     for (let i = 1; i < tokens.length; i++) {
       const t = tokens[i]
-      if (t !== '-o' && t !== '--output' && t !== '--output-file' && t !== '--outfile') continue
-      const v = tokens[i + 1]
-      if (v && !v.startsWith('-') && !/^https?:\/\//.test(v)) {
-        paths.push(v)
-        i++
+      if (t === '-o' || t === '--output' || t === '--output-file' || t === '--outfile') {
+        const v = tokens[i + 1]
+        if (v && !v.startsWith('-') && !/^https?:\/\//.test(v)) {
+          paths.push(v)
+          i++
+        }
+        continue
+      }
+      if (t === '--remote-name' || t === '--remote-name-all') {
+        hasRemoteName = true
+        continue
+      }
+      // -O in a short cluster (-sO, -O, -sfLO). A lowercase `-o` anywhere
+      // consumes the rest as a filename, so only the letters before it count.
+      if (t.startsWith('-') && !t.startsWith('--')) {
+        const oIdx = t.indexOf('o')
+        const head = oIdx === -1 ? t.slice(1) : t.slice(1, oIdx)
+        if (head.includes('O')) hasRemoteName = true
       }
     }
+    if (hasRemoteName) paths.push(process.cwd())
   }
 
   if (['rm', 'mv', 'cp', 'touch', 'mkdir', 'rmdir', 'chmod', 'chown',
@@ -1234,101 +1251,186 @@ function isLoopbackOnly(rest: string): boolean {
 }
 
 /**
- * True when a curl command is a strict read-only download: GET to http(s)
- * URLs only, output written to a local file (-o/--output/-O/--remote-name),
- * and no request body, upload, custom method, auth/credential header,
- * TLS-bypass, proxy or referer flag. Anything else must remain network/deny.
+ * True when a curl command is a strict read-only download: a single GET to
+ * one http(s) URL, output written to a local file (-o/--output/-O/
+ * --remote-name), and no request body, upload, custom method,
+ * auth/credential header, TLS-bypass, proxy, destination override or
+ * referer flag. This is an ALLOWLIST of known-benign flags, not a
+ * denylist: every unlisted flag or token denies, so an undiscovered option
+ * (proxy short form, cookie/oauth2 credentials, TLS weakening,
+ * --resolve/--connect-to, HEAD) cannot slip through. Anything else must
+ * remain network/deny.
  */
-/**
- * Expand glued single-char short-option clusters so per-flag matchers see
- * every flag: `curl -sLk -o a https://…` → `-s -L -k -o a …`. A cluster is a
- * single-dash run of 2+ flag letters (`-sLk`); single-char options (`-o`,
- * `-O`, `-X`) and long options (`--output`) are left untouched. Expansion is
- * conservative for safety: `-data` (not a real curl short cluster) expands to
- * `-d -a -t -a`, which trips the `-d` block and stays network/deny.
- *
- * Exception: `-o` is a value-taking short option, so `-oout` / `-osLk` mean
- * `-o out` / `-o sLk` (the value is a filename), NOT a flag cluster
- * `-o -u -t …`. Expanding it would fabricate blocked flags (`-u`, `-d`, …)
- * out of the filename and false-deny legitimate `curl -oNAME` downloads.
- * The same applies when `-o` appears INSIDE a cluster (`-sodata` = `-s -o
- * data`): the option letter is followed by its value, so expansion stops
- * there — the remaining characters stay glued to `-o` as the filename.
- */
-function expandShortOptionClusters(cmd: string): string {
-  return cmd.replace(
-    /(^|\s)-([A-Za-z][A-Za-z0-9]{1,})(?=\s|$)/g,
-    (_m, lead: string, cluster: string) => {
-      // `-o` at position 0: whole cluster is `-o` + filename (`-oT` = output
-      // to file `T`). Never expand — would fabricate blocked flags.
-      if (cluster.startsWith('o')) return lead + '-' + cluster
-      // `-o` INSIDE the cluster (`-sodata` = `-s -o data`): expand the
-      // leading benign flags, then keep `-o` + the rest as the filename.
-      const oIdx = cluster.indexOf('o', 1)
-      if (oIdx !== -1) {
-        const flags = [...cluster.slice(0, oIdx)].map((ch) => `-${ch}`).join(' ')
-        return lead + flags + ' -' + cluster.slice(oIdx)
-      }
-      return lead + [...cluster].map((ch) => `-${ch}`).join(' ')
-    },
-  )
+// Strict-GET download allowlist. Only flags that provably cannot change the
+// method, destination, credentials or TLS trust are permitted; every
+// unlisted flag or token denies. This retires the whole "undiscovered flag
+// allowed" class that a denylist had (proxy short form, cookie/oauth2
+// credentials, TLS weakening, --resolve/--connect-to destination override,
+// HEAD) and matches the plugin's default-deny stance.
+
+// Short flags that take no value and are benign for a GET download.
+const CURL_BENIGN_SHORT = new Set([
+  's', // silent
+  'S', // show-error
+  'L', // follow redirects
+  'f', // fail on HTTP error
+  'g', // globoff (disable URL globbing)
+  'q', // disable (do not read curlrc)
+  'N', // no output buffering
+  'v', // verbose
+  '#', // progress bar
+  '4', // IPv4 only
+  '6', // IPv6 only
+])
+// Short flags that take a value (the value is consumed, not re-checked).
+const CURL_VALUE_SHORT = new Set([
+  'r', // range
+  'm', // max-time
+  'z', // time-cond
+  'C', // continue-at (resume)
+  'Y', // speed-limit
+  'y', // speed-time
+])
+// Long flags that take no value and are benign.
+const CURL_BENIGN_LONG = new Set([
+  '--silent', '--show-error', '--location', '--fail', '--fail-early',
+  '--fail-with-body', '--globoff', '--disable', '--no-buffer', '--verbose',
+  '--progress-bar', '--ipv4', '--ipv6', '--compressed', '--tr-encoding',
+  '--remote-name', '--remote-name-all', '--no-remote-name',
+  '--no-progress-meter', '--no-clobber', '--retry-all-errors',
+  '--retry-connrefused', '--help', '--version',
+])
+// Long flags that take a value (the value is consumed, not re-checked).
+const CURL_VALUE_LONG = new Set([
+  '--range', '--max-time', '--time-cond', '--continue-at',
+  '--speed-limit', '--speed-time', '--limit-rate', '--connect-timeout',
+  '--retry', '--retry-delay', '--retry-max-time', '--output',
+  '--max-filesize',
+])
+
+// A -o/--output target that is not a real file: `-` (stdout), a /dev
+// pseudo-device, or a value carrying shell metacharacters (a pipe, an
+// operator/command substitution, or bash process substitution `>(sh)`).
+// The response then reaches a shell (`curl -o - URL | sh`,
+// `curl -o >(sh) URL`) instead of a rollbackable local file, so it must
+// not be treated as a strict-GET download.
+const NON_FILE_TARGET_CHARS = /[|&;<>()$`]/
+function isNonFileOutput(value: string): boolean {
+  if (value === '-') return true
+  // Normalise a doubled/leading-slash prefix: POSIX treats `//dev/stdout`
+  // as `/dev/stdout`, so it must still hit the pseudo-device test and be
+  // classified as a non-file output rather than a rollbackable file.
+  const norm = value.startsWith('//') ? value.replace(/^\/+/, '/') : value
+  if (norm.startsWith('/dev/')) return true
+  if (NON_FILE_TARGET_CHARS.test(value)) return true
+  return false
 }
 
 function isReadonlyCurlDownload(rest: string): boolean {
   // Quote-strip BEFORE flag detection: `curl "-HX:y"` / `curl "--insecure"`
-  // are shell syntax — curl receives the bare option. The token-based checks
-  // below split on whitespace, so a leading quote would make the token look
-  // like a non-option and hide the flag entirely (dsh review B-4). The write
-  // path extraction already works on quote-stripped tokens; flag detection
-  // must use the same view.
-  const s = expandShortOptionClusters(
-    rest
-      .split(/\s+/)
-      .map((t) => t.replace(/^['"]|['"]$/g, ''))
-      .join(' '),
-  )
-  // Must target at least one http(s) URL.
-  if (!/https?:\/\/[^\s"'`]+/.test(s)) return false
-  // Must write output to a local file (not stdout, not piped).
-  const hasOutput =
-    /(?:^|\s)-o\s+\S+/.test(s) || /(?:^|\s)--output\s+\S+/.test(s) ||
-    /(?:^|\s)--output=\S+/.test(s) || /(?:^|\s)-o\S+/.test(s) ||
-    /(?:^|\s)-O\b/.test(s) || /(?:^|\s)--remote-name\b/.test(s)
-  if (!hasOutput) return false
-  // Any of these flags makes it not a read-only download.
-  //
-  // Short options are checked TOKEN-wise so a dangerous letter is caught at
-  // ANY position inside the token (cluster prefix, glued value, punctuation
-  // value): `-sHX:y`, `-sLdsecret=1`, `-suadmin:pw`, `-sFkey=@f`,
-  // `-sehttp://r`, `-sK./cfg`, `-sk./x`, `-XPOST` — a single benign prefix
-  // letter must not hide them (dsh review B-3). `-o` is exempted at any
-  // position: it is a value-taking option whose value is a local filename
-  // (`-odata`, `-sodata` = `-s -o data`), so the option letter and everything
-  // after it never participate in the danger check.
-  const shortOptionTokens = s.split(/\s+/)
-  for (const tok of shortOptionTokens) {
-    if (!tok.startsWith('-') || tok.startsWith('--')) continue
-    const oIdx = tok.indexOf('o')
-    const head = oIdx === -1 ? tok.slice(1) : tok.slice(1, oIdx)
-    if (/[HdXuFTekK]/.test(head)) return false
+  // are shell syntax — curl receives the bare option. A leading quote would
+  // make the token look like a non-option and hide the flag entirely.
+  const tokens = rest
+    .split(/\s+/)
+    .map((t) => t.replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean)
+
+  let urlCount = 0
+  let outputCount = 0
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]
+
+    // Long option: exact name match (no curl-style abbreviation, which could
+    // otherwise be ambiguous). Value is either inline after `=` or the next
+    // token, and is consumed without re-checking.
+    if (tok.startsWith('--')) {
+      const eq = tok.indexOf('=')
+      const name = eq === -1 ? tok : tok.slice(0, eq)
+      if (CURL_BENIGN_LONG.has(name)) {
+        if (eq !== -1) return false
+        // --remote-name / --remote-name-all are the long form of -O: the
+        // response is written to a server-named local file, so they supply
+        // the required output.
+        if (name === '--remote-name' || name === '--remote-name-all') outputCount++
+        continue
+      }
+      if (CURL_VALUE_LONG.has(name)) {
+        let val: string
+        if (eq !== -1) {
+          val = tok.slice(eq + 1)
+        } else {
+          if (i + 1 >= tokens.length) return false
+          val = tokens[i + 1]
+          i++
+        }
+        if (name === '--output') {
+          if (isNonFileOutput(val)) return false
+          outputCount++
+        }
+        continue
+      }
+      return false
+    }
+
+    // Short option: walk the cluster letter by letter. A bare benign flag
+    // (`-s`, `-sfL`) only advances; a value-taking flag (`-r`, `-m`)
+    // consumes the rest of the token or the next token; `-o` consumes the
+    // filename; `-O` takes no value. Any unlisted letter denies — this is
+    // what catches `-x` (proxy), `-b`/`-c` (cookies), `-A` (UA),
+    // `-E`/`-K` (cert/config), `-I` (HEAD), `-X`/`-d`/`-H` etc.
+    if (tok.startsWith('-') && tok.length > 1) {
+      const chars = tok.slice(1)
+      let j = 0
+      while (j < chars.length) {
+        const ch = chars[j]
+        if (ch === 'o') {
+          let outFile: string
+          if (j + 1 < chars.length) {
+            outFile = chars.slice(j + 1)
+          } else {
+            if (i + 1 >= tokens.length) return false
+            outFile = tokens[i + 1]
+            i++
+          }
+          if (isNonFileOutput(outFile)) return false
+          outputCount++
+          j = chars.length
+          break
+        }
+        if (ch === 'O') {
+          outputCount++
+          j++
+          continue
+        }
+        if (CURL_BENIGN_SHORT.has(ch)) {
+          j++
+          continue
+        }
+        if (CURL_VALUE_SHORT.has(ch)) {
+          if (j + 1 >= chars.length) {
+            if (i + 1 >= tokens.length) return false
+            i++
+          }
+          j = chars.length
+          break
+        }
+        return false
+      }
+      continue
+    }
+
+    // Exactly one http(s) URL.
+    if (/^https?:\/\/[^\s"'`]+/i.test(tok)) {
+      urlCount++
+      continue
+    }
+
+    // Any other bare token (a stray host, filename, scheme-less URL) denies.
+    return false
   }
-  // Long options (each matched by its own `--…` rule; never hit by the
-  // single-dash check above because (?:^|\s) requires a space/start before
-  // the dash and `--` starts with a dash).
-  const blockedLong: RegExp[] = [
-    /(?:^|\s)--request\b/,
-    /(?:^|\s)--data\b/, /(?:^|\s)--data-raw\b/, /(?:^|\s)--data-binary\b/, /(?:^|\s)--data-urlencode\b/,
-    /(?:^|\s)--upload-file\b/,
-    /(?:^|\s)--form\b/,
-    /(?:^|\s)--header\b/,
-    /(?:^|\s)--user\b/, /(?:^|\s)--basic\b/, /(?:^|\s)--digest\b/, /(?:^|\s)--anyauth\b/, /(?:^|\s)--bearer\b/,
-    /(?:^|\s)--insecure\b/,
-    /(?:^|\s)--config\b/,
-    /(?:^|\s)--proxy\b/, /(?:^|\s)--referer\b/,
-    /(?:^|\s)--post\d*\b/, /(?:^|\s)--head\b/,
-  ]
-  for (const re of blockedLong) if (re.test(s)) return false
-  return true
+
+  return urlCount === 1 && outputCount >= 1
 }
 
 /**
@@ -3520,6 +3622,8 @@ export interface GateDecision {
   category: OpCategory
   /** When allow=true and this is a write op, whether to snapshot first */
   shouldSnapshot: boolean
+  /** True when the write is confined to a disposable temp dir */
+  temp: boolean
 }
 
 /** macOS temp-dir prefixes — disposable scratch, exempt from the
@@ -3528,7 +3632,7 @@ const TEMP_PREFIXES = [
   '/tmp', '/private/tmp', '/var/tmp', '/var/folders',
 ]
 
-function isTempPath(abs: string): boolean {
+export function isTempPath(abs: string): boolean {
   if (!abs.startsWith('/')) abs = toAbsolute(abs)
   // Same normalization as the sensitive-read / write-protection sides
   // (normalizeForMatch collapses `//`, `.`, `..` and lowercases): a path like
@@ -3556,6 +3660,7 @@ export function decide(
       reason: `BLOCKED (${category}, forced deny): ${reason}`,
       category,
       shouldSnapshot: false,
+      temp: false,
     }
   }
 
@@ -3569,6 +3674,7 @@ export function decide(
         reason: `Allowed (${category}): ${reason}`,
         category,
         shouldSnapshot: false,
+        temp: false,
       }
 
     case 'file_write':
@@ -3578,6 +3684,7 @@ export function decide(
           reason: `Allowed (file_write on TM-protected path): ${reason}`,
           category,
           shouldSnapshot: true,
+          temp: false,
         }
       }
       // Writes confined to disposable temp dirs (/tmp, $TMPDIR, /var/tmp)
@@ -3590,6 +3697,7 @@ export function decide(
           reason: `Allowed (file_write in temp dir): ${reason}`,
           category,
           shouldSnapshot: false,
+          temp: true,
         }
       }
       return {
@@ -3597,6 +3705,7 @@ export function decide(
         reason: `BLOCKED (file_write on path NOT protected by Time Machine): ${reason}`,
         category,
         shouldSnapshot: false,
+        temp: false,
       }
 
     case 'network':
@@ -3609,6 +3718,7 @@ export function decide(
         reason: `BLOCKED (${category}, not TM-rollback-able): ${reason}`,
         category,
         shouldSnapshot: false,
+        temp: false,
       }
 
     case 'mixed':
@@ -3619,6 +3729,7 @@ export function decide(
         reason: `BLOCKED (${category}, cannot verify TM-rollback-ability): ${reason}`,
         category,
         shouldSnapshot: false,
+        temp: false,
       }
   }
 }

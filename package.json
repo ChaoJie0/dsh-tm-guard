@@ -1,6 +1,6 @@
 {
   "name": "dsh-tm-guard",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Autonomous agent permission gate for DeepSeek Harness (dsh) with automatic git/Time-Machine snapshots. Safe defaults on install (protect cwd, deny network/system, block sensitive reads). Configure protectedPaths/extraAllowTools to tune access for tools you explicitly trust — see README. Audit log keeps everything by default, with optional automatic cleanup of the oldest records.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -39,6 +39,7 @@
     "verify:build": "node scripts/verify-reproducible-build.mjs",
     "verify:pack": "node scripts/verify-pack-audit.mjs",
     "verify:hygiene": "node scripts/verify-hygiene.mjs",
+    "verify:postpublish": "node scripts/verify-postpublish.mjs",
     "verify:fast": "npm run test && npm run verify:peer && npm run verify:build && npm run verify:pack && npm run verify:hygiene",
     "release:check": "npm run verify:fast",
     "release:gate": "node scripts/release-gate.mjs",
