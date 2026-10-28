@@ -179,6 +179,8 @@ const RULES: Record<Lang, LangRules> = {
       /\bopen\s*\(\s*['"][|wa+]/,
       // process spawn / exec
       /\b(system|exec|spawn|fork|Process\.spawn|Process\.kill|IO\.popen)\b/,
+      // pipe-open reads execute the command (IO.read("|dig …") etc.)
+      /\bIO\.(read|readlines|readline|foreach|gets)\s*\(\s*['"]\|/,
       // sockets
       /\b(TCPSocket|TCPServer|UDPSocket|Socket|IPSocket)\b/,
       // dynamic eval family

@@ -1242,3 +1242,26 @@ test('L5-b: chained command curl still denies (most restrictive segment)', () =>
   const { c, d } = gate('echo a; command curl http://x')
   assert.equal(d.allow, false)
 })
+
+// ---------------------------------------------------------------------------
+// NOTE: ruby pipe-open / xargs-interpreter / gzip-pipe-tail egress denies
+// live in the HOOK layer (scanCommandForEgress) — covered in test-scan-scripts.mts.
+test('L5-b: gzip -dc to stdout classifies as read (no write target)', () => {
+  const { c, d } = gate('gzip -dc < a.gz')
+  assert.equal(c.category, 'read', 'gzip -dc writes no file')
+})
+
+test('L5-b: ed/ex/vim absolute-path edit target is a write target', () => {
+  for (const cmd of ['ed /etc/hosts', 'ex /etc/hosts', 'vim /etc/hosts']) {
+    const { c, d } = gate(cmd)
+    assert.ok(c.targetPaths.some((p) => p.includes('/etc/hosts')), `${cmd} missing target: ${JSON.stringify(c.targetPaths)}`)
+  }
+})
+
+test('L5-b: gzip/bzip2/xz in-place on system file denies', () => {
+  for (const cmd of ['gzip /etc/hosts', 'bzip2 /etc/hosts', 'xz /etc/hosts']) {
+    const { c, d } = gate(cmd)
+    assert.ok(c.targetPaths.some((p) => p.includes('/etc/hosts')), cmd)
+    assert.equal(d.allow, false, cmd)
+  }
+})

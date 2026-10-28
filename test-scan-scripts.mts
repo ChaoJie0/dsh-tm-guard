@@ -153,6 +153,16 @@ await expectClean(`npx --yes tsc --noEmit`, 'npx runner flags parse (package not
 // -(c|e)= inline-code defensive branch (perl -e=… style)
 await expectClean(`perl -e='print qq(hello)'`, 'perl -e= inline clean (no egress)')
 
+// L5-b: ruby pipe-open read executes the command (BLOCKER 3 tail — IO.read("|dig"));
+// the egress scan flags unverifiable, which the hook turns into deny.
+await expectUnverifiable(`ruby -e 'IO.read("|/usr/bin/dig example.com")'`, 'ruby IO.read pipe-open read')
+
+// L5-b: xargs inner interpreter write (BLOCKER 7b — stdin-carried target)
+await expectUnverifiable(`xargs ruby -e 'File.write(ARGV[0],"x")'`, 'xargs inner ruby write')
+
+// L5-b: gzip -dc piped ruby write reaches the egress scan (BLOCKER 7b tail)
+await expectUnverifiable(`gzip -dc < a.gz | ruby -e 'File.write("/etc/gz","x")'`, 'gzip -dc | ruby write')
+
 // --- cleanup ------------------------------------------------------
 rmSync(dir, { recursive: true, force: true })
 
