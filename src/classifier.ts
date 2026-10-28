@@ -1420,6 +1420,13 @@ function hasUnverifiableDanger(code: string, isPython = false): boolean {
   // the write nets, and a `'//'`/`'#'`/URL string must NOT wash out the rest
   // of its line (the Y1 fail-open the regex masks introduced).
   code = maskComments(code, isPython)
+  // H3b/F3: python may load code from sys.path — a mutation targeting an
+  // absolute path or a variable is unverifiable (a pure relative literal
+  // stays inside the session cwd and is allowed).
+  if (isPython) {
+    const sysThreat = pythonSysPathThreat(code)
+    if (sysThreat) return true
+  }
   // K1/J1-spill: constructor names — literal Path/PurePath plus aliases from
   // `from pathlib import Path as P` (used by the bound-writer net AND the
   // section-0 strict-chain net, so aliased P('/x').write_text( still denies).
@@ -2326,6 +2333,53 @@ function splitPipeRespectQuotes(command: string): string[] {
   return parts
 }
 
+/** PYTHONPATH/PYTHONSTARTUP assignment whose value contains an absolute path
+ * (or a variable / substitution) makes a python interpreter load code from an
+ * unverifiable location — fail closed. A pure relative literal ("./lib", "lib",
+ * ".") stays inside the session cwd and is allowed. */
+function taintedPathEnv(assignTok: string): string | null {
+  const m = assignTok.match(/^(PYTHONPATH|PYTHONSTARTUP)=(.+)$/)
+  if (!m) return null
+  const value = m[2]!
+  if (value === '') return null
+  if (/\$/.test(value) || /`/.test(value) || /["']/.test(value)) {
+    return `unverifiable ${m[1]} value`
+  }
+  for (const seg of value.split(':')) {
+    if (seg.startsWith('/')) {
+      return `${m[1]} points outside cwd (${seg.slice(0, 40)})`
+    }
+  }
+  return null
+}
+
+/** sys.path mutation (insert/append/extend/index-assign/plain assign) that
+ * loads python code from an absolute path or a non-literal argument — the
+ * injected module is unverifiable. A pure relative literal stays inside the
+ * session cwd and is allowed. */
+function pythonSysPathThreat(code: string): string | null {
+  let m: RegExpExecArray | null
+  const mut = /\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend)\s*\(([^)]*)\)/g
+  while ((m = mut.exec(code))) {
+    const args = m[1]!
+    const pathArg = args.includes(',')
+      ? args.slice(args.indexOf(',') + 1).trim()
+      : args.trim()
+    const lit = pathArg.match(/^['"]([^'"]*)['"]$/)
+    if (!lit) return `sys.path mutation with non-literal argument: ${pathArg.slice(0, 40)}`
+    const p = lit[1]!
+    if (p.startsWith('/') || p.includes(':')) return `sys.path points outside cwd: ${p.slice(0, 40)}`
+  }
+  const assign = /\bsys\s*\.\s*path\s*(?:\[[^\]]*\]\s*)?=\s*['"]([^'"]*)['"]/g
+  while ((m = assign.exec(code))) {
+    if (m[1]!.startsWith('/')) return `sys.path assignment outside cwd: ${m[1]!.slice(0, 40)}`
+  }
+  if (/\bsys\s*\.\s*path\s*=\s*(?!['"])/.test(code)) {
+    return 'sys.path assigned from a non-literal'
+  }
+  return null
+}
+
 function classifySingleCommand(command: string, denyReadPaths: string[] = []): ClassifyResult {
   let trimmed = command.trim()
   // Strip one or more leading '(' (subshell groups) so `(lsof -ti:3000 | xargs …)`
@@ -2345,7 +2399,19 @@ function classifySingleCommand(command: string, denyReadPaths: string[] = []): C
     let inner = trimmed
     while (/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/.test(inner)) {
       const em = inner.match(/^[A-Za-z_][A-Za-z0-9_]*=(\S+)\s+/)
-      if (em) envValues.push(em[1])
+      if (em) {
+        // H3b/F3: PYTHONPATH / PYTHONSTARTUP pointing outside cwd loads
+        // interpreter code from an unverifiable location.
+        const taint = taintedPathEnv(inner.match(/^[A-Za-z_][A-Za-z0-9_]*=\S+/)?.[0] ?? '')
+        if (taint) {
+          return {
+            category: 'unknown',
+            reason: `interpreter code load via env (${taint})`,
+            targetPaths: [],
+          }
+        }
+        envValues.push(em[1])
+      }
       inner = inner.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/, '').trim()
     }
     if (inner && inner !== trimmed) {
@@ -2418,6 +2484,15 @@ function classifySingleCommand(command: string, denyReadPaths: string[] = []): C
       if (!tok) break
       // VAR=value assignment prefix
       if (/^[A-Za-z_][A-Za-z0-9_]*=\S*$/.test(tok)) {
+        // H3b/F3: env PYTHONPATH=/abs … loads interpreter code outside cwd.
+        const taint = taintedPathEnv(tok)
+        if (taint) {
+          return {
+            category: 'unknown',
+            reason: `interpreter code load via env (${taint})`,
+            targetPaths: [],
+          }
+        }
         inner = inner.slice(tok.length).trim()
         continue
       }
@@ -2472,6 +2547,31 @@ function classifySingleCommand(command: string, denyReadPaths: string[] = []): C
   const segPart = trimmed.replace(/\s*[;&]\s*$/, '')
   const segFirst = segPart.split(/\s+/)[0]?.toLowerCase() ?? ''
 
+  // H3b/F3: `export PYTHONPATH=/abs …` / `export PYTHONPATH` (inherits the
+  // caller's value) makes a later python interpreter load code from an
+  // unverifiable path — fail closed even though the export segment itself is
+  // side-effect-free.
+  if (/^export\s+[A-Za-z_][A-Za-z0-9_]*(\s|=|$)/.test(segPart.trim())) {
+    const em = segPart.trim().match(/^export\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(\S+))?/)
+    if (em && (em[1] === 'PYTHONPATH' || em[1] === 'PYTHONSTARTUP')) {
+      if (em[2] === undefined) {
+        return {
+          category: 'unknown',
+          reason: `export ${em[1]} inherits an unverifiable value`,
+          targetPaths: [],
+        }
+      }
+      const taint = taintedPathEnv(`${em[1]}=${em[2]}`)
+      if (taint) {
+        return {
+          category: 'unknown',
+          reason: `interpreter code load via env (${taint})`,
+          targetPaths: [],
+        }
+      }
+    }
+  }
+
   // Pure assignment segments (`VAR=hello` / `VAR=$(ls)` arriving as their own
   // segment after `;`/`&&` splitting) have no side effects — read. Without
   // this, `VAR=x; cmd` mis-classified the assignment half as unknown (R1
@@ -2486,6 +2586,18 @@ function classifySingleCommand(command: string, denyReadPaths: string[] = []): C
   // quote- and escape-aware so grep patterns keep their "|" intact.
   const pipeParts = splitPipeRespectQuotes(trimmed)
   if (pipeParts.length > 1) {
+    // H3b/F4: a pipeline feeding an interpreter's stdin (`… | python3 -`,
+    // `… | node /dev/stdin`) makes the interpreter read CODE from upstream —
+    // the content is not on the command line. Fail closed for the pipeline.
+    const stdinInterp = pipeParts.find((p) =>
+      /^(?:ruby|perl|php|python\d*|node|nodejs)\s+(?:\/dev\/(?:stdin|fd\/\d+)|-)\s*$/.test(p.trim()))
+    if (stdinInterp) {
+      return {
+        category: 'unknown',
+        reason: `interpreter reads code from stdin pipeline (unverifiable): ${stdinInterp.trim().slice(0, 60)}`,
+        targetPaths: [],
+      }
+    }
     const sub = pipeParts.map((p) => classifySingleCommand(p.trim(), denyReadPaths))
     const localPriority: OpCategory[] = [
       'system', 'network', 'vcs_remote', 'package', 'process',
@@ -2930,6 +3042,21 @@ function stripUvRunFlags(s: string): string {
       return {
         category: 'unknown',
         reason: `bare interpreter may execute stdin code (unverifiable): ${fullCmd.slice(0, 60)}`,
+        targetPaths: [],
+      }
+    }
+    // H3b/F4: `python3 -` / `python3 /dev/stdin` / `node /dev/fd/0` read their
+    // CODE from stdin (a pipe or process substitution) — the content is not on
+    // the command line, same posture as the bare-interpreter rule. A heredoc
+    // (`python3 - <<'PY'`) keeps the historical path: its body IS visible and
+    // scanned by the heredoc net.
+    if (/^(?:ruby|perl|php|python\d*|node|nodejs)\b/.test(firstWord) &&
+        /^(?:\/dev\/(?:stdin|fd\/\d+)|-)\s*$/.test(rest.trim()) &&
+        /(?:^|[|&;])\s*(?:<\s*\(|[^<]*\||[^<]*<(?!<))/.test(trimmed) &&
+        !/<<-?/.test(trimmed.replace(/^(?:ruby|perl|php|python\d*|node|nodejs)\b/, ''))) {
+      return {
+        category: 'unknown',
+        reason: `interpreter reads code from stdin (unverifiable): ${fullCmd.slice(0, 60)}`,
         targetPaths: [],
       }
     }
@@ -3499,16 +3626,25 @@ function splitCommandSegments(command: string): string[] {
  * caught by re-classifying the inner command. Arithmetic `$((x << 2))` yields
  * a harmless body; nesting is handled by the recursive re-classification.
  */
-export function extractCommandSubstitutions(s: string): string[] {
-  const out: string[] = []
+export interface CommandSubstitutionBody {
+  body: string
+  /** true = backtick source (bash unescapes `\``/`\\` inside it and
+   *  re-parses); false = $()/<() source (a `\`` there is a literal backtick
+   *  and must NOT be unescaped into a new substitution). */
+  bt: boolean
+}
+export function extractCommandSubstitutions(s: string): CommandSubstitutionBody[] {
+  const out: CommandSubstitutionBody[] = []
   // Backtick body may contain escaped backticks (`\``) and backslashes;
   // they stay inside the body so the nested command survives for re-scan.
-  // H3: a backtick preceded by `\` is an ESCAPED backtick (not a delimiter) —
-  // `echo \`echo \`ruby -e '…'\`` must extract the whole nested body.
-  const btRe = /(?<!\\)`((?:\\.|[^`\\])*)`/g
+  // H3: a backtick preceded by `\` is an ESCAPED backtick (not a delimiter).
+  // F2: bash closes an unterminated backtick substitution at END OF LINE
+  // (verified: `echo \`echo \\\`id\\\`\`` live-runs id), so the closer may
+  // be an unescaped backtick OR the end of the string.
+  const btRe = /(?<!\\)`((?:\\.|[^`\\])*)(?:`|$)/g
   let m: RegExpExecArray | null
   while ((m = btRe.exec(s)) !== null) {
-    out.push(m[1])
+    out.push({ body: m[1], bt: true })
   }
   let i = 0
   while (i < s.length) {
@@ -3537,16 +3673,21 @@ export function extractCommandSubstitutions(s: string): string[] {
       }
     }
     if (end === -1) break
-    out.push(s.slice(start + 2, end))
+    out.push({ body: s.slice(start + 2, end), bt: false })
     i = end + 1
   }
   return out
 }
 
-/** H3: normalize escaped backticks / dollar signs inside an extracted
- *  substitution body so a nested command can be re-scanned one layer deeper. */
-export function unescapeSubstitutionBody(body: string): string {
-  return body.replace(/\\`/g, '`').replace(/\\\$/g, '$')
+/** H3/F2: normalize escapes inside an extracted substitution body so a
+ *  nested command can be re-scanned one layer deeper. bash consumes one
+ *  backslash layer inside a backtick body: `\\` -> `\`, `\`` -> a literal
+ *  backtick (which then re-opens a substitution on the next re-parse), and
+ *  `\$` -> `$`. Inside a `$(…)` body a backtick is NOT escaped/executed, so
+ *  `unescapeBackticks=false` keeps `\`` untouched (literal). */
+export function unescapeSubstitutionBody(body: string, unescapeBackticks = true): string {
+  return body.replace(/\\([\\`$])/g, (_m, c: string) =>
+    c === '`' && !unescapeBackticks ? _m : c)
 }
 
 /**
@@ -4101,6 +4242,62 @@ function findInlineCode(action: string): string | null {
  * layer. Deletion uses the shared destructive surface; network uses the inline
  * egress API set. Returns { kind, signal } or null when offline/local.
  */
+/**
+ * H3b/F1: the FIRST argument of a process launcher call must be a string
+ * literal — a variable (`os.popen(c)`), a concatenation (`'cu'+'rl'`) or a
+ * list/other expression hides the executed command from static analysis.
+ * Literal argv stays on the per-target egress path (G5/G6 contract).
+ */
+function nonLiteralLaunchArg(code: string, callRe: RegExp): string | null {
+  // Module-level global regexes leak lastIndex across calls — reset before
+  // scanning or a match early in a previous code string skips later calls.
+  callRe.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = callRe.exec(code))) {
+    const openIdx = m.index + m[0].length - 1
+    let depth = 0
+    let i = openIdx
+    for (; i < code.length; i++) {
+      if (code[i] === '(') depth++
+      else if (code[i] === ')') {
+        depth--
+        if (depth === 0) break
+      }
+    }
+    const args = code.slice(openIdx + 1, i)
+    const first = args.split(',')[0].trim()
+    if (!first) return 'launcher with an empty first argument'
+    // A pure string literal or a pure literal list (['ls'] / 'ls' — no
+    // concatenation, no interpolated variable) keeps the per-target egress
+    // path (FIND_SHELLOUT_RE adjudicates curl/wget/…); `'cu'+'rl'`, a bare
+    // variable or a nested expression hides the executed command.
+    const PURE_LAUNCH_ARG =
+      /^(?:['"](?:[^"'\\\n]|\\.)*['"]|\[\s*(?:['"](?:[^"'\\\n]|\\.)*['"]\s*(?:,\s*['"](?:[^"'\\\n]|\\.)*['"])*\s*)?\])$/
+    if (!PURE_LAUNCH_ARG.test(first)) {
+      return `launcher first argument not a pure literal: ${first.slice(0, 40)}`
+    }
+  }
+  return null
+}
+
+/** Replace string-literal contents with empty quotes so bare-verb nets do not
+ * trip on WORDS INSIDE strings (`puts "operating system check"` contains
+ * "system"). Structural strings that the nets must inspect (pipe-open "-|",
+ * heredoc delimiters) keep their original form and are tested on `code`. */
+function maskStringLiterals(code: string): string {
+  return code
+    .replace(/'(?:[^'\\\n]|\\.)*'/g, "''")
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""')
+}
+
+const NONPY_LAUNCH_WORD =
+  /\b(?:system|spawn|popen|passthru|proc_open|pcntl_exec|shell_exec|exec|fork)\b/
+
+const PY_FIND_LAUNCH_RE =
+  /\b(?:os\.(?:popen|exec[a-z]*|posix_spawn)|subprocess\.(?:run|Popen|call|check_call|check_output|getoutput|getstatusoutput))\s*\(/g
+const NODE_LAUNCH_RE =
+  /(?:require\(\s*['"]child_process['"]\s*\)|child_process)\s*\.\s*(?:spawn|spawnSync|execFile|execFileSync|fork)\s*\(/g
+
 function findActionInlineThreat(trimmed: string): { kind: 'delete' | 'egress'; signal: string } | null {
   const actionRe = /(?:--exec|-(?:exec(?:dir)?|ok|x))/gi
   let am: RegExpExecArray | null
@@ -4130,18 +4327,38 @@ function findActionInlineThreat(trimmed: string): { kind: 'delete' | 'egress'; s
         if (FIND_FIND_DESTRUCTIVE_RE.test(code)) return { kind: 'delete', signal: `${verb} inline delete/spawn` }
         if (FIND_INLINE_EGRESS_RE.test(code)) return { kind: 'egress', signal: `${verb} inline network` }
         if (FIND_SHELLOUT_RE.test(code)) return { kind: 'egress', signal: `${verb} subprocess shell-out` }
-        // H2: ruby/perl/php launchers (spawn/IO.popen/Open3/system/popen) are
-        // opaque — the target string cannot be statically trusted, so fail
-        // closed. Python keeps the g-round posture (only network targets are
-        // denied via FIND_SHELLOUT_RE, e.g. benign os.popen('ls') stays read).
-        if (!/^python/.test(verb) && (/\b(?:spawn|Process\.spawn|IO\.popen|system|popen)\s*\(/.test(code) || /\bOpen3\./.test(code))) {
-          return { kind: 'delete', signal: `${verb} inline spawn/shell exec` }
+        if (!/^python/.test(verb)) {
+          // H2/H3b/F1: ruby/perl/php launchers are opaque — any process
+          // primitive fails closed; a benign literal is NOT statically trusted
+          // for these languages. Bare-verb words are tested on string-masked
+          // code (puts "system" stays read); pipe-open patterns need the
+          // original string content so they run on `code`.
+          const masked = maskStringLiterals(code)
+          if (NONPY_LAUNCH_WORD.test(masked) ||
+              /%x\s*[({[]/.test(code) ||
+              /Kernel\.(?:send|public_send|__send__)\s*\(/.test(masked) ||
+              /IPC::Open[23]\b|\bopen[23]\s*\(/.test(masked) ||
+              /open\s*\([^)]*["']-\|["']/.test(code)) {
+            return { kind: 'delete', signal: `${verb} inline launcher` }
+          }
         }
-        // H2: node exec/execSync run a command STRING through a shell — cannot
-        // be proven safe even for a literal; node spawnSync/execFileSync stay
-        // on the g-round per-target path (benign spawnSync('ls') stays read).
-        if ((verb === 'node' || verb === 'nodejs') && /\b(?:execSync|exec)\s*\(/.test(code)) {
-          return { kind: 'delete', signal: `node inline command-string exec` }
+        // H2/F1: node exec/execSync run a command STRING through a shell —
+        // cannot be proven safe even for a literal; node spawnSync/execFileSync
+        // stay on the g-round per-target path (benign spawnSync('ls') stays
+        // read) but a non-literal first argument fails closed.
+        if ((verb === 'node' || verb === 'nodejs')) {
+          if (/\b(?:execSync|exec)\s*\(/.test(code)) {
+            return { kind: 'delete', signal: `node inline command-string exec` }
+          }
+          const nodeThreat = nonLiteralLaunchArg(code, NODE_LAUNCH_RE)
+          if (nodeThreat) return { kind: 'delete', signal: `node ${nodeThreat}` }
+        }
+        // F1: python launcher with a non-literal first argument (os.popen(c),
+        // os.execvp('cu'+'rl', …), subprocess.run(cmd)) — literal argv is
+        // adjudicated by FIND_SHELLOUT_RE / FIND_INLINE_EGRESS_RE below.
+        if (/^python/.test(verb)) {
+          const pyThreat = nonLiteralLaunchArg(code, PY_FIND_LAUNCH_RE)
+          if (pyThreat) return { kind: 'delete', signal: `python ${pyThreat}` }
         }
       }
       const flag = moduleFlagEgress(action, verb)
@@ -4425,6 +4642,21 @@ export function classifyBashCommand(
     return { category: 'read', reason: 'Empty command', targetPaths: [] }
   }
 
+  // H3b/F4: a segment reading interpreter CODE from stdin (`python3 -`,
+  // `node /dev/stdin`, …) is unverifiable — the code may arrive from an
+  // upstream pipeline (already split away here) or the terminal, neither is
+  // on the command line. Fail closed. Heredoc-fed interpreters were collapsed
+  // by stripHeredocs and keep their historical scanned path.
+  const stdinCode = segments.find((p) =>
+    /^(?:ruby|perl|php|python\d*|node|nodejs)\s+(?:\/dev\/(?:stdin|fd\/\d+)|-)\s*$/.test(p.trim()))
+  if (stdinCode) {
+    return {
+      category: 'unknown',
+      reason: `interpreter reads code from stdin (unverifiable): ${stdinCode.trim().slice(0, 60)}`,
+      targetPaths: [],
+    }
+  }
+
   const results = segments.map((p) => classifySingleCommand(p, denyReadPaths))
 
   // Track `cd` across segments so relative paths after `cd dir && …` resolve
@@ -4471,7 +4703,7 @@ export function classifyBashCommand(
     // the outer segment is just echo + a token. B7: a substitution's verdict
     // is part of the segment — `echo $(cp a /outside)` / `echo $(ruby -e
     // 'File.write(...)')` must not be absorbed as a benign read.
-    for (const body of extractCommandSubstitutions(s)) {
+    for (const { body } of extractCommandSubstitutions(s)) {
       const inner = classifyBashCommand(body, denyReadPaths)
       if (inner.forceDeny) {
         resolvedReads.push(...(inner.targetPaths.length > 0 ? inner.targetPaths : [dir]))

@@ -45,6 +45,7 @@ import {
   hasDotdotAcrossSymlink,
   extractCommandSubstitutions,
   unescapeSubstitutionBody,
+  type CommandSubstitutionBody,
   type GateDecision,
 } from './classifier.ts'
 import { scanCommandForEgress } from './scan-scripts.ts'
@@ -1049,54 +1050,64 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         /\$\(|`|<\(/.test(rawCmdSub) &&
         !classification.forceDeny
       ) {
-        for (const body of extractCommandSubstitutions(rawCmdSub)) {
-          if (!body.trim()) continue
-          // H3: a body may itself nest escaped backticks (`echo \`ruby -e …\``);
-          // normalize and recurse one layer so the escaped inner command is
-          // still caught.
-          const norm = unescapeSubstitutionBody(body)
-          if (hasArchiveExecSink(norm)) {
-            classification.forceDeny = true
-            classification.reason +=
-              ' [substitution body is an archive exec sink (bytes -> interpreter): denied]'
-            break
-          }
-          const subEgress = await scanCommandForEgress(norm)
-          if (subEgress.hits.length > 0) {
-            const h = subEgress.hits[0]
-            classification.category = 'network'
-            classification.forceDeny = true
-            classification.reason +=
-              ` [substitution-body static-egress: ${h.where} (${h.language}): ${h.snippet}]`
-            break
-          }
-          if (subEgress.unverifiable) {
-            classification.category = 'unknown'
-            classification.reason +=
-              ' [substitution body unverifiable (dynamic code): cannot prove no egress]'
-            break
-          }
-          // One recursion layer for escaped nested substitutions (H3).
-          const nested = extractCommandSubstitutions(norm)
-          if (nested.length > 0 && !classification.forceDeny) {
-            for (const nbody of nested) {
-              if (!nbody.trim()) continue
-              const nn = unescapeSubstitutionBody(nbody)
-              if (hasArchiveExecSink(nn)) {
+        for (const { body: bodyText, bt } of extractCommandSubstitutions(rawCmdSub)) {
+          if (!bodyText.trim()) continue
+          // H3/F2: bash unescapes backtick bodies RECURSIVELY — nested
+          // escaped backticks (`echo \`echo \\\`id\\\`\``) live-execute the
+          // innermost command. Unescape each body to a fixpoint so every
+          // nesting level becomes visible, then rescan and recurse until no
+          // new body is produced; a depth beyond 8 (pathological) fails
+          // closed rather than trusting an unparsed tail.
+          let pending: CommandSubstitutionBody[] = [{ body: bodyText, bt }]
+          let guard = 0
+          while (pending.length > 0 && guard++ < 8) {
+            const next: CommandSubstitutionBody[] = []
+            for (const p of pending) {
+              // bash consumes ONE backslash layer per substitution re-parse:
+              // `\\\`` -> `\`` on the first round, then a plain backtick on
+              // the next, each time re-running the lexical extraction.
+              let norm = unescapeSubstitutionBody(p.body, p.bt)
+              if (norm === p.body) norm = p.body
+              if (hasArchiveExecSink(norm)) {
                 classification.forceDeny = true
                 classification.reason +=
-                  ' [nested substitution body is an archive exec sink: denied]'
+                  ' [substitution body is an archive exec sink (bytes -> interpreter): denied]'
+                pending = []
                 break
               }
-              const nEgress = await scanCommandForEgress(nn)
-              if (nEgress.hits.length > 0 || nEgress.unverifiable) {
-                classification.category = nEgress.hits.length > 0 ? 'network' : 'unknown'
+              const subEgress = await scanCommandForEgress(norm)
+              if (subEgress.hits.length > 0) {
+                const h = subEgress.hits[0]
+                classification.category = 'network'
                 classification.forceDeny = true
-                classification.reason += ' [nested substitution body unverifiable/egress: cannot prove no egress]'
+                classification.reason +=
+                  ` [substitution-body static-egress: ${h.where} (${h.language}): ${h.snippet}]`
+                pending = []
                 break
+              }
+              if (subEgress.unverifiable) {
+                classification.category = 'unknown'
+                classification.reason +=
+                  ' [substitution body unverifiable (dynamic code): cannot prove no egress]'
+                pending = []
+                break
+              }
+              for (const nb of extractCommandSubstitutions(norm)) {
+                if (!nb.body.trim()) continue
+                const nn = unescapeSubstitutionBody(nb.body, nb.bt)
+                if (!next.some((x) => x.body === nn) && nn !== norm) next.push({ body: nn, bt: nb.bt })
               }
             }
+            pending = next
           }
+          if (guard >= 8) {
+            classification.category = 'unknown'
+            classification.reason +=
+              ' [substitution nesting exceeds static analysis depth: cannot prove no egress]'
+            classification.forceDeny = true
+          }
+          if (classification.forceDeny || classification.category === 'network' ||
+              classification.category === 'unknown') break
         }
       }
 

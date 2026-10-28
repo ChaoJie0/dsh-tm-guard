@@ -463,3 +463,28 @@ test('tm_rollback: last_operation record without target paths → guidance', asy
     assert.match(out, /had no target paths recorded|No file-modification/)
   } finally { __setExecOverride(null) }
 })
+
+// ── f-round F2: arbitrarily deep escaped command substitutions (review-…h) ──
+// bash unescapes backticks recursively: `echo \`echo \\\`id\\\`\`` live-runs
+// the innermost command (verified on bash). The gate must unescape to a
+// fixpoint so the innermost body is scanned.
+test('f/F2: three-level escaped substitution with ruby system denied', async () => {
+  apply(mockCtx() as any, { protectedPaths: [ROOT], denyNetwork: true })
+  const cmd = 'echo `echo \\`echo \\\\\\`ruby -e \'system("id")\'\\\\\\`\\`\\`'
+  const r = await gate({ name: 'bash', arguments: { command: cmd, description: 'nested ruby' } })
+  assert.equal(r.kind, 'deny', `nested interpreter launcher must be denied (got ${JSON.stringify(r)})`)
+})
+
+test('f/F2: three-level escaped substitution with tar -I archive sink denied', async () => {
+  apply(mockCtx() as any, { protectedPaths: [ROOT], denyNetwork: true })
+  const cmd = 'echo `echo \\`tar -I sh -xf evil.tar\\``'
+  const r = await gate({ name: 'bash', arguments: { command: cmd, description: 'nested tar -I' } })
+  assert.equal(r.kind, 'deny', `nested archive sink must be denied (got ${JSON.stringify(r)})`)
+})
+
+test('f/F2-neg: escaped backtick in double quotes stays allowed (literal)', async () => {
+  apply(mockCtx() as any, { protectedPaths: [ROOT], denyNetwork: true })
+  const cmd = 'echo "\\`not a command\\`"'
+  const r = await gate({ name: 'bash', arguments: { command: cmd, description: 'literal backtick' } })
+  assert.equal(r.kind, 'allow', `literal escaped backtick must stay allowed (got ${JSON.stringify(r)})`)
+})

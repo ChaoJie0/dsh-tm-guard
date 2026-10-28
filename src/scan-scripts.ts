@@ -125,7 +125,15 @@ const RULES: Record<Lang, LangRules> = {
       /\bfrom\s+importlib\s+import\s+import_module\b/,
       /\bimport_module\s*\(\s*["']/,
     ],
-    risky: [],
+    risky: [
+      // H3b/F3: python loading code from a path it mutates (sys.path) or an
+      // env override (os.environ PYTHONPATH) — the injected module is
+      // unverifiable. os.system executes an arbitrary shell string.
+      /\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend)\s*\(/,
+      /\bsys\s*\.\s*path\s*(?:\[[^\]]*\]\s*=|=\s*)/,
+      /\bos\s*\.\s*environ\s*\[\s*["']PYTHONPATH["']\s*\]\s*=/,
+      /\bos\s*\.\s*system\s*\(/,
+    ],
   },
   node: {
     importNet: [

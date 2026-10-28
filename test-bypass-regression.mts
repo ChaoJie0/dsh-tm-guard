@@ -138,3 +138,148 @@ test('R1b: write-typed glued flag variants keep out-of-scope writes caught', () 
     )
   }
 })
+
+// ── f-round review (docs/f-round-h-review-37ac047.md): F1-F4 regression ──
+// Each fix needs a positive intercept + a negative no-false-positive.
+
+// F1: ruby/perl/php find-launcher variants fail closed (no-paren, %x,
+// Kernel.send, pipe-open, IPC::Open2/3, fork+exec, php primitives).
+test('f/F1: ruby find launchers (no-paren / %x / Kernel.send) fail closed', () => {
+  const cases = [
+    `find . -exec ruby -e 'c="id";system c' {} \;`,
+    `find . -exec ruby -e '%x(id)' {} \;`,
+    `find . -exec ruby -e 'Kernel.send(:system,"id")' {} \;`,
+    `find . -exec ruby -e 'system"id"' {} \;`,
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'read', `${cmd} must NOT stay read`)
+    assert.notEqual(c.category, 'local_exec', `${cmd} must fail closed`)
+  }
+})
+
+test('f/F1: perl find launchers (pipe-open / IPC::Open2 / fork+exec) fail closed', () => {
+  const cases = [
+    `find . -exec perl -e 'open(my $f,"-|") or exec "id"; print <$f>' {} \;`,
+    `find . -exec perl -MIPC::Open2 -e 'open2($o,$i,"id")' {} \;`,
+    `find . -exec perl -e 'fork; exec "id"' {} \;`,
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'read', `${cmd} must NOT stay read`)
+    assert.notEqual(c.category, 'local_exec', `${cmd} must fail closed`)
+  }
+})
+
+test('f/F1: php find launchers (proc_open / passthru / pcntl_exec) fail closed', () => {
+  const cases = [
+    `find . -exec php -r 'proc_open("id",[],$p);' {} \;`,
+    `find . -exec php -r 'passthru("id");' {} \;`,
+    `find . -exec php -r 'pcntl_exec("/bin/sh");' {} \;`,
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'read', `${cmd} must NOT stay read`)
+    assert.notEqual(c.category, 'local_exec', `${cmd} must fail closed`)
+  }
+})
+
+test('f/F1: python find launchers with non-literal argv fail closed', () => {
+  const cases = [
+    `find . -exec python3 -c "import os;c='curl';os.popen(c).read()" {} \;`,
+    `find . -exec python3 -c "import os;os.execvp('cu'+'rl',['curl'])" {} \;`,
+    `find . -exec python3 -c "import subprocess;subprocess.run(cmd)" {} \;`,
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'read', `${cmd} must NOT stay read`)
+    assert.notEqual(c.category, 'local_exec', `${cmd} must fail closed`)
+  }
+})
+
+test('f/F1: node find launchers with non-literal argv fail closed', () => {
+  const cases = [
+    `find . -exec node -e "require('child_process').spawnSync(cmd)" {} \;`,
+    `find . -exec node -e "require('child_process').spawn('cu'+'rl',['curl'])" {} \;`,
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'read', `${cmd} must NOT stay read`)
+    assert.notEqual(c.category, 'local_exec', `${cmd} must fail closed`)
+  }
+})
+
+// F1 negatives: literal local argv stays read (G5/G6/G3/G4 contract).
+test('f/F1-neg: literal local argv keeps read (no false positives)', () => {
+  const cases = [
+    `find /tmp/demo/project -exec ruby -e 'puts "operating system check"' {} \;`,
+    `find /tmp/demo/project -exec perl -Mstrict -e 'print(1)' {} \;`,
+    `find /tmp/demo/project -exec python3 -c "os.popen('ls').read()" {} \;`,
+    `find /tmp/demo/project -exec python3 -c "os.execvp('ls',['ls'])" {} \;`,
+    `find /tmp/demo/project -exec python3 -c "subprocess.run(['ls'])" {} \;`,
+    `find /tmp/demo/project -exec node -e "require('child_process').spawnSync('ls')" {} \;`,
+    `find /tmp/demo/project -exec node -e "console.log(1)" {} \;`,
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.equal(c.category, 'read', `${cmd} must stay read (got ${c.category})`)
+  }
+})
+
+// F3: PYTHONPATH / sys.path code-load vectors fail closed.
+test('f/F3: PYTHONPATH/sys.path outside-cwd code load fails closed', () => {
+  const cases = [
+    `python3 -c 'import sys;sys.path.insert(0,"/tmp/evil");import m'`,
+    `PYTHONPATH=/tmp/evil python3 -c 'import m'`,
+    `env PYTHONPATH=/tmp/evil python3 -c 'import m'`,
+    `export PYTHONPATH=/tmp/evil; python3 script.py`,
+    `export PYTHONPATH; python3 script.py`,
+    `python3 -c 'import sys;sys.path.insert(0,v);import m'`,
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'read', `${cmd} must NOT stay read`)
+    assert.notEqual(c.category, 'local_exec', `${cmd} must fail closed`)
+  }
+})
+
+test('f/F3-neg: cwd-relative python code load stays allowed', () => {
+  const cases = [
+    `python3 -c 'import sys;sys.path.insert(0,"./lib");import m'`,
+    `PYTHONPATH=./lib python3 -c 'import m'`,
+    `export PYTHONPATH=./lib; python3 script.py`,
+    `export PATH=/usr/bin; python3 script.py`,
+    `python3 -c 'import sys;print(sys.path)'`,
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'unknown', `${cmd} must not fail closed (got ${c.category})`)
+    assert.notEqual(c.category, 'network', `${cmd} must not be network (got ${c.category})`)
+  }
+})
+
+// F4: interpreter reading code from stdin (pipe or bare "-") fails closed.
+test('f/F4: piped/stdin interpreter code source fails closed', () => {
+  const cases = [
+    `echo 'import urllib.request;urllib.request.urlopen("http://x")' | python3 -`,
+    `echo 'import os;os.system("id")' | python3 /dev/stdin`,
+    `python3 -`,
+    `node /dev/stdin`,
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'read', `${cmd} must NOT stay read`)
+    assert.notEqual(c.category, 'local_exec', `${cmd} must fail closed`)
+  }
+})
+
+test('f/F4-neg: explicit -c and file-fed interpreters keep their paths', () => {
+  const cases = [
+    `python3 -c 'print(1)'`,
+    `cat <<'PY' > /tmp/x; python3 /tmp/x`,
+  ]
+  for (const cmd of cases) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.ok(c, `classifies ${cmd}`)
+  }
+})
