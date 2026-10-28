@@ -16,6 +16,7 @@ import { mkdtempSync, mkdirSync, symlinkSync, rmSync, realpathSync, writeFileSyn
 import { join } from 'node:path'
 import { tmpdir, homedir } from 'node:os'
 import { canonicalTarget, isAutoInitSafe } from './src/index.ts'
+import { classifyBashCommand } from './src/classifier.ts'
 import { isPathProtected } from './src/tm.ts'
 
 let ROOT = ''
@@ -79,6 +80,41 @@ test('canonicalTarget: internal symlink + missing file stays inside (unchanged)'
 
 test('canonicalTarget: lexical .. before symlink still resolves outside (unchanged)', () => {
   assert.equal(canonicalTarget('sub/../elink/newdir/f.txt'), join(OUT_REAL, 'newdir/f.txt'))
+})
+
+test('canonicalTarget: symlink then lexical .. resolves to dotdot-escape sentinel (B4)', () => {
+  assert.equal(canonicalTarget('elink/../back.txt'), '/.tmguard-dotdot-escape')
+})
+
+test('canonicalTarget: symlink then .. then more components is denied (B4)', () => {
+  assert.equal(canonicalTarget('elink/../sub/f.txt'), '/.tmguard-dotdot-escape')
+})
+
+test('canonicalTarget: internal symlink + .. is also fail-closed (B4, conservative)', () => {
+  assert.equal(canonicalTarget('ink/../deep.txt'), '/.tmguard-dotdot-escape')
+})
+
+test('canonicalTarget: .. after non-symlink directory is untouched (B4 control)', () => {
+  assert.equal(canonicalTarget('fresh/../x.txt'), join(CWD_REAL, 'x.txt'))
+})
+
+test('canonicalTarget: symlink without .. unaffected by B4 guard', () => {
+  assert.equal(canonicalTarget('elink/newdir/f.txt'), join(OUT_REAL, 'newdir/f.txt'))
+})
+
+test('classifier: symlink + lexical .. target becomes dotdot-escape sentinel (B4)', () => {
+  const r = classifyBashCommand('echo hi > elink/../back.txt')
+  assert.ok(r.targetPaths.some((p) => p === '/.tmguard-dotdot-escape'))
+})
+
+test('classifier: symlink + .. + more components becomes sentinel (B4)', () => {
+  const r = classifyBashCommand('mkdir -p elink/../kd && echo hi > elink/../kd/f.txt')
+  assert.ok(r.targetPaths.includes('/.tmguard-dotdot-escape'))
+})
+
+test('classifier: plain .. without symlink stays resolved (B4 control)', () => {
+  const r = classifyBashCommand('echo hi > fresh/../x.txt')
+  assert.equal(r.targetPaths[0], join(CWD_REAL, 'x.txt'))
 })
 
 test('canonicalTarget: bare external symlink resolves to its target (unchanged)', () => {

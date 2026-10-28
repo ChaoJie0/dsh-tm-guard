@@ -49,6 +49,15 @@ All notable changes to dsh-tm-guard will be documented in this file.
   ELOOP; the canonical fallback now returns a bare `/.tmguard-symlink-loop` /
   `/.tmguard-symlink-cap` sentinel (never with the basename re-appended), so
   such targets are conservatively denied and gate behaviour matches the OS.
+- **A lexical `..` crossing a symlink is denied before the classifier
+  collapses it (B4).** `elink/../x` with `elink -> /outside` is applied by
+  the kernel to the link's real target, so the write lands one directory
+  above the workspace. The classifier previously collapsed the `..` with
+  `resolve()` before the canonical walk saw the link form, turning the target
+  into an inside-workspace lexical path that was allowed. The raw path is now
+  scanned component-by-component (before any collapse) and such targets
+  resolve to the `/.tmguard-dotdot-escape` denial sentinel, both at
+  classification and at the canonical-walk entry point.
 
 ### Security (unchanged boundaries)
 - The ancestor fallback happens only after the canonical inside-workspace

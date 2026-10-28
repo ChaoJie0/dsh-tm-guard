@@ -15,6 +15,7 @@
  */
 
 import { resolve } from 'node:path'
+import { lstatSync } from 'node:fs'
 
 export type OpCategory =
   | 'read'
@@ -1643,11 +1644,54 @@ export function expandHome(p: string): string {
   return out
 }
 
+/**
+ * B4 (review-l5b-0.2.10b): a lexical `..` that crosses a symlink component is
+ * applied by the kernel to the link's REAL target, not to the lexical link
+ * path. Any absolute-ization / lexical collapse of such a path would fold
+ * `elink/../x` back inside the workspace and allow a write that the OS lands
+ * outside it. Detect that pattern on the RAW path (before any collapse) and
+ * fail closed. `baseDir` must be the directory the relative path is resolved
+ * against (the `cd`-tracked base, not necessarily process.cwd()).
+ */
+export function hasDotdotAcrossSymlink(
+  p: string,
+  baseDir: string = process.cwd(),
+): boolean {
+  // NOTE: use plain string concatenation, not path.join/resolve — join()
+  // normalises `..` away and the pattern below would never be seen.
+  const abs = p.startsWith('/') ? p : baseDir + '/' + p
+  // Fast path: no lexical `..` component means nothing can be crossed — most
+  // paths have none, and this avoids per-component lstat on the hot path.
+  if (!/\.\.(?:\/|$)/.test(abs)) return false
+  const parts = abs.split('/')
+  let prefix = ''
+  const linkStack: boolean[] = []
+  for (const part of parts) {
+    if (part === '' || part === '.') continue
+    if (part === '..') {
+      if (linkStack.some(Boolean)) return true
+      linkStack.pop()
+      prefix = prefix.slice(0, prefix.lastIndexOf('/'))
+      continue
+    }
+    prefix = prefix === '' ? '/' + part : prefix + '/' + part
+    let isLink = false
+    try {
+      isLink = lstatSync(prefix).isSymbolicLink()
+    } catch {
+      isLink = false
+    }
+    linkStack.push(isLink)
+  }
+  return false
+}
+
 /** Absolute-ize a possibly-relative path for deny-prefix matching. */
 function toAbsolute(path: string, baseDir: string = process.cwd()): string {
   if (path.startsWith('/')) return path
   if (path.startsWith('~')) return expandHome(path)
   if (/^\$(?:HOME|\{HOME\})(\/|$)/.test(path)) return expandHome(path)
+  if (hasDotdotAcrossSymlink(path, baseDir)) return '/.tmguard-dotdot-escape'
   return resolve(baseDir, path)
 }
 

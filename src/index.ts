@@ -42,6 +42,7 @@ import {
   decide,
   isTempPath,
   hasArchiveExecSink,
+  hasDotdotAcrossSymlink,
   type GateDecision,
 } from './classifier.ts'
 import { scanCommandForEgress } from './scan-scripts.ts'
@@ -312,11 +313,11 @@ const AUTO_INIT_FORBIDDEN_ROOTS = new Set([
 // followed hop by hop via readlink, because an OS write traverses the whole
 // chain (a -> b -> outside); the final target is resolved lexically so a
 // write that would create the file outside the workspace is not treated as
-// inside. When the basename does not exist yet (a new file), only the
-// existing parent is realpath'd. This holds the boundary against an absolute
-// `/cwd/../outside` target, a symlinked directory, a symlinked file, a
-// single dangling link, and a chained dangling link.
+// B4 guard lives in classifier.ts (hasDotdotAcrossSymlink) so the classifier's
+// toAbsolute collapse sees it too; canonicalTarget keeps the same check as
+// defense in depth for paths that reach it without going through toAbsolute.
 export function canonicalTarget(p: string): string {
+  if (hasDotdotAcrossSymlink(p)) return '/.tmguard-dotdot-escape'
   const lex = resolve(p.startsWith('/') ? p : join(process.cwd(), p))
   try {
     return realpathSync(lex)
