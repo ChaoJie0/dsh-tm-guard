@@ -342,7 +342,9 @@ export function canonicalTarget(p: string): string {
     followed = true
     const link = readlinkSync(cur)
     const next = resolve(link.startsWith('/') ? link : join(dirname(cur), link))
-    if (seen.has(next)) return next
+    // A cycle (a -> b -> a) has no terminal target; the kernel rejects it
+    // with ELOOP, so fail closed instead of returning an in-cwd lexical path.
+    if (seen.has(next)) return '/.tmguard-symlink-loop'
     seen.add(next)
     cur = next
     try {
@@ -365,6 +367,9 @@ export function canonicalTarget(p: string): string {
   // inside the workspace even though the OS write follows the link and lands
   // outside it (symlink-escape review, F4/O1).
   const realDir = resolveParentToReal(dir)
+  // A loop/cap sentinel is a verdict, not a directory: return it bare so a
+  // basename can never be re-appended onto the sentinel path.
+  if (realDir === '/.tmguard-symlink-loop' || realDir === '/.tmguard-symlink-cap') return realDir
   return base ? join(realDir, base) : realDir
 }
 
@@ -396,20 +401,30 @@ function resolveParentToReal(dir: string): string {
         // cur is a dangling symlink: follow its chain lexically.
         let t = cur
         const seen = new Set<string>([t])
+        let capped = true
         for (let hops = 0; hops < 40; hops++) {
           let st
           try {
             st = lstatSync(t)
           } catch {
+            capped = false
             break
           }
-          if (!st.isSymbolicLink()) break
+          if (!st.isSymbolicLink()) {
+            capped = false
+            break
+          }
           const link = readlinkSync(t)
           const next = resolve(link.startsWith('/') ? link : join(dirname(t), link))
-          if (seen.has(next)) return join(t, ...missing)
+          // A cycle has no terminal target (kernel ELOOP): fail closed rather
+          // than re-appending the missing suffix to an in-cwd link path.
+          if (seen.has(next)) return '/.tmguard-symlink-loop'
           seen.add(next)
           t = next
         }
+        // Hop cap exhausted: same sentinel as the canonicalTarget outer loop,
+        // so a >40-hop chain cannot collapse back to an in-cwd lexical path.
+        if (capped) return '/.tmguard-symlink-cap'
         real = t
       }
       return missing.length ? join(real, ...missing) : real
@@ -1105,12 +1120,32 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         // cwd but resolves outside cannot place a repo outside the
         // workspace or vouch for an out-of-scope write.
         const sessionCwd = canonicalTarget(process.cwd())
+        // A target whose canonical landing point lies outside the session cwd
+        // must never be vouchsafed by a lexical protectedPaths hit alone:
+        // `elink -> /outside` makes `elink/new/x.txt` match lexically while
+        // the OS write follows the link outside. Record those targets and let
+        // only a protection check on the real landing point count for them.
+        const escapeChecks = new Array<boolean>(classification.targetPaths.length).fill(false)
         const gitChecks = await Promise.all(classification.targetPaths.map(async (p, i) => {
-          if (protectedTargetChecks[i]) return true
-          if (isTempPath(p)) return false
           const cp = canonicalTarget(p)
           const insideWorkspace = cp === sessionCwd || cp.startsWith(sessionCwd + '/')
-          if (!insideWorkspace) return false
+          if (!insideWorkspace) {
+            escapeChecks[i] = true
+            // The OS write lands outside the session cwd. A lexical
+            // protectedPaths hit on the raw target is NOT sufficient (O1
+            // symlink-escape: `elink -> /outside` then `elink/new/x.txt`
+            // matches lexically but the write follows the link outside).
+            // Re-check protection on the CANONICAL landing point: an
+            // explicitly configured TM-protected directory (e.g. a backup
+            // volume outside cwd) still allows, while a symlink that resolves
+            // outside cwd is denied.
+            if (protectedTargetChecks[i]) {
+              return await isPathProtected(cp, config.protectedPaths)
+            }
+            return false
+          }
+          if (protectedTargetChecks[i]) return true
+          if (isTempPath(p)) return false
           // A curl -O download synthesises the cwd itself as the target;
           // anchor the baseline at cwd rather than its parent. A concrete
           // file is covered by a baseline in its directory. When that
@@ -1126,11 +1161,17 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
           return r.ok
         }))
 
-        pathsProtected = classification.targetPaths.every((_p, i) => protectedTargetChecks[i] || gitChecks[i])
+        pathsProtected = classification.targetPaths.every((_p, i) => {
+          // A canonical escape is decided solely by the real landing point;
+          // the lexical protectedPaths hit must not short-circuit it.
+          if (escapeChecks[i]) return gitChecks[i] === true
+          return (protectedTargetChecks[i] ?? false) || (gitChecks[i] ?? false)
+        })
         if (!pathsProtected) {
-          const unprotected = classification.targetPaths.filter(
-            (_p, i) => !protectedTargetChecks[i] && !gitChecks[i],
-          )
+          const unprotected = classification.targetPaths.filter((_p, i) => {
+            if (escapeChecks[i]) return gitChecks[i] !== true
+            return !protectedTargetChecks[i] && !gitChecks[i]
+          })
           classification.reason += ` [unprotected: ${unprotected.join(', ')}]`
         }
       }

@@ -16,6 +16,7 @@ import { mkdtempSync, mkdirSync, symlinkSync, rmSync, realpathSync, writeFileSyn
 import { join } from 'node:path'
 import { tmpdir, homedir } from 'node:os'
 import { canonicalTarget, isAutoInitSafe } from './src/index.ts'
+import { isPathProtected } from './src/tm.ts'
 
 let ROOT = ''
 let CWD = ''
@@ -115,4 +116,52 @@ test('isAutoInitSafe: forbidden roots still refused (unchanged)', () => {
   assert.equal(isAutoInitSafe(HOME, HOME_DIR), false)
   assert.equal(isAutoInitSafe('/System', HOME_DIR), false)
   assert.equal(isAutoInitSafe('/System/Library', HOME_DIR), false)
+})
+
+// ---- B-regression cases (dsh adversarial round, 0.2.10) ----
+
+test('canonicalTarget: >40-hop dangling parent chain returns cap sentinel (B1 fix)', () => {
+  // hc/l1 -> l2 -> ... -> l41 (each link exists) -> dangling absolute target;
+  // the parent-side chain must hit the hop cap and fail closed, not collapse
+  // back to an in-cwd lexical path.
+  const hc = join(CWD, 'hc41')
+  mkdirSync(hc, { recursive: true })
+  let prev = ''
+  for (let i = 1; i <= 41; i++) {
+    const name = `l${i}`
+    const target = i < 41 ? `l${i + 1}` : join(ROOT, 'far-ghost')
+    symlinkSync(target, join(hc, name))
+    prev = name
+  }
+  const t = canonicalTarget(join('hc41', 'l1', 'new', 'f.txt'))
+  assert.equal(t, '/.tmguard-symlink-cap')
+  assert.ok(!(t === CWD_REAL || t.startsWith(CWD_REAL + '/')))
+})
+
+test('canonicalTarget: in-cwd symlink cycle returns loop sentinel (B2 fix)', () => {
+  // ca -> cb, cb -> ca: the kernel rejects any write through the cycle with
+  // ELOOP, so canonicalTarget must fail closed instead of returning an
+  // in-cwd path that the gate would allow.
+  symlinkSync('cb', join(CWD, 'ca'))
+  symlinkSync('ca', join(CWD, 'cb'))
+  const t = canonicalTarget(join('ca', 'f.txt'))
+  assert.equal(t, '/.tmguard-symlink-loop')
+  assert.ok(!(t === CWD_REAL || t.startsWith(CWD_REAL + '/')))
+})
+
+test('canonicalTarget: cycle terminal inside the basename chain is also a loop sentinel (B2 fix)', () => {
+  // cx -> cy, cy -> cx; the target is the link itself plus a missing component.
+  symlinkSync('cy', join(CWD, 'cx'))
+  symlinkSync('cx', join(CWD, 'cy'))
+  const t = canonicalTarget(join('cx', 'new', 'f.txt'))
+  assert.equal(t, '/.tmguard-symlink-loop')
+})
+
+test('isPathProtected canonical re-check: escaped realpath is NOT covered by lexical cwd prefix (B3 premise)', async () => {
+  // A symlink-escaped landing point (realpath outside cwd) must not match a
+  // lexical protected prefix of the cwd itself; only an explicitly configured
+  // real (TM-protected) prefix keeps allowing.
+  assert.equal(await isPathProtected(join(HOME_DIR, 'out', 'new', 'x.txt'), [CWD]), false)
+  assert.equal(await isPathProtected(join(HOME_DIR, 'out', 'new', 'x.txt'), [join(HOME_DIR, 'out')]), true)
+  assert.equal(await isPathProtected(join(CWD, 'ok.txt'), [CWD]), true)
 })
