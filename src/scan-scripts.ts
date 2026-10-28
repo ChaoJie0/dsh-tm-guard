@@ -176,8 +176,17 @@ const RULES: Record<Lang, LangRules> = {
       // the first string (File.open's first arg is the path). Match a write
       // mode string anywhere inside the parens; File.open("t") read stays clean.
       /\bFile\.open\s*\([^)]*['"](?:w|a|r\+|w\+|wb|ab|wt)/,
-      // B1: receiver-indirection write (File.send(:write,…), public_send…)
-      /\bFile\.send\s*\(\s*:?(?:write|binwrite|truncate|delete|unlink)\b/,
+      // H4: File.new(path,"w") — constructor variant of the open write.
+      /\bFile\.new\s*\([^)]*['"](?:w|a|r\+|w\+|wb|ab|wt)/,
+      // H4: receiver ALIAS (`z=File; z.write("/etc/x","y")`) — capture the
+      // assigned name and require its later file-mutation call.
+      /\b([A-Za-z_]\w*)\s*=\s*File\b(?![:\w])[\s\S]*?\b\1\s*\.\s*(?:write|binwrite|truncate|delete|unlink)\s*\(/,
+      // H4: %q(w) / %Q{...} mode-string spellings.
+      /\bFile\.(?:open|new)\s*\([^)]*%[qQ][(\[{'"](?:w|a|r\+|w\+|wb|ab|wt)[)\]}"']/,
+      // B1/H4: receiver-indirection write — File.send/__send__/public_send
+      // with symbol OR string method name, paren or no-paren call forms.
+      /\bFile\.(?:send|__send__|public_send)\s*\(\s*(?::?(?:write|binwrite|truncate|delete|unlink|open)\b[,"')]|["'](?:write|binwrite|truncate|delete|unlink|open)["'])/,
+      /\bFile\.(?:send|__send__|public_send)\s+(?::?(?:write|binwrite|truncate|delete|unlink|open)\b|["'](?:write|binwrite|truncate|delete|unlink|open)["'])/,
       /\bFileUtils\.(write|cp|cp_r|mv|rm|rm_f|rm_r|rm_rf|remove_file|remove_entry|remove_entry_secure|mkdir|mkdir_p|chmod|chown|symlink|link)\b/,
       /\bDir\.(mkdir|rmdir|delete|unlink)\b/,
       /\bIO\.(write|binwrite|truncate)\b/,

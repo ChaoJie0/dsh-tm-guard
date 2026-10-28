@@ -2341,11 +2341,27 @@ function classifySingleCommand(command: string, denyReadPaths: string[] = []): C
   // -c danger/sensitive scans still apply (previously firstWord was FOO=bar
   // and no branch matched the inner interpreter).
   if (/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/.test(trimmed)) {
+    const envValues: string[] = []
     let inner = trimmed
     while (/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/.test(inner)) {
+      const em = inner.match(/^[A-Za-z_][A-Za-z0-9_]*=(\S+)\s+/)
+      if (em) envValues.push(em[1])
       inner = inner.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/, '').trim()
     }
     if (inner && inner !== trimmed) {
+      // H1: GNU compressors read external-program options from env
+      // ($GZIP, $XZ_DEFAULTS, $BZIP2, $GZIP_OPT). If an env value smuggles
+      // --use-compress-program / -I onto a compressor command, fail closed.
+      const first = inner.split(/\s+/)[0] ?? ''
+      if (/^(gzip|gunzip|xz|unxz|bzip2|bunzip2|lz4|lzma|unlzma|lzop)\b/.test(first) &&
+          envValues.some((v) => /compress-program/i.test(v) || /(?:^|\s)-[a-z0-9]*I[A-Za-z0-9_.=]*/.test(v))) {
+        return {
+          category: 'unknown',
+          reason: `compressor external program via env (unverifiable): ${trimmed}`,
+          targetPaths: [],
+          mutates: true,
+        }
+      }
       return classifySingleCommand(inner, denyReadPaths)
     }
   }
@@ -2797,7 +2813,10 @@ function stripUvRunFlags(s: string): string {
     // (`-v c="id" 'BEGIN{c|getline}'`, `ENVIRON["CMD"]|getline`,
     // `print "y" > f`) has no literal command/path to match — fail closed.
     if (firstWord === 'awk' || firstWord === 'gawk') {
-      if (/(?:^|\s)-f(?:\s|$)/.test(rest) || /(?:^|\s)--file=/.test(rest) || /(?:^|\s)-f[A-Za-z0-9_.-]/.test(rest)) {
+      // H6: opaque program FILE via `-f PROG`, `--file=PROG`, `--file PROG`
+      // (space form) or glued `-fPROG` — the program body is never scanned.
+      if (/(?:^|\s)-f(?:\s|$)/.test(rest) || /(?:^|\s)--file(\s|=)/.test(rest) ||
+          /(?:^|\s)-f[A-Za-z0-9_.-]/.test(rest) || /(?:^|\s)--file[A-Za-z0-9_.-]/.test(rest)) {
         return {
           category: 'unknown',
           reason: `awk program file (unverifiable): ${fullCmd.slice(0, 60)}`,
@@ -2806,8 +2825,11 @@ function stripUvRunFlags(s: string): string {
       }
       // Program text may be a quoted block containing spaces; test the whole
       // rest for the indirect command/write surface (`> f` via -v variable,
-      // `c|getline`, ENVIRON, system/exec).
-      if (/\bsystem\s*\(|\bexec\s*\(|\|\s*(?:getline\b|["'])|>\s*(?:["']|[A-Za-z_]\w*)|ENVIRON\s*\[/.test(rest)) {
+      // `c|getline`, ENVIRON|getline, system/exec). H7: ENVIRON alone is a
+      // read (`print ENVIRON["HOME"]`) — require a real sink (|getline, >).
+      if (/\bsystem\s*\(|\bexec\s*\(|\|\s*(?:getline\b|["'])/.test(rest) ||
+          />\s*(?:["']|[A-Za-z_]\w*)/.test(rest) ||
+          /ENVIRON\[[^\]]*\]\s*(\|\s*getline\b|>\s*["'\w])/.test(rest)) {
         return {
           category: 'unknown',
           reason: `awk program executes indirect commands or writes (unverifiable): ${fullCmd.slice(0, 60)}`,
@@ -3179,10 +3201,14 @@ function stripUvRunFlags(s: string): string {
       }
     }
 
-    // B3: external-program guard MUST run BEFORE decompressToStdout — adding
-    // `-dc` to `--use-compress-program` must not reorder the guard away.
+    // B3/H1: external-program guard MUST run BEFORE decompressToStdout —
+    // adding `-dc` to `--use-compress-program` must not reorder the guard
+    // away. Covers the long option (any case, any position/quoting), GNU
+    // gzip/xz short `-I PROG` / glued `-Ish` / `-I=sh` / cluster `-dcIsh`,
+    // across all supported compressors.
     if (/^(gzip|gunzip|xz|unxz|bzip2|bunzip2|lz4|lzma|unlzma|lzop)\b/.test(firstWord) &&
-        /--(?:use-)?compress-program(\s+|=)\S+/.test(trimmed)) {
+        (/(?:^|\s)--?(?:use[-_])?compress-program(\s+|=)\S+/i.test(trimmed) ||
+         /(?:^|\s)-[a-z0-9]*I[A-Za-z0-9_.=]*/.test(trimmed))) {
       return {
         category: 'unknown',
         reason: `compression with external program (unverifiable): ${fullCmd}`,
@@ -3475,7 +3501,11 @@ function splitCommandSegments(command: string): string[] {
  */
 export function extractCommandSubstitutions(s: string): string[] {
   const out: string[] = []
-  const btRe = /`([^`]*)`/g
+  // Backtick body may contain escaped backticks (`\``) and backslashes;
+  // they stay inside the body so the nested command survives for re-scan.
+  // H3: a backtick preceded by `\` is an ESCAPED backtick (not a delimiter) —
+  // `echo \`echo \`ruby -e '…'\`` must extract the whole nested body.
+  const btRe = /(?<!\\)`((?:\\.|[^`\\])*)`/g
   let m: RegExpExecArray | null
   while ((m = btRe.exec(s)) !== null) {
     out.push(m[1])
@@ -3490,6 +3520,12 @@ export function extractCommandSubstitutions(s: string): string[] {
     const starts = [dollar, gt, lt].filter((v) => v !== -1)
     if (starts.length === 0) break
     const start = Math.min(...starts)
+    // H7: `$(( … ))` is arithmetic expansion, NOT a command substitution —
+    // skip it so `echo $((1+2))` stays read.
+    if (start === dollar && s[start + 2] === '(') {
+      i = start + 3
+      continue
+    }
     let depth = 0
     let end = -1
     for (let j = start + 2; j < s.length; j++) {
@@ -3505,6 +3541,12 @@ export function extractCommandSubstitutions(s: string): string[] {
     i = end + 1
   }
   return out
+}
+
+/** H3: normalize escaped backticks / dollar signs inside an extracted
+ *  substitution body so a nested command can be re-scanned one layer deeper. */
+export function unescapeSubstitutionBody(body: string): string {
+  return body.replace(/\\`/g, '`').replace(/\\\$/g, '$')
 }
 
 /**
@@ -3950,6 +3992,7 @@ function wrappedEgressSignal(trimmed: string): string | null {
 /** Interpreters that may appear directly as a find/fd action verb (no sh wrapper). */
 const FIND_INLINE_INTERP = new Set([
   'perl', 'perl5', 'ruby', 'python', 'python3', 'python3.12', 'node', 'nodejs',
+  'php', 'php-cli',
 ])
 
 /**
@@ -3974,11 +4017,34 @@ const FIND_INLINE_EGRESS_RE = new RegExp([
   /net\/http/,
   /open-uri/,
   /IO::Socket(?:::(?:INET|SSL))?\b/,
+  /require\s*\(\s*["']socket["']\s*\)/,
+  /require\s+["']socket["']/,
+  /\bTCPSocket\b/,
+  /\bUDPSocket\b/,
 ].map((r) => r.source).join('|'))
 
+/**
+ * H2: interpreter action bodies inside `find … -exec <interp> -e …` are never
+ * egress-scanned by the hook (the find read path skips it), so ANY process
+ * spawn / shell-out / create-copy primitive inside the inline code fails
+ * closed. The direct-command FileUtils cp/mkdir narrowing contract does NOT
+ * apply here: the find body is opaque and its target paths are unknown.
+ */
+const FIND_FIND_DESTRUCTIVE_RE = new RegExp([
+  INLINE_DESTRUCTIVE_RE.source,
+  /\bFileUtils\.(?:cp|cp_r|mv|mkdir|mkdir_p|touch)\b/,
+  /\bFile\.new\s*\([^)]*['"](?:w|a|r\+|w\+|wb|ab|wt)/,
+  /\bopen\s*\([^)]*['"]>/,
+  /\bfile_put_contents\s*\(/,
+  /\bfwrite\s*\(/,
+  /\b([A-Za-z_]\w*)\s*=\s*File\b(?![:\w])[\s\S]*?\b\1\s*\.\s*(?:write|binwrite|truncate|delete|unlink)\s*\(/,
+  /\bKernel\.(?:system|exec)\b/,
+  /\bqx\b/,
+  /`[^`]*`/,
+].map((r) => (typeof r === 'string' ? r : r.source)).join('|'))
+
 /** Perl `-M`/`-m` and ruby `-r` network modules carried on the load flag rather
- *  than inside the extracted code body; a match fails closed on egress. */
-const FIND_NET_PERL_FLAG = /(?:^|[\s=])-[mM]\s*=?\s*['"]?[A-Za-z0-9:]+['"]?/g
+ *  than inside the extracted code body; a match fails closed on egress. */const FIND_NET_PERL_FLAG = /(?:^|[\s=])-[mM]\s*=?\s*['"]?[A-Za-z0-9:]+['"]?/g
 const FIND_NET_RUBY_FLAG = /(?:^|[\s=])-r\s*=?\s*['"]?[A-Za-z0-9_\/-]+['"]?/g
 const FIND_NET_PERL_MODULES = new Set([
   'LWP', 'LWP::Simple', 'LWP::UserAgent', 'IO::Socket::INET',
@@ -4022,7 +4088,9 @@ function moduleFlagEgress(action: string, verb: string): string | null {
 
 /** Extract the quoted code after -c/-e/-E/--eval from an action substring. */
 function findInlineCode(action: string): string | null {
-  const m = action.match(/-(?:c|e|E|eval)\s*(?:'([^']*)'|"([^"]*)")/)
+  // H2: php uses `-r`/`-R` for inline code (ruby -e, perl -e/-E, python -c,
+  // node -e/--eval).
+  const m = action.match(/-(?:c|e|E|r|R|eval)\s*(?:'([^']*)'|"([^"]*)")/)
   return m ? (m[1] ?? m[2] ?? null) : null
 }
 
@@ -4056,9 +4124,25 @@ function findActionInlineThreat(trimmed: string): { kind: 'delete' | 'egress'; s
     if (FIND_INLINE_INTERP.has(verb)) {
       const code = findInlineCode(action)
       if (code) {
-        if (INLINE_DESTRUCTIVE_RE.test(code)) return { kind: 'delete', signal: `${verb} inline delete` }
+        // H2: find bodies are opaque and never egress-scanned downstream —
+        // use the widened find-specific destructive surface (delete + create
+        // + copy + spawn + shell-out).
+        if (FIND_FIND_DESTRUCTIVE_RE.test(code)) return { kind: 'delete', signal: `${verb} inline delete/spawn` }
         if (FIND_INLINE_EGRESS_RE.test(code)) return { kind: 'egress', signal: `${verb} inline network` }
         if (FIND_SHELLOUT_RE.test(code)) return { kind: 'egress', signal: `${verb} subprocess shell-out` }
+        // H2: ruby/perl/php launchers (spawn/IO.popen/Open3/system/popen) are
+        // opaque — the target string cannot be statically trusted, so fail
+        // closed. Python keeps the g-round posture (only network targets are
+        // denied via FIND_SHELLOUT_RE, e.g. benign os.popen('ls') stays read).
+        if (!/^python/.test(verb) && (/\b(?:spawn|Process\.spawn|IO\.popen|system|popen)\s*\(/.test(code) || /\bOpen3\./.test(code))) {
+          return { kind: 'delete', signal: `${verb} inline spawn/shell exec` }
+        }
+        // H2: node exec/execSync run a command STRING through a shell — cannot
+        // be proven safe even for a literal; node spawnSync/execFileSync stay
+        // on the g-round per-target path (benign spawnSync('ls') stays read).
+        if ((verb === 'node' || verb === 'nodejs') && /\b(?:execSync|exec)\s*\(/.test(code)) {
+          return { kind: 'delete', signal: `node inline command-string exec` }
+        }
       }
       const flag = moduleFlagEgress(action, verb)
       if (flag) return { kind: 'egress', signal: flag }
@@ -4088,7 +4172,7 @@ function findActionInlineThreat(trimmed: string): { kind: 'delete' | 'egress'; s
     const cm = action.match(/(?:-[a-z]*c\s+)(?:'([^']*)'|"([^"]*)")/)
     if (cm) {
       const body = cm[1] ?? cm[2] ?? ''
-      if (INLINE_DESTRUCTIVE_RE.test(body)) return { kind: 'delete', signal: 'wrapped inline delete' }
+      if (FIND_FIND_DESTRUCTIVE_RE.test(body)) return { kind: 'delete', signal: 'wrapped inline delete/spawn' }
       if (FIND_INLINE_EGRESS_RE.test(body)) return { kind: 'egress', signal: 'wrapped inline network' }
       if (FIND_SHELLOUT_RE.test(body)) return { kind: 'egress', signal: 'wrapped subprocess shell-out' }
       const nm = body.match(/(?:sh|bash|dash|zsh)\s+-[a-z]*c\s+(?:'([^']*)'|"([^"]*)")/)
@@ -4238,17 +4322,22 @@ function detectEditorCommandInjection(
  * OTHER segment's payload, invisible to this segment's path extractor.
  */
 function detectStdinEditorEscape(command: string): ClassifyResult | null {
-  const m = /(?:^|[\s;|&])(?:ex|ed)\s+(?:-\w+\s+)*-s\b|vim\s+(?:-[\w]+\s+)*-es\b/i.exec(command)
-  if (!m) return null
-  if (/\bw(?:rite)?\s+(?:\/|~|\S*\.\.)/.test(command)) {
+  // H5: `ed`/`ex`/`vim -es` fed by a stream is a stdin editor; the `-s`
+  // silent flag is NOT required (`echo '!id' | ed f.txt` executes the escape
+  // and `printf 'wq /etc/x\n' | ex -s f.txt` writes the named target). A bare
+  // interactive `ed f.txt` (no pipe) keeps its historical classification.
+  const hasEditor = /\b(?:ex|ed)\b|\bvim\s+(?:-[\w]+\s+)*-es\b/i.test(command)
+  if (!hasEditor) return null
+  if (!/\|/.test(command)) return null
+  // Write-and-quit / ranged write commands with an absolute, ~ or escaping
+  // target: `w /abs`, `wq /abs`, `wq! /abs`, `x /abs`, `N,Mw /abs`.
+  if (/\bw(?:rite)?!?\s+(?:\/|~|\S*\.\.)/.test(command) ||
+      /\b[0-9,$]*\s*w\s+(?:\/|~|\S*\.\.)/.test(command) ||
+      /\bwq!?\s+(?:\/|~|\S*\.\.)/.test(command) ||
+      /\bx\s+(?:\/|~|\S*\.\.)/.test(command)) {
     return { category: 'unknown', reason: `stdin editor writes an absolute/escape path`, targetPaths: [], mutates: true }
   }
-  if (/(?:^|\|)\s*(?:printf|echo)\s+["']?[^"'|]*!(?:\s|$)/.test(command)) {
-    return { category: 'unknown', reason: `stdin editor executes a shell command`, targetPaths: [], mutates: true }
-  }
-  // B7 (g 轮): any `!cmd` / `r !cmd` line inside the stream fed to ed/ex is a
-  // shell escape (live-confirmed `printf '!echo PWNED\nq\n' | ed -s` executes
-  // it). Fail closed on a `!` in the quoted stdin payload.
+  // Shell escapes: `!cmd` (any position), `r !cmd`, `. !cmd`, `%!cmd`.
   if (/["'](?:[^"']*)(?:^|\\)n!|["'][^"']*r\s+!\s|["'][^"']*!\s\S/.test(command) ||
       /\b(?:printf|echo)\s+["'][^"']*!/.test(command)) {
     return { category: 'unknown', reason: `stdin editor receives a shell-escape command line`, targetPaths: [], mutates: true }

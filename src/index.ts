@@ -44,6 +44,7 @@ import {
   hasArchiveExecSink,
   hasDotdotAcrossSymlink,
   extractCommandSubstitutions,
+  unescapeSubstitutionBody,
   type GateDecision,
 } from './classifier.ts'
 import { scanCommandForEgress } from './scan-scripts.ts'
@@ -1050,13 +1051,17 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       ) {
         for (const body of extractCommandSubstitutions(rawCmdSub)) {
           if (!body.trim()) continue
-          if (hasArchiveExecSink(body)) {
+          // H3: a body may itself nest escaped backticks (`echo \`ruby -e …\``);
+          // normalize and recurse one layer so the escaped inner command is
+          // still caught.
+          const norm = unescapeSubstitutionBody(body)
+          if (hasArchiveExecSink(norm)) {
             classification.forceDeny = true
             classification.reason +=
               ' [substitution body is an archive exec sink (bytes -> interpreter): denied]'
             break
           }
-          const subEgress = await scanCommandForEgress(body)
+          const subEgress = await scanCommandForEgress(norm)
           if (subEgress.hits.length > 0) {
             const h = subEgress.hits[0]
             classification.category = 'network'
@@ -1070,6 +1075,27 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
             classification.reason +=
               ' [substitution body unverifiable (dynamic code): cannot prove no egress]'
             break
+          }
+          // One recursion layer for escaped nested substitutions (H3).
+          const nested = extractCommandSubstitutions(norm)
+          if (nested.length > 0 && !classification.forceDeny) {
+            for (const nbody of nested) {
+              if (!nbody.trim()) continue
+              const nn = unescapeSubstitutionBody(nbody)
+              if (hasArchiveExecSink(nn)) {
+                classification.forceDeny = true
+                classification.reason +=
+                  ' [nested substitution body is an archive exec sink: denied]'
+                break
+              }
+              const nEgress = await scanCommandForEgress(nn)
+              if (nEgress.hits.length > 0 || nEgress.unverifiable) {
+                classification.category = nEgress.hits.length > 0 ? 'network' : 'unknown'
+                classification.forceDeny = true
+                classification.reason += ' [nested substitution body unverifiable/egress: cannot prove no egress]'
+                break
+              }
+            }
           }
         }
       }
