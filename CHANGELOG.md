@@ -34,6 +34,21 @@ All notable changes to dsh-tm-guard will be documented in this file.
   followed through their chain), so such targets are denied; `isAutoInitSafe`
   additionally refuses any anchor whose realpath escapes the session cwd, so a
   baseline can never be created outside the workspace.
+- **Lexical protected-path hit can no longer short-circuit a canonical
+  escape (B3).** When a symlink inside the workspace points outside
+  (`elink -> /outside`), a target like `elink/new/f.txt` matched the
+  configured `protectedPaths` lexically, and the gate's `every(protected ||
+  git)` combination let that lexical hit bypass the canonical inside-workspace
+  check entirely, allowing the OS write to land outside. Escape targets are
+  now tagged during the canonical walk and are decided solely by a protection
+  check on the real landing point — the lexical hit alone never allows them.
+- **Symlink cycles and over-long chains resolve to a denial sentinel (B1/B2).**
+  An in-workspace cycle (`a -> b`, `b -> a`) or a chain longer than the hop
+  limit followed by a missing component previously resolved back into a
+  workspace path and could be allowed even though the OS write fails with
+  ELOOP; the canonical fallback now returns a bare `/.tmguard-symlink-loop` /
+  `/.tmguard-symlink-cap` sentinel (never with the basename re-appended), so
+  such targets are conservatively denied and gate behaviour matches the OS.
 
 ### Security (unchanged boundaries)
 - The ancestor fallback happens only after the canonical inside-workspace
