@@ -4185,6 +4185,13 @@ function detectStdinEditorEscape(command: string): ClassifyResult | null {
   if (/(?:^|\|)\s*(?:printf|echo)\s+["']?[^"'|]*!(?:\s|$)/.test(command)) {
     return { category: 'unknown', reason: `stdin editor executes a shell command`, targetPaths: [], mutates: true }
   }
+  // B7 (g 轮): any `!cmd` / `r !cmd` line inside the stream fed to ed/ex is a
+  // shell escape (live-confirmed `printf '!echo PWNED\nq\n' | ed -s` executes
+  // it). Fail closed on a `!` in the quoted stdin payload.
+  if (/["'](?:[^"']*)(?:^|\\)n!|["'][^"']*r\s+!\s|["'][^"']*!\s\S/.test(command) ||
+      /\b(?:printf|echo)\s+["'][^"']*!/.test(command)) {
+    return { category: 'unknown', reason: `stdin editor receives a shell-escape command line`, targetPaths: [], mutates: true }
+  }
   return null
 }
 
