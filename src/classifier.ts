@@ -2364,9 +2364,12 @@ function splitPipeRespectQuotes(command: string): string[] {
   return parts
 }
 
-/** PYTHONPATH/PYTHONSTARTUP assignment whose value contains an absolute path
- * (or a variable / substitution) makes a python interpreter load code from an
- * unverifiable location — fail closed. A pure relative literal ("./lib", "lib",
+/** PYTHONPATH/PYTHONSTARTUP/PYTHONHOME assignment whose value points outside
+ * the session cwd (absolute path, `~`, `..` parent traversal, variable /
+ * substitution) makes a python interpreter load code from an unverifiable
+ * location — fail closed. f-round-2 B4: `~/evil` (shell-expanded), relative
+ * `../evil` (attacker-controlled project dir) and PYTHONHOME were all missed
+ * by the old "starts with /" check. A pure relative literal ("./lib", "lib",
  * ".") stays inside the session cwd and is allowed. */
 function taintedPathEnv(assignTok: string): string | null {
   const m = assignTok.match(/^(PYTHONPATH|PYTHONSTARTUP|PYTHONHOME)=(.+)$/)
@@ -2377,7 +2380,12 @@ function taintedPathEnv(assignTok: string): string | null {
     return `unverifiable ${m[1]} value`
   }
   for (const seg of value.split(':')) {
-    if (seg.startsWith('/')) {
+    if (
+      seg.startsWith('/') ||
+      seg.includes('~') ||
+      seg.includes('..') ||
+      /^\.{1,2}$/.test(seg)
+    ) {
       return `${m[1]} points outside cwd (${seg.slice(0, 40)})`
     }
   }
@@ -2390,7 +2398,7 @@ function taintedPathEnv(assignTok: string): string | null {
  * session cwd and is allowed. */
 function pythonSysPathThreat(code: string): string | null {
   let m: RegExpExecArray | null
-  const mut = /\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend)\s*\(([^)]*)\)/g
+  const mut = /\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend|__setitem__)\s*\(([^)]*)\)/g
   while ((m = mut.exec(code))) {
     const args = m[1]!
     const pathArg = args.includes(',')
@@ -2401,6 +2409,18 @@ function pythonSysPathThreat(code: string): string | null {
     const p = lit[1]!
     if (p.startsWith('/') || p.includes(':')) return `sys.path points outside cwd: ${p.slice(0, 40)}`
   }
+  // f-round-2 B5: `getattr(sys.path,"insert")(0,"/tmp/evil")` — string-method
+  // dispatch hides the mutation from the literal-name nets.
+  if (/getattr\s*\(\s*sys\s*\.\s*path\s*,\s*["'](?:insert|append|extend|__setitem__)["']\s*\)/.test(code)) {
+    const arg = code.match(/getattr\s*\(\s*sys\s*\.\s*path\s*,\s*["'](?:insert|append|extend|__setitem__)["']\s*\)\s*\(\s*[^)]*?,\s*['"]([^'"]*)['"]/)
+    if (arg) {
+      if (arg[1]!.startsWith('/') || arg[1]!.includes(':')) {
+        return `sys.path getattr dispatch outside cwd: ${arg[1]!.slice(0, 40)}`
+      }
+    } else {
+      return 'sys.path getattr dispatch with non-literal path'
+    }
+  }
   const assign = /\bsys\s*\.\s*path\s*(?:\[[^\]]*\]\s*)?=\s*['"]([^'"]*)['"]/g
   while ((m = assign.exec(code))) {
     if (m[1]!.startsWith('/')) return `sys.path assignment outside cwd: ${m[1]!.slice(0, 40)}`
@@ -2409,6 +2429,30 @@ function pythonSysPathThreat(code: string): string | null {
     return 'sys.path assigned from a non-literal'
   }
   return null
+}
+
+/**
+ * Strip pass-through wrappers to a fixpoint: `nohup|setsid|command|time|nice|
+ * ionice|strace`, `env [-i …]`, `( … )` parens, and leading `VAR=value`
+ * assignments (any order, any depth, e.g. `X=1 nohup python3 -`). Returns the
+ * inner command with the wrappers removed. Shared by the per-segment stdin
+ * interpreter checks in classifyBashCommand and classifySingleCommand so a
+ * wrapped `… | nohup python3 -` fails closed exactly like a bare `python3 -`.
+ */
+function stripWrappers(seg: string): string {
+  let s = seg.trim()
+  for (let g = 0; g < 8; g++) {
+    const m = s.match(
+      /^(?:(?:nohup|setsid|command|time|nice|ionice|strace)\s+|env\s+(?:-[A-Za-z0-9]+\s+)*|\([\s(]*|[A-Za-z_]\w*=\S+\s+)+/,
+    )
+    if (!m) break
+    s = s.slice(m[0].length).trim()
+    // f-round-2 B6: a leading subshell group `(python3 -)` leaves a trailing
+    // `)` behind — strip the matching close paren so the stdin-code check
+    // sees `python3 -`, not `python3 -)`.
+    if (/^\([\s(]*/.test(m[0]) && s.endsWith(')')) s = s.slice(0, -1).trim()
+  }
+  return s
 }
 
 function classifySingleCommand(command: string, denyReadPaths: string[] = []): ClassifyResult {
@@ -3066,6 +3110,17 @@ function stripUvRunFlags(s: string): string {
         targetPaths: writes,
       }
     }
+    // f-round-2 B6: `echo 1 | nohup python3 -` — splitCommandSegments split
+    // on the pipe FIRST, so the wrapper segment (`nohup python3 -`) arrives
+    // here with no pipe in sight and the old pipe-branch strip never ran
+    // (local_exec ALLOW, live). Strip pass-through wrappers to a fixpoint so
+    // the bare/stdin interpreter checks below see the interpreter itself.
+    const w1raw = firstWord
+    const wrestRaw = rest
+    const strippedSeg = stripWrappers(`${w1raw} ${wrestRaw}`)
+    const strippedParts = strippedSeg.split(/\s+/)
+    const w1 = (strippedParts[0] ?? '').toLowerCase().split('/').pop() ?? ''
+    const wrest = strippedSeg.slice((strippedParts[0] ?? '').length).trim()
     // B6 (g 轮): a bare code-host interpreter with NO arguments reads and
     // executes code from stdin (`cat evil.rb | ruby`, `gzip -dc evil.gz |
     // ruby`, `cat x.sh | bash`). The pipe content is not on the command line;
@@ -3073,8 +3128,8 @@ function stripUvRunFlags(s: string): string {
     // -e/-c/-m, heredoc marker, flag) names an explicit target and keeps the
     // historical classification (e.g. `ruby -w`, `node <<'NODE'`,
     // `python3 -m http.server`, `bash -x -c "…"` all stay local_exec).
-    if (/^(?:ruby|perl|php|python\d*|node|nodejs|bash|sh|zsh|dash|ksh|tclsh|elixir|elixirc|escript)\b/.test(firstWord) &&
-        !rest.trim()) {
+    if (/^(?:ruby|perl|php|python\d*|node|nodejs|bash|sh|zsh|dash|ksh|tclsh|elixir|elixirc|escript)\b/.test(w1) &&
+        !wrest.trim()) {
       return {
         category: 'unknown',
         reason: `bare interpreter may execute stdin code (unverifiable): ${fullCmd.slice(0, 60)}`,
@@ -3090,11 +3145,11 @@ function stripUvRunFlags(s: string): string {
     // heredoc) — the interpreter's stdin position marker (`-`, /dev/stdin,
     // /dev/fd/N) plus ANY pipe / `<` / process-substitution upstream fails
     // closed, without requiring the pipe branch.
-    if (/^(?:ruby|perl|php|python\d*|node|nodejs)\b/.test(firstWord) &&
-        (/(?:^|\s)(?:\/dev\/(?:stdin|fd\/\d+))(?:\s|$)/.test(rest) ||
-         /\s-\s|\s-\s*$/.test(rest) || /^\s*-\s/.test(rest)) &&
-        /(?:^|[|&;])\s*(?:<\s*\(|[^<]*\||[^<]*<(?!<))/.test(trimmed) &&
-        !/<<-?/.test(trimmed.replace(/^(?:ruby|perl|php|python\d*|node|nodejs)\b/, ''))) {
+    if (/^(?:ruby|perl|php|python\d*|node|nodejs)\b/.test(w1) &&
+        (/(?:^|\s)(?:\/dev\/(?:stdin|fd\/\d+))(?:\s|$)/.test(wrest) ||
+         /\s-\s|\s-\s*$/.test(wrest) || /^\s*-\s/.test(wrest)) &&
+        /(?:^|[|&;])\s*(?:<\s*\(|[^<]*\||[^<]*<(?!<))/.test(`${w1} ${wrest}`.trim()) &&
+        !/<<-?/.test(`${w1} ${wrest}`.trim().replace(/^(?:ruby|perl|php|python\d*|node|nodejs)\b/, ''))) {
       return {
         category: 'unknown',
         reason: `interpreter reads code from stdin (unverifiable): ${fullCmd.slice(0, 60)}`,
@@ -4241,10 +4296,10 @@ const FIND_NET_RUBY_MODULES = new Set([
  *  `os.execvp('ls')` / `spawnSync('ls')` with a non-network argv stays allowed. */
 const FIND_SHELLOUT_RE = new RegExp([
   /subprocess\.(?:run|Popen|call|check_call|check_output)\s*\([^)]*shell\s*=\s*True/,
-  /subprocess\.(?:run|Popen|call|check_call|check_output)\s*\(\s*\[\s*['"](?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)['"]/,
-  /subprocess\.(?:getoutput|getstatusoutput)\s*\(\s*['"][^'"]*(?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)/,
-  /os\.(?:exec[a-z]*|posix_spawn|popen[234]?)\s*\(\s*['"][^'"]*(?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)/,
-  /require\(\s*\\?['"]child_process\\?['"]\s*\)\s*\.\s*(?:spawn|spawnSync|fork|execFile|execFileSync|exec|execSync)\s*\(\s*['"][^'"]*(?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)/,
+  /subprocess\.(?:run|Popen|call|check_call|check_output)\s*\(\s*\[\s*\\?['"](?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)['"]/,
+  /subprocess\.(?:getoutput|getstatusoutput)\s*\(\s*\\?['"][^'"]*(?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)/,
+  /os\.(?:exec[a-z]*|posix_spawn|popen[234]?)\s*\(\s*\\?['"][^'"]*(?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)/,
+  /require\(\s*\\?['"]child_process\\?['"]\s*\)\s*\.\s*(?:spawn|spawnSync|fork|execFile|execFileSync|exec|execSync)\s*\(\s*\\?['"][^'"]*(?:curl|wget|aria2c|axel|ncat|netcat|nc|telnet|ftp|sftp|ssh|scp|rsync)/,
 ].map((r) => r.source).join('|'))
 
 /** Network module carried on a perl `-M`/`-m` or ruby `-r` load flag. */
@@ -4396,16 +4451,45 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
           // code (puts "system" stays read); pipe-open patterns need the
           // original string content so they run on `code`.
           const masked = maskStringLiterals(code)
+          // f-round-2 B1: Open3 through an alias receiver (`o=Open3;
+          // o.capture2`), `::` namespace separator (`Open3::popen2`), and
+          // dynamic dispatch (`Open3.send(:capture2)`, `m="capture2";
+          // Open3.send(m,…)`, `Open3.method("capture2").call`,
+          // `public_send("popen#{2}")`) are all equivalent to a direct
+          // `Open3.capture2` — close them as a family. The `::` case needs
+          // the original string (mask would hide it); interpolated method
+          // names need the original too, so these run on `code`.
+          let o3Hit = false
+          if (/\bOpen3\b/.test(code)) {
+            const o3recv = ['Open3']
+            for (const m2 of code.matchAll(/(\w+)\s*=\s*Open3\b/g)) {
+              if (m2[1] !== 'Open3' && !o3recv.includes(m2[1])) o3recv.push(m2[1])
+            }
+            const recvAlt = o3recv.join('|')
+            const o3Method = '(?:capture2e?|capture3|popen[23]?|pipeline[_a-z]*)'
+            o3Hit =
+              // `[.:]+` covers both `.` and the `::` namespace separator
+              // (`Open3::popen2`) — a single `[.:]` matched only one char.
+              new RegExp(`(?:${recvAlt})\\s*[.:]+\\s*(?:${o3Method})\\s*[(\\s]`).test(code) ||
+              // dynamic dispatch: symbol, string literal, OR a variable name
+              // (`m="capture2";Open3.send(m,…)`) — a variable receiver of a
+              // dispatch whose name we cannot verify fails closed too.
+              new RegExp(`(?:${recvAlt})\\s*\\.\\s*(?:send|public_send|__send__)\\s*\\(\\s*(?::|["']|${'[A-Za-z_]\\w*'})[^"')]*(?:${o3Method})`, 'i').test(code) ||
+              new RegExp(`(?:${recvAlt})\\s*\\.\\s*(?:send|public_send|__send__)\\s*\\(\\s*[A-Za-z_]\\w*\\s*(?:[,)]|\\s*,\\s)`).test(code) ||
+              new RegExp(`(?:${recvAlt})\\s*\\.\\s*method\\s*\\(\\s*["'][^"')]*(?:${o3Method})`, 'i').test(code)
+          }
           if (NONPY_LAUNCH_WORD.test(masked) ||
               // F1-a: Open3 family (capture2/capture2e/capture3/popen2/
               // popen3/pipeline) spawns subprocesses — 37ac047 covered it,
               // the NONPY word list lost it.
-              /\bOpen3\s*\.\s*(?:capture2e?|capture3|popen[23]?|pipeline)\s*\(/.test(masked) ||
+              o3Hit ||
               /%x\s*[({[]/.test(code) ||
               /Kernel\.(?:send|public_send|__send__)\s*\(/.test(masked) ||
               /IPC::Open[23]\b|\bopen[23]\s*\(/.test(masked) ||
               /open\s*\([^)]*["']-\|["']/.test(code) ||
-              /open\s*\([^)]*["']\|-["']/.test(code)) {
+              /open\s*\([^)]*["']\|-["']/.test(code) ||
+              // f-round-2 obs-5: perl variable pipe mode (`$m="|-";open($f,$m,"id")`)
+              (/(?:^|[^$\w])\$\w+\s*=\s*["'][|]?-[|]?["']/.test(code) && /(?:open|sysopen)\s*\(/.test(code))) {
             return { kind: 'delete', signal: `${verb} inline launcher` }
           }
         }
@@ -4453,7 +4537,7 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
     }
 
     // Wrapped shell body: delete surface + inline egress APIs, one nested layer.
-    const cm = action.match(/(?:-[a-z]*c\s+)(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/)
+    const cm = action.match(/(?:-[a-z]*c\s+)(?:\$?'([^']*)'|"((?:[^"\\]|\\.)*)")/)
     if (cm) {
       // Keep the extracted body ESCAPED (`\"` stays `\"`): the recursion below
       // re-reads it through findInlineCode, whose escape-aware quote branch
@@ -4467,6 +4551,17 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
       // inline-interpreter adjudicator so node/python/… launchers inside
       // `sh -c 'node -e "…"'` fail closed exactly like a direct `-exec node`.
       // Depth is bounded (a nested `sh -c 'sh -c …'` chain cannot run forever).
+      // F1-b: the wrapped body is an arbitrary command — recurse through the
+      // inline-interpreter adjudicator so node/python/… launchers inside
+      // `sh -c 'node -e "…"'` fail closed exactly like a direct `-exec node`.
+      // Depth is bounded (a nested `sh -c 'sh -c …'` chain cannot run forever).
+      // f-round-2 B2 note: a full classifyBashCommand(body) recursion was
+      // tried and reverted — it over-denied benign read-only bodies
+      // (`sh -c 'python3 -c "print(1)"'`, `sh -c 'git log'`) that the
+      // direct-verb readonly exemptions (G3-G7) allow; the find-action
+      // recursion below already covers the real B2 threats (node spawnSync/
+      // execFile families via FIND_SHELLOUT_RE, curl/wget/pip/git-fetch via
+      // FIND_INLINE_EGRESS_RE, nested `sh -c 'sh -c …'` chains).
       const innerThreat = findActionInlineThreat(`-exec ${body} {} ;`, 1)
       if (innerThreat) {
         return { kind: innerThreat.kind, signal: `wrapped ${innerThreat.signal}` }
@@ -4726,8 +4821,14 @@ export function classifyBashCommand(
   // upstream pipeline (already split away here) or the terminal, neither is
   // on the command line. Fail closed. Heredoc-fed interpreters were collapsed
   // by stripHeredocs and keep their historical scanned path.
+  // f-round-2 B6: strip pass-through wrappers per segment first so
+  // `… | nohup python3 -`, `… | command python3 -`, `… | (python3 -)`,
+  // `… | X=1 nohup python3 -` all hit this rule — splitCommandSegments cut
+  // the pipe away before classifySingleCommand, where the wrapper strip
+  // alone cannot see the upstream pipe and would return local_exec ALLOW.
   const stdinCode = segments.find((p) =>
-    /^(?:ruby|perl|php|python\d*|node|nodejs)\s+(?:\/dev\/(?:stdin|fd\/\d+)|-)\s*$/.test(p.trim()))
+    /^(?:ruby|perl|php|python\d*|node|nodejs)\s+(?:\/dev\/(?:stdin|fd\/\d+)|-)\s*$/.test(stripWrappers(p)),
+  )
   if (stdinCode) {
     return {
       category: 'unknown',

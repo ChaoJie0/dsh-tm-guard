@@ -996,7 +996,17 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
       // so a `denyNetwork=false` config override cannot resurrect smuggled
       // egress; eval/exec/__import__ we cannot prove innocent is downgraded to
       // unknown (conservative deny).
-      if (classification.category === 'local_exec') {
+      // f-round-2 B3: `find … -exec ruby - {} \; <<'RB'` classifies as
+      // READ (find action), so the egress gate below (local_exec only) never
+      // sees the heredoc body — the interpreter runs it via stdin and the
+      // system/File.write payload executes. Scan heredoc-bearing commands on
+      // every category: the heredoc scanner only flags real interpreter code
+      // (system, network, File.write…); a plain `cat <<EOF` text heredoc
+      // stays unflaggable and remains read.
+      const hasHeredoc = /<<-?\s*(?:'([^']+)'|"([^"]+)"|[A-Za-z_][A-Za-z0-9_]*)/.test(
+        (args.command as string) ?? (args.input as string) ?? (args.cmd as string) ?? (args.code as string) ?? '',
+      )
+      if (classification.category === 'local_exec' || (classification.category === 'read' && hasHeredoc)) {
         const rawCmd =
           (args.command as string) ??
           (args.input as string) ??

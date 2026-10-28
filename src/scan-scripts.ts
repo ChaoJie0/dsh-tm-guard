@@ -137,20 +137,31 @@ const RULES: Record<Lang, LangRules> = {
       // FP-2: pure-relative-literal sys.path mutations are exempted inside
       // scanCode() so this layer agrees with the classifier's
       // pythonSysPathThreat (PYTHONPATH=./lib env form is allowed).
-      /\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend)\s*\(/,
+      /\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend|__setitem__)\s*\(/,
       // F3-b: bound-alias mutations — `ins=sys.path.insert; ins(0,"/tmp/evil")`
       // or `p=sys.path; p.insert(0,"/tmp/evil")` — the alias hides the
       // mutation from the literal-name regex above (the `;`-terminated binding
       // and the later `alias(…)` call are both matched).
-      /\b([A-Za-z_]\w*)\s*=\s*sys\s*\.\s*path(?:\s*\.\s*(?:insert|append|extend))?\s*(?:\(|;)/,
+      /\b([A-Za-z_]\w*)\s*=\s*sys\s*\.\s*path(?:\s*\.\s*(?:insert|append|extend|__setitem__))?\s*(?:\(|;)/,
+      // f-round-2 B5: `sys.path.__setitem__(0,"/tmp/evil")` (indexed writer)
+      // and `getattr(sys.path,"insert")(0,…)` (string-method dispatch) both
+      // hide the mutation from the literal-name nets.
+      /\bsys\s*\.\s*path\s*\.\s*__setitem__\s*\(/,
+      /getattr\s*\(\s*sys\s*\.\s*path\s*,\s*["'](?:insert|append|extend|__setitem__)["']\s*\)/,
       /\bsys\s*\.\s*path\s*(?:\[[^\]]*\]\s*=|=\s*)/,
-      /\bos\s*\.\s*environ\s*\[\s*["']PYTHONPATH["']\s*\]\s*=/,
+      // f-round-2 B4: os.environ assignments to ANY python path override
+      // (PYTHONHOME/PYTHONPATH/PYTHONSTARTUP) poison interpreter startup —
+      // fail closed regardless of the assigned value's shape.
+      /\bos\s*\.\s*environ\s*\[\s*["']PYTHON(?:HOME|PATH|STARTUP)["']\s*\]\s*=/,
       // F3-c: site.addsitedir adds a whole directory of packages at runtime
       // (the classifier's sitecustomize/PYTHONHOME net covers startup paths);
       // importlib.util.spec_from_file_location loads a module from an
       // arbitrary file — both are unverifiable code sources.
       /\bsite\s*\.\s*addsitedir\s*\(/,
-      /\bimportlib\s*\.\s*util\s*\.\s*(?:spec_from_file_location|module_from_spec)\s*\(/,
+      // f-round-2 B5: don't anchor `importlib.util.` — `from importlib.util
+      // import spec_from_file_location as s; s(…)` aliases it away; these two
+      // functions have no other source.
+      /\b(?:spec_from_file_location|module_from_spec)\s*\(/,
       /\bos\s*\.\s*system\s*\(/,
     ],
   },
@@ -172,6 +183,13 @@ const RULES: Record<Lang, LangRules> = {
     risky: [
       /\bprocess\.(kill|spawn)\b/,
       /\bDeno\.(run|writeTextFile|writeFile|connect|listen|mkdir|remove|symlink)\b/,
+      // f-round-2 B3: node heredoc stdin code running `child_process`
+      // exec/execSync executes an arbitrary COMMAND STRING whose target
+      // cannot be proven innocent statically — fail closed, matching the
+      // ruby/python system()/os.system posture. spawn/spawnSync/execFile
+      // take an argv/file and stay on the network-argv shellNet rule, so
+      // benign `spawnSync('ls')` remains readable.
+      /\b(?:require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.|child_process\s*\.)\s*(?:exec|execSync)\s*\(/,
     ],
   },
   shell: {
@@ -220,7 +238,10 @@ const RULES: Record<Lang, LangRules> = {
       /\bopen\s*\(\s*['"][|wa+]/,
       // B1: Kernel.open(path, "w…") — mode in a later argument
       /\bopen\s*\([^)]*,\s*['"](?:w|a|r\+|w\+|wb|ab)/,
-      // process spawn / exec
+      // process spawn / exec — FP-5: words inside inert string literals
+      // (`puts "operating system check"`) are not call sites; the loop
+      // re-tests this pattern on a masked line (only interpolated strings
+      // `system("#{cmd}")` keep their hit).
       /\b(system|exec|spawn|fork|Process\.spawn|Process\.kill|IO\.popen)\b/,
       // pipe-open reads execute the command (IO.read("|dig …") etc.)
       /\bIO\.(read|readlines|readline|foreach|gets)\s*\(\s*['"]\|/,
@@ -428,7 +449,14 @@ function extractHeredocs(command: string): { bodies: HeredocHit[]; clean: string
       // -exec clause so its body is scanned with the right language instead
       // of being dropped as unverifiable-by-luck.
       const exeM = line.match(/-\s*exec\s+(\S+)/)
-      const exeFirst = exeM ? (exeM[1].split('/').pop() ?? '').toLowerCase() : ''
+      let exeFirst = exeM ? (exeM[1].split('/').pop() ?? '').toLowerCase() : ''
+      // f-round-2 B3: `-exec sh -c 'ruby -' {} \; <<'RB'` — the shell wrapper
+      // delegates the heredoc to an inner interpreter; take its language so
+      // the body is scanned as ruby (not dropped as unverifiable-by-luck).
+      if (/^(?:sh|bash|dash|zsh)$/.test(exeFirst)) {
+        const inner = line.match(/-c\s*['"]?\s*(ruby|perl|php|python\d*|node|nodejs)\b/)
+        if (inner) exeFirst = inner[1]
+      }
       const lang = INTERPRETERS[exeFirst] ?? INTERPRETERS[first]
       if (lang) {
         active = { delim, stripTabs, lang, body: [] }
@@ -511,6 +539,32 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
   const lines = code.split('\n')
   const importLines: { n: number; line: string }[] = []
   let hardHits = 0
+  // f-round-2 B5: `from importlib.util import spec_from_file_location as s;
+  // s("m","/tmp/none.py")` aliases the function away from the risky literal
+  // regex. Track the alias per line so a later bare call site is detected.
+  let specAlias: string | null = null
+  // Reused by dyn and risky loops: relative-literal call sites of the spec
+  // family (spec_from_file_location/module_from_spec/its alias) load a module
+  // inside the session cwd and are verifiable; absolute / non-literal args
+  // still fail closed.
+  const specCallRE = (l: string): RegExp | null => {
+    if (language !== 'python') return null
+    if (/\b(?:spec_from_file_location|module_from_spec)\s*\(/.test(l)) {
+      return /\b(?:spec_from_file_location|module_from_spec)\s*\(/
+    }
+    if (specAlias && new RegExp(`\\b${specAlias}\\s*\\(`).test(l)) {
+      return new RegExp(`\\b${specAlias}\\s*\\(`)
+    }
+    return null
+  }
+  const specRelLiteral = (l: string): boolean => {
+    const re = specCallRE(l)
+    if (!re) return false
+    const strs = [...l.matchAll(/["']([^"']*)["']/g)].map((x) => x[1])
+    return strs.length > 0 && strs.every((s) =>
+      !s.startsWith('/') && !s.includes(':') && !s.includes('$') &&
+      !s.includes('`') && !s.includes('"'))
+  }
 
   for (let i = 0; i < lines.length && out.length < MAX_HITS; i++) {
     const line = lines[i]
@@ -522,6 +576,13 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
     // into a false "network" denial the moment the import graph reached the
     // detector's own source.
     if (isRegexLiteralLine(line)) continue
+
+    // f-round-2 B5: track `… as s` aliases of the spec family so a later
+    // bare `s(...)` call site is caught by specCallRE above.
+    if (language === 'python') {
+      const am = line.match(/\b(?:spec_from_file_location|module_from_spec)\s+as\s+(\w+)\b/)
+      if (am) specAlias = am[1]
+    }
 
     // Shell-out hits are always hard (no loopback downgrade for `curl ...`
     // with a remote host; loopback filter below handles 127.0.0.1 lines).
@@ -563,7 +624,17 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
 
     for (const re of rules.dyn) {
       re.lastIndex = 0
-      if (re.test(line)) unverifiable = true
+      if (re.test(line)) {
+        // f-round-2 FP-4: `import importlib.util as u;u.spec_from_file_location(
+        // "m","./m.py")` hits the dyn `import importlib` marker, but a
+        // relative-literal spec-family call on the same line is verifiable —
+        // do not fail the whole scan for it. Absolute/non-literal args (and a
+        // bare import with no call) still fail closed.
+        if (language === 'python' &&
+            re.source.includes('importlib') &&
+            specRelLiteral(line)) continue
+        unverifiable = true
+      }
     }
 
     // Unverifiable-risky primitives (writes/deletes/processes/sockets/ARGV):
@@ -571,15 +642,38 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
     // as network hits (they are not egress; the caller downgrades to unknown).
     for (const re of rules.risky) {
       re.lastIndex = 0
-      if (re.test(line)) {
+      let rawHit = re.test(line)
+      // f-round-2 B5: alias call sites count as a spec-family raw hit even
+      // though the risky literal regex cannot see the alias name.
+      if (!rawHit && language === 'python' && specAlias &&
+          new RegExp(`\\b${specAlias}\\s*\\(`).test(line)) rawHit = true
+      // FP-5: ruby process words (system/exec/spawn/fork) that occur only
+      // inside inert string literals (`puts "operating system check"`) are
+      // not call sites — re-test the line with inert strings masked. A
+      // double-quoted string containing `#{}` interpolation is NOT masked
+      // (`system("#{cmd}")` is a live call), single quotes never interpolate.
+      if (rawHit && re.source.startsWith('\\b(system|exec|spawn|fork')) {
+        const maskedLine = line
+          .replace(/"(?:[^"#\\]|\\.)*(?!#\{)"/g, '""')
+          .replace(/'(?:[^'\\]|\\.)*'/g, '""')
+        re.lastIndex = 0
+        if (!re.test(maskedLine)) continue
+      }
+      if (rawHit) {
         // FP-2: a sys.path mutation whose string arguments are all pure
         // relative literals ("lib", "./lib", ".", "x/y") stays inside the
         // session cwd — classifier's pythonSysPathThreat allows it and the
         // two layers must agree (PYTHONPATH=./lib env form is allowed).
         // Any absolute path, colon path, variable or substitution still
         // fails closed (and non-literal args yield no string match → deny).
+        // f-round-2 FP-3/FP-4: the same relative-literal posture applies to
+        // site.addsitedir("./lib") and u.spec_from_file_location("m","./m.py")
+        // (a module inside the session cwd is verifiable); absolute or
+        // non-literal args stay denied.
         if (language === 'python' &&
-            /\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend)\s*\(/.test(line)) {
+            (/\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend|__setitem__)\s*\(/.test(line) ||
+             /\bsite\s*\.\s*addsitedir\s*\(/.test(line) ||
+             specCallRE(line) !== null)) {
           const strs = [...line.matchAll(/["']([^"']*)["']/g)].map((x) => x[1])
           if (strs.length > 0 && strs.every((s) =>
             !s.startsWith('/') && !s.includes(':') && !s.includes('$') &&
