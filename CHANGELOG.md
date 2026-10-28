@@ -58,6 +58,14 @@ All notable changes to dsh-tm-guard will be documented in this file.
   scanned component-by-component (before any collapse) and such targets
   resolve to the `/.tmguard-dotdot-escape` denial sentinel, both at
   classification and at the canonical-walk entry point.
+- **B4 defence extended to absolute, `~` and `$HOME` forms, and sentinel
+  targets are forced denies (review-l5b-0.2.10c blockers 1/2 + O1).** The
+  previous fix only guarded plain relative paths: `toAbsolute()` returned
+  early for `/abs/path/link/../x` and `~/link/../x` before the guard ran, so
+  the lexical `..` survived collapse and the write was allowed while the OS
+  landed it outside the workspace. The guard now runs first on every form
+  (`expandHome` first for `~`/`$HOME`), and any `/.tmguard-*` sentinel target
+  is a forced deny regardless of protected-prefix coverage.
 
 ### Security (unchanged boundaries)
 - The ancestor fallback happens only after the canonical inside-workspace

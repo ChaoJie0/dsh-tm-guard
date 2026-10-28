@@ -1678,8 +1678,11 @@ export function hasDotdotAcrossSymlink(
     let isLink = false
     try {
       isLink = lstatSync(prefix).isSymbolicLink()
-    } catch {
-      isLink = false
+    } catch (e) {
+      // ENOENT means the component does not exist (and cannot be a link);
+      // any other error (EACCES etc.) is fail-closed: treat the component as
+      // a link so a `..` after it is denied rather than silently collapsed.
+      isLink = (e as NodeJS.ErrnoException).code !== 'ENOENT'
     }
     linkStack.push(isLink)
   }
@@ -1688,9 +1691,25 @@ export function hasDotdotAcrossSymlink(
 
 /** Absolute-ize a possibly-relative path for deny-prefix matching. */
 function toAbsolute(path: string, baseDir: string = process.cwd()): string {
-  if (path.startsWith('/')) return path
-  if (path.startsWith('~')) return expandHome(path)
-  if (/^\$(?:HOME|\{HOME\})(\/|$)/.test(path)) return expandHome(path)
+  // B4 check runs FIRST, on every form, before any collapse/expansion can
+  // happen: absolute paths, `~`, `$HOME` and plain relative paths all cross
+  // the same raw-path guard. `expandHome` is applied first for `~`/`$HOME`
+  // so the guard lstat's a real path (a literal `~/` prefix has no lstat
+  // target of its own).
+  if (path.startsWith('~')) {
+    const e = expandHome(path)
+    if (hasDotdotAcrossSymlink(e)) return '/.tmguard-dotdot-escape'
+    return e
+  }
+  if (/^\$(?:HOME|\{HOME\})(\/|$)/.test(path)) {
+    const e = expandHome(path)
+    if (hasDotdotAcrossSymlink(e)) return '/.tmguard-dotdot-escape'
+    return e
+  }
+  if (path.startsWith('/')) {
+    if (hasDotdotAcrossSymlink(path)) return '/.tmguard-dotdot-escape'
+    return path
+  }
   if (hasDotdotAcrossSymlink(path, baseDir)) return '/.tmguard-dotdot-escape'
   return resolve(baseDir, path)
 }
@@ -4176,7 +4195,15 @@ export function decide(
 ): GateDecision {
   const { category, reason, forceDeny } = classification
 
-  if (forceDeny) {
+  // Sentinel targets (`/.tmguard-dotdot-escape`, `-.tmguard-symlink-loop`,
+  // `-.tmguard-symlink-cap`) mean the raw path crossed a symlink component or
+  // could not be canonicalised — the OS write would land somewhere the gate
+  // cannot see. Deny them unconditionally instead of relying on "the sentinel
+  // happens not to be covered by any protectedPaths prefix" (review-l5b O1).
+  if (
+    forceDeny ||
+    classification.targetPaths.some((t) => t.startsWith('/.tmguard-'))
+  ) {
     return {
       allow: false,
       reason: `BLOCKED (${category}, forced deny): ${reason}`,

@@ -16,7 +16,7 @@ import { mkdtempSync, mkdirSync, symlinkSync, rmSync, realpathSync, writeFileSyn
 import { join } from 'node:path'
 import { tmpdir, homedir } from 'node:os'
 import { canonicalTarget, isAutoInitSafe } from './src/index.ts'
-import { classifyBashCommand } from './src/classifier.ts'
+import { classifyBashCommand, decide } from './src/classifier.ts'
 import { isPathProtected } from './src/tm.ts'
 
 let ROOT = ''
@@ -115,6 +115,49 @@ test('classifier: symlink + .. + more components becomes sentinel (B4)', () => {
 test('classifier: plain .. without symlink stays resolved (B4 control)', () => {
   const r = classifyBashCommand('echo hi > fresh/../x.txt')
   assert.equal(r.targetPaths[0], join(CWD_REAL, 'x.txt'))
+})
+
+test('classifier: ABSOLUTE symlink+.. path becomes sentinel (B4, review-l5b blocker 1)', () => {
+  // toAbsolute() must run the B4 guard on absolute paths too — the raw
+  // `elink/../` must not survive collapse when written as an absolute target.
+  const r = classifyBashCommand(`echo hi > ${CWD_REAL}/elink/../abs.txt`)
+  assert.ok(r.targetPaths.includes('/.tmguard-dotdot-escape'), `got ${JSON.stringify(r.targetPaths)}`)
+})
+
+test('classifier: TILDE (~) symlink+.. path becomes sentinel (B4, review-l5b blocker 2)', () => {
+  // expandHome must be followed by the guard, not shortcut past it.
+  const savedHome = process.env.HOME
+  try {
+    process.env.HOME = ROOT
+    symlinkSync(OUT, join(ROOT, 'hl'))
+    const r = classifyBashCommand('echo hi > ~/hl/../tilde.txt')
+    assert.ok(r.targetPaths.includes('/.tmguard-dotdot-escape'), `got ${JSON.stringify(r.targetPaths)}`)
+  } finally {
+    process.env.HOME = savedHome
+  }
+})
+
+test('classifier: $HOME symlink+.. path becomes sentinel (B4, review-l5b blocker 2)', () => {
+  const savedHome = process.env.HOME
+  try {
+    process.env.HOME = ROOT
+    symlinkSync(OUT, join(ROOT, 'hl2'))
+    const r = classifyBashCommand('echo hi > $HOME/hl2/../dollar.txt')
+    assert.ok(r.targetPaths.includes('/.tmguard-dotdot-escape'), `got ${JSON.stringify(r.targetPaths)}`)
+  } finally {
+    process.env.HOME = savedHome
+  }
+})
+
+test('decide: sentinel target is forced deny even when pathsProtected=true (review-l5b O1)', () => {
+  const c = {
+    category: 'file_write' as const,
+    reason: 'test',
+    targetPaths: ['/.tmguard-dotdot-escape'],
+  }
+  const d = decide(c, true)
+  assert.equal(d.allow, false)
+  assert.match(d.reason, /forced deny/)
 })
 
 test('canonicalTarget: bare external symlink resolves to its target (unchanged)', () => {
