@@ -894,6 +894,7 @@ function extractWritePaths(command: string): string[] {
         if (v) { changeDir = v; i++ }
         continue
       }
+      if (t.startsWith('--directory=')) { changeDir = t.slice(12); continue }
       if (t === '-x' || t === '--extract' || t === '--get' || t === '-t' ||
           t === '--list' || t === '-d' || t === '--diff' || t === '--compare') {
         mode = 'extract'
@@ -906,9 +907,34 @@ function extractWritePaths(command: string): string[] {
       }
       if (t.startsWith('-') && !t.startsWith('--')) {
         // Short-option cluster: `-czf` contains the `f` marker whose value is
-        // the next token; `-C` consumes the next token as the directory. An
-        // action letter (x/c/t/d/r/u) re-marks the mode.
+        // the next token; `-C` consumes the next token (or a glued value
+        // `-Cdir`) as the directory. An action letter (x/c/t/d/r/u) re-marks
+        // the mode.
         const letters = t.slice(1)
+        if (letters.includes('C')) {
+          const rest = letters.slice(letters.indexOf('C') + 1)
+          if (rest) { changeDir = rest }
+          else if (i + 1 < tokens.length && !tokens[i + 1].startsWith('-')) {
+            changeDir = tokens[i + 1]
+            i++
+          }
+        }
+        if (letters.includes('x') || letters.includes('t') || letters.includes('d')) mode = 'extract'
+        if (letters.includes('c') || letters.includes('r') || letters.includes('u')) mode = 'create'
+        if (letters.includes('f') && i + 1 < tokens.length && !tokens[i + 1].startsWith('-') &&
+            !letters.includes('C')) {
+          archivePath = tokens[i + 1]
+          i++
+        }
+        continue
+      }
+      // Bare action cluster (GNU/bsd tar traditional form): `tar xf a.tar`
+      // carries no `-` before the action letters. Only treat a token as a
+      // bare cluster when its FIRST letter is an action letter and the rest
+      // are tar option letters — a plain file name like `backup` must not be
+      // mistaken for one (review-l5b-0.2.10d B5-1).
+      if (!t.startsWith('-') && !archivePath && /^[xctdru][xctdruzjJvhwKmMPWgf]*$/.test(t)) {
+        const letters = t
         if (letters.includes('x') || letters.includes('t') || letters.includes('d')) mode = 'extract'
         if (letters.includes('c') || letters.includes('r') || letters.includes('u')) mode = 'create'
         if (letters.includes('f') && i + 1 < tokens.length && !tokens[i + 1].startsWith('-')) {
@@ -917,15 +943,31 @@ function extractWritePaths(command: string): string[] {
         }
       }
     }
-    if (mode === 'extract') {
-      if (changeDir) paths.push(changeDir)
-      else if (!tokens.some((t) => t === '--to-stdout' || t === '-O')) {
+    // `-C DIR` is a real write directory in BOTH create and extract modes —
+    // extract mode additionally lands extracted members there. Push it
+    // unconditionally (unless pure listing, which writes nothing) so a
+    // `tar xf a.tar -C link/../dir` target flows through toAbsolute()/the B4
+    // sentinel and the per-target boundary instead of vanishing into a
+    // zero-target allow (review-l5b-0.2.10d B5-1).
+    if (changeDir) {
+      const listing = tokens.some((t) => t === '-t' || t === '--list' ||
+        (t.startsWith('-') && !t.startsWith('--') && t.slice(1).includes('t')) ||
+        (t === '--to-stdout' || t === '-O') ||
+        /^[xctdru][xctdruzjJvhwKmMPWgf]*$/.test(t) && t.includes('t'))
+      if (!listing) {
+        paths.push(changeDir)
+        // create mode with -C also writes the archive file itself
+        if (mode === 'create' && archivePath) paths.push(archivePath)
+      }
+    } else if (mode === 'extract') {
+      if (!tokens.some((t) => t === '--to-stdout' || t === '-O')) {
         // Extraction lands in the session cwd; synthesize it so the boundary
         // check can approve only rollback-covered directories. Pure listing
         // (-t/--list) and member-to-stdout (-O/--to-stdout) write nothing and
         // must NOT synthesize a write target (review-029-f1f2 (c)).
         const listing = tokens.some((t) => t === '-t' || t === '--list' ||
-          (t.startsWith('-') && !t.startsWith('--') && t.slice(1).includes('t')))
+          (t.startsWith('-') && !t.startsWith('--') && t.slice(1).includes('t')) ||
+          (/^[xctdru][xctdruzjJvhwKmMPWgf]*$/.test(t) && t.includes('t')))
         if (!listing) paths.push(process.cwd())
       }
     } else if (archivePath) {

@@ -39,13 +39,17 @@ before(() => {
   symlinkSync(OUT, join(CWD, 'elink'))                    // existing external link
   symlinkSync(join(ROOT, 'outside-x'), join(CWD, 'dlink')) // dangling link
   symlinkSync(join(CWD, 'sub'), join(CWD, 'ink'))         // internal link (target exists)
-  HOME_DIR = mkdtempSync(join(HOME, '.tm-o1-'))
-  mkdirSync(join(HOME_DIR, 'sub'), { recursive: true })
-  process.chdir(CWD)
   // macOS /var -> /private/var: canonicalTarget returns realpath forms.
   ROOT_REAL = realpathSync(ROOT)
   CWD_REAL = realpathSync(CWD)
   OUT_REAL = realpathSync(OUT)
+  // HOME_DIR must be a real path (no symlink prefix), NOT under $HOME (a
+  // sandboxed/CI $HOME is often read-only → EPERM), and NOT under any
+  // AUTO_INIT_FORBIDDEN_ROOT (/private, /System, …): /Users/Shared satisfies
+  // all three (review-l5b-0.2.10d O3).
+  HOME_DIR = mkdtempSync('/Users/Shared/.tm-o1-')
+  mkdirSync(join(HOME_DIR, 'sub'), { recursive: true })
+  process.chdir(CWD)
 })
 
 after(() => {
@@ -158,6 +162,68 @@ test('decide: sentinel target is forced deny even when pathsProtected=true (revi
   const d = decide(c, true)
   assert.equal(d.allow, false)
   assert.match(d.reason, /forced deny/)
+})
+
+// review-l5b-0.2.10d B5-1: bare-letter `tar xf a.tar -C link/../dir` produced
+// NO write target (zero-target file_write allowed via cwd coverage) and the OS
+// landed extracted members outside the workspace. `-C DIR` is now extracted as
+// a write target in every form (separate, glued, `--directory[=]`), and bare
+// action clusters are parsed like short-option clusters.
+
+function tarHasSentinel(cmd: string): boolean {
+  const r = classifyBashCommand(cmd)
+  assert.ok(r.targetPaths.includes('/.tmguard-dotdot-escape'),
+    `${cmd} → got ${JSON.stringify(r.targetPaths)}`)
+  return true
+}
+
+test('classifier: tar xf -C link/../dir (bare cluster) is sentinel (B5-1)', () => {
+  tarHasSentinel('tar xf a.tar -C elink/../ex')
+})
+
+test('classifier: tar --directory separated form is sentinel (B5-1)', () => {
+  tarHasSentinel('tar xf a.tar --directory elink/../ex')
+})
+
+test('classifier: tar --directory= glued form is sentinel (B5-1)', () => {
+  tarHasSentinel('tar xf a.tar --directory=elink/../ex')
+})
+
+test('classifier: tar xpf -C form is sentinel (B5-1)', () => {
+  tarHasSentinel('tar xpf a.tar -C elink/../ex')
+})
+
+test('classifier: tar -xf -C form is sentinel (B5-1)', () => {
+  tarHasSentinel('tar -xf a.tar -C elink/../ex')
+})
+
+test('classifier: tar -C before -xf (reordered) is sentinel (B5-1)', () => {
+  tarHasSentinel('tar -C elink/../ex -xf a.tar')
+})
+
+test('classifier: tar glued -Celink/../dir is sentinel (B5-1)', () => {
+  tarHasSentinel('tar -Celink/../ex -xf a.tar')
+})
+
+test('classifier: tar create mode with -C link/../dir is sentinel (B5-1)', () => {
+  tarHasSentinel('tar -C elink/../ex -cf out.tar .')
+})
+
+test('classifier: tar xf -C plain dir stays inside (B5-1 control)', () => {
+  const r = classifyBashCommand('tar xf a.tar -C freshdir')
+  assert.ok(!r.targetPaths.includes('/.tmguard-dotdot-escape'))
+  assert.ok(r.targetPaths.some((p) => p.includes('freshdir')))
+})
+
+test('classifier: tar list -tf with -C writes nothing (B5-1 control)', () => {
+  const r = classifyBashCommand('tar tf a.tar -C elink/../ex')
+  assert.ok(!r.targetPaths.includes('/.tmguard-dotdot-escape'))
+  assert.ok(!r.targetPaths.some((p) => p.includes('elink')))
+})
+
+test('classifier: plain filename not mistaken for bare cluster (B5-1 control)', () => {
+  const r = classifyBashCommand('tar xf backup.tar')
+  assert.ok(!r.targetPaths.includes('/.tmguard-dotdot-escape'))
 })
 
 test('canonicalTarget: bare external symlink resolves to its target (unchanged)', () => {

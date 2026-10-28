@@ -66,6 +66,16 @@ All notable changes to dsh-tm-guard will be documented in this file.
   landed it outside the workspace. The guard now runs first on every form
   (`expandHome` first for `~`/`$HOME`), and any `/.tmguard-*` sentinel target
   is a forced deny regardless of protected-prefix coverage.
+- **tar `-C DIR` write targets are always extracted, and bare action clusters
+  are parsed (review-l5b-0.2.10d B5-1).** `tar xf a.tar -C link/../dir` used a
+  bare action cluster (`xf` without `-`) that the parser never recognized as
+  extract mode, so `-C`'s directory never became a write target; the command
+  fell into the zero-target file_write branch and was allowed via cwd
+  coverage, landing extracted members outside the workspace through the
+  symlink + lexical `..`. `-C`/`--directory[=]` now push their directory as a
+  write target in every form (separate, glued `-Cdir`, reordered) regardless
+  of mode, bare clusters (`xf`, `xpf`, …) are parsed like short-option
+  clusters, and pure listing (`-t`) / stdout (`-O`) still write nothing.
 
 ### Security (unchanged boundaries)
 - The ancestor fallback happens only after the canonical inside-workspace
