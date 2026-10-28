@@ -39,6 +39,7 @@ import {
 } from './tm.ts'
 import {
   classifyToolCall,
+  classifyBashCommand,
   decide,
   isTempPath,
   hasArchiveExecSink,
@@ -1072,6 +1073,22 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
                 classification.forceDeny = true
                 classification.reason +=
                   ' [substitution body is an archive exec sink (bytes -> interpreter): denied]'
+                pending = []
+                break
+              }
+              // F2-a: compression `-I`/`--use-compress-program` rules live only
+              // in the classifier — the deep loop re-runs it on each
+              // normalized body so `gzip -dc -I sh evil.gz` hidden behind
+              // ≥2 backtick layers denies like tar at depth 1 does. A
+              // benign nested body still classifies read and continues.
+              const deepCls = classifyBashCommand(norm, config.denyReadPaths)
+              if (deepCls.forceDeny ||
+                  deepCls.category === 'unknown' ||
+                  deepCls.category === 'network') {
+                classification.category = deepCls.category === 'unknown' ? 'unknown' : 'network'
+                classification.forceDeny = true
+                classification.reason +=
+                  ` [substitution body reclassified: ${deepCls.reason}]`
                 pending = []
                 break
               }

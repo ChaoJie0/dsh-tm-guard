@@ -283,3 +283,63 @@ test('f/F4-neg: explicit -c and file-fed interpreters keep their paths', () => {
     assert.ok(c, `classifies ${cmd}`)
   }
 })
+
+// ---------- f-round-2 (dsh adversarial review of 690af9a) ----------
+// F1-a: Open3 family inside a find -exec ruby action fails closed.
+test('f2/F1-a: Open3 capture2/pipeline find actions fail closed', () => {
+  for (const cmd of [
+    `find . -exec ruby -e 'require "open3";Open3.capture2("id")' {} \\;`,
+    `find . -exec ruby -e 'Open3.pipeline(["id"])' {} \\;`,
+  ]) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'read', `${cmd} must NOT stay read`)
+  }
+})
+
+// F1-b: sh -c wrapper around a double-quoted node/python inline code string.
+test('f2/F1-b: wrapped double-quoted node/python inline code fails closed', () => {
+  for (const cmd of [
+    `find . -exec sh -c 'node -e "require(\\"child_process\\").execSync(\\"id\\")"' _ {} \\;`,
+    `find . -exec sh -c 'python3 -c "import os;os.system(\\"echo X\\")"' _ {} \\;`,
+  ]) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'read', `${cmd} must NOT stay read`)
+  }
+})
+
+// F1-c: perl three-arg pipe-open write end inside find -exec.
+test('f2/F1-c: perl "|-" pipe-open write end fails closed', () => {
+  const c = classifyBashCommand(`find . -exec perl -e 'open(my $f,"|-","id");print $f ""' {} \\;`, DENY_READ)
+  assert.notEqual(c.category, 'read', 'perl pipe-open write end must NOT stay read')
+})
+
+// F2-a: compressor -I hidden behind two escaped backtick layers.
+test('f2/F2-a: gzip -I at depth-2 backtick substitution fails closed', () => {
+  const c = classifyBashCommand('echo `echo \\`gzip -dc -I sh evil.gz\\``', DENY_READ)
+  assert.notEqual(c.category, 'read', 'gzip -I at depth 2 must NOT stay read')
+})
+
+// F3-a: PYTHONHOME env override is an unverifiable interpreter code load.
+test('f2/F3-a: PYTHONHOME env override fails closed', () => {
+  const c = classifyBashCommand('PYTHONHOME=/tmp/evil python3 -c "import m"', DENY_READ)
+  assert.notEqual(c.category, 'read', 'PYTHONHOME must NOT stay read')
+})
+
+// F4: stdin/stdin-marker/fd interpreters fail closed; benign -c stays open.
+test('f2/F4: stdin and fd-fed interpreters fail closed', () => {
+  for (const cmd of [
+    `python3 - < /tmp/payload.py`,
+    `node /dev/fd/63 63< /tmp/p.js`,
+    `printf "print(1)\\n" | nohup python3 -`,
+  ]) {
+    const c = classifyBashCommand(cmd, DENY_READ)
+    assert.notEqual(c.category, 'read', `${cmd} must NOT stay read`)
+  }
+})
+
+// FP-1: subprocess.Popen(['ls','-la']) as a find action stays usable (no FP).
+test('f2/FP-1: Popen list literal in find action is not over-denied', () => {
+  const c = classifyBashCommand(`find . -exec python3 -c "import subprocess;subprocess.Popen(['ls','-la'])" {} \\;`, DENY_READ)
+  assert.notEqual(c.category, 'unknown', 'Popen list must NOT fail closed')
+  assert.notEqual(c.category, 'network', 'Popen list must NOT be network')
+})

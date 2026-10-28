@@ -616,6 +616,37 @@ function hasSinkInClause(clause: string): boolean {
     if (base === 'cpio' || base.endsWith('cpio.exe')) {
       return hasCpioSink(tokens, i)
     }
+    // F2-a: GNU gzip/xz/bzip2 accept `-I PROG` / `--use-compress-program=PROG`
+    // (read from stdin, decompress THROUGH an arbitrary program) — the same
+    // bytes->interpreter sink family as tar's -I. The classifier's own
+    // compression rule knows this; hasArchiveExecSink must too, because the
+    // deep substitution loop in index.ts re-runs ONLY hasArchiveExecSink +
+    // egress on normalized bodies (gzip -I hidden behind ≥2 backtick layers
+    // previously read->ALLOW).
+    if (base === 'gzip' || base === 'gunzip' || base === 'xz' || base === 'unxz' ||
+        base === 'bzip2' || base === 'bunzip2' || base === 'lz4' || base === 'lzma' ||
+        base === 'unlzma' || base === 'lzop' ||
+        ['gzip.exe', 'gunzip.exe', 'xz.exe', 'bzip2.exe', 'lz4.exe', 'lzma.exe', 'lzop.exe'].includes(base)) {
+      const rest = tokens.slice(i).map((t) => t.toLowerCase())
+      for (let k = 0; k < rest.length; k++) {
+        const tl = rest[k]
+        if (tl === '-i' || tl === '--use-compress-program') {
+          const v = rest[k + 1] ?? ''
+          if (!ARCHIVE_COMPRESSORS.has(v) && v !== '') return true
+          k++
+          continue
+        }
+        if (tl.startsWith('-i') && tl.length > 2 && !tl.startsWith('--')) {
+          const v = tl.slice(2)
+          if (!ARCHIVE_COMPRESSORS.has(v) && v !== '') return true
+        }
+        if (tl.startsWith('--use-compress-program=')) {
+          const v = tl.slice('--use-compress-program='.length)
+          if (!ARCHIVE_COMPRESSORS.has(v) && v !== '') return true
+        }
+      }
+      return false
+    }
     // A real non-archive command (sed, perl, gzip, ...): its -i is its own.
     return false
   }
@@ -2338,7 +2369,7 @@ function splitPipeRespectQuotes(command: string): string[] {
  * unverifiable location — fail closed. A pure relative literal ("./lib", "lib",
  * ".") stays inside the session cwd and is allowed. */
 function taintedPathEnv(assignTok: string): string | null {
-  const m = assignTok.match(/^(PYTHONPATH|PYTHONSTARTUP)=(.+)$/)
+  const m = assignTok.match(/^(PYTHONPATH|PYTHONSTARTUP|PYTHONHOME)=(.+)$/)
   if (!m) return null
   const value = m[2]!
   if (value === '') return null
@@ -2553,7 +2584,7 @@ function classifySingleCommand(command: string, denyReadPaths: string[] = []): C
   // side-effect-free.
   if (/^export\s+[A-Za-z_][A-Za-z0-9_]*(\s|=|$)/.test(segPart.trim())) {
     const em = segPart.trim().match(/^export\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(\S+))?/)
-    if (em && (em[1] === 'PYTHONPATH' || em[1] === 'PYTHONSTARTUP')) {
+    if (em && (em[1] === 'PYTHONPATH' || em[1] === 'PYTHONSTARTUP' || em[1] === 'PYTHONHOME')) {
       if (em[2] === undefined) {
         return {
           category: 'unknown',
@@ -2589,8 +2620,13 @@ function classifySingleCommand(command: string, denyReadPaths: string[] = []): C
     // H3b/F4: a pipeline feeding an interpreter's stdin (`… | python3 -`,
     // `… | node /dev/stdin`) makes the interpreter read CODE from upstream —
     // the content is not on the command line. Fail closed for the pipeline.
-    const stdinInterp = pipeParts.find((p) =>
-      /^(?:ruby|perl|php|python\d*|node|nodejs)\s+(?:\/dev\/(?:stdin|fd\/\d+)|-)\s*$/.test(p.trim()))
+    // F4-c: strip command wrappers (nohup/setsid/command/time/nice/env) first
+    // so `… | nohup python3 -` cannot slip past the interpreter check.
+    const stdinInterp = pipeParts.find((p) => {
+      const stripped = p.trim().replace(
+        /^(?:(?:nohup|setsid|command|time|nice)\s+|env\s+(?:-\w+\s+)*)/i, '')
+      return /^(?:ruby|perl|php|python\d*|node|nodejs)\s+(?:\/dev\/(?:stdin|fd\/\d+)|-)\s*$/.test(stripped)
+    })
     if (stdinInterp) {
       return {
         category: 'unknown',
@@ -3049,9 +3085,14 @@ function stripUvRunFlags(s: string): string {
     // CODE from stdin (a pipe or process substitution) — the content is not on
     // the command line, same posture as the bare-interpreter rule. A heredoc
     // (`python3 - <<'PY'`) keeps the historical path: its body IS visible and
-    // scanned by the heredoc net.
+    // scanned by the heredoc net. F4-a/b: `python3 - < file` and
+    // `node /dev/fd/63 63< file` also feed code via `<` redirection (not a
+    // heredoc) — the interpreter's stdin position marker (`-`, /dev/stdin,
+    // /dev/fd/N) plus ANY pipe / `<` / process-substitution upstream fails
+    // closed, without requiring the pipe branch.
     if (/^(?:ruby|perl|php|python\d*|node|nodejs)\b/.test(firstWord) &&
-        /^(?:\/dev\/(?:stdin|fd\/\d+)|-)\s*$/.test(rest.trim()) &&
+        (/(?:^|\s)(?:\/dev\/(?:stdin|fd\/\d+))(?:\s|$)/.test(rest) ||
+         /\s-\s|\s-\s*$/.test(rest) || /^\s*-\s/.test(rest)) &&
         /(?:^|[|&;])\s*(?:<\s*\(|[^<]*\||[^<]*<(?!<))/.test(trimmed) &&
         !/<<-?/.test(trimmed.replace(/^(?:ruby|perl|php|python\d*|node|nodejs)\b/, ''))) {
       return {
@@ -4230,8 +4271,10 @@ function moduleFlagEgress(action: string, verb: string): string | null {
 /** Extract the quoted code after -c/-e/-E/--eval from an action substring. */
 function findInlineCode(action: string): string | null {
   // H2: php uses `-r`/`-R` for inline code (ruby -e, perl -e/-E, python -c,
-  // node -e/--eval).
-  const m = action.match(/-(?:c|e|E|r|R|eval)\s*(?:'([^']*)'|"([^"]*)")/)
+  // node -e/--eval). F1-b: `"…\"…\"…"` keeps escaped quotes INSIDE the body
+  // (a double-quoted -c/-e body may embed escaped quotes) — extract with an
+  // escape-aware double-quote branch.
+  const m = action.match(/-(?:c|e|E|r|R|eval)\s*(?:'([^']*)'|"((?:[^"\\\n]|\\.)*)")/)
   return m ? (m[1] ?? m[2] ?? null) : null
 }
 
@@ -4265,7 +4308,21 @@ function nonLiteralLaunchArg(code: string, callRe: RegExp): string | null {
       }
     }
     const args = code.slice(openIdx + 1, i)
-    const first = args.split(',')[0].trim()
+    // FP-1: split the first argument at the first top-level comma (bracket
+    // depth 0) — `['ls','-la']` must yield `['ls','-la']` as ONE argument,
+    // not `['ls'`. A bare `split(',')` broke multi-element literal argv lists.
+    let first = ''
+    let bdepth = 0
+    for (let k = 0; k < args.length; k++) {
+      const ch = args[k]
+      if (ch === '[' || ch === '{' || ch === '(') bdepth++
+      else if (ch === ']' || ch === '}' || ch === ')') bdepth--
+      else if (ch === ',' && bdepth === 0) {
+        first = args.slice(0, k).trim()
+        break
+      }
+    }
+    if (!first) first = args.trim()
     if (!first) return 'launcher with an empty first argument'
     // A pure string literal or a pure literal list (['ls'] / 'ls' — no
     // concatenation, no interpolated variable) keeps the per-target egress
@@ -4298,7 +4355,12 @@ const PY_FIND_LAUNCH_RE =
 const NODE_LAUNCH_RE =
   /(?:require\(\s*['"]child_process['"]\s*\)|child_process)\s*\.\s*(?:spawn|spawnSync|execFile|execFileSync|fork)\s*\(/g
 
-function findActionInlineThreat(trimmed: string): { kind: 'delete' | 'egress'; signal: string } | null {
+function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 'egress'; signal: string } | null {
+  if (depth >= 4) {
+    // A wrapped-shell chain deeper than 4 layers is unverifiable — the find
+    // action runs opaque nested commands; fail closed on the destructive side.
+    return { kind: 'delete', signal: 'nested wrapped shell exceeds depth limit' }
+  }
   const actionRe = /(?:--exec|-(?:exec(?:dir)?|ok|x))/gi
   let am: RegExpExecArray | null
   while ((am = actionRe.exec(trimmed))) {
@@ -4335,10 +4397,15 @@ function findActionInlineThreat(trimmed: string): { kind: 'delete' | 'egress'; s
           // original string content so they run on `code`.
           const masked = maskStringLiterals(code)
           if (NONPY_LAUNCH_WORD.test(masked) ||
+              // F1-a: Open3 family (capture2/capture2e/capture3/popen2/
+              // popen3/pipeline) spawns subprocesses — 37ac047 covered it,
+              // the NONPY word list lost it.
+              /\bOpen3\s*\.\s*(?:capture2e?|capture3|popen[23]?|pipeline)\s*\(/.test(masked) ||
               /%x\s*[({[]/.test(code) ||
               /Kernel\.(?:send|public_send|__send__)\s*\(/.test(masked) ||
               /IPC::Open[23]\b|\bopen[23]\s*\(/.test(masked) ||
-              /open\s*\([^)]*["']-\|["']/.test(code)) {
+              /open\s*\([^)]*["']-\|["']/.test(code) ||
+              /open\s*\([^)]*["']\|-["']/.test(code)) {
             return { kind: 'delete', signal: `${verb} inline launcher` }
           }
         }
@@ -4386,13 +4453,25 @@ function findActionInlineThreat(trimmed: string): { kind: 'delete' | 'egress'; s
     }
 
     // Wrapped shell body: delete surface + inline egress APIs, one nested layer.
-    const cm = action.match(/(?:-[a-z]*c\s+)(?:'([^']*)'|"([^"]*)")/)
+    const cm = action.match(/(?:-[a-z]*c\s+)(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/)
     if (cm) {
+      // Keep the extracted body ESCAPED (`\"` stays `\"`): the recursion below
+      // re-reads it through findInlineCode, whose escape-aware quote branch
+      // handles `\"`; unescaping here first collapsed the inner quotes and
+      // truncated `-e "require(\"child_process\")…"` at `require(`.
       const body = cm[1] ?? cm[2] ?? ''
       if (FIND_FIND_DESTRUCTIVE_RE.test(body)) return { kind: 'delete', signal: 'wrapped inline delete/spawn' }
       if (FIND_INLINE_EGRESS_RE.test(body)) return { kind: 'egress', signal: 'wrapped inline network' }
       if (FIND_SHELLOUT_RE.test(body)) return { kind: 'egress', signal: 'wrapped subprocess shell-out' }
-      const nm = body.match(/(?:sh|bash|dash|zsh)\s+-[a-z]*c\s+(?:'([^']*)'|"([^"]*)")/)
+      // F1-b: the wrapped body is an arbitrary command — recurse through the
+      // inline-interpreter adjudicator so node/python/… launchers inside
+      // `sh -c 'node -e "…"'` fail closed exactly like a direct `-exec node`.
+      // Depth is bounded (a nested `sh -c 'sh -c …'` chain cannot run forever).
+      const innerThreat = findActionInlineThreat(`-exec ${body} {} ;`, 1)
+      if (innerThreat) {
+        return { kind: innerThreat.kind, signal: `wrapped ${innerThreat.signal}` }
+      }
+      const nm = body.match(/(?:sh|bash|dash|zsh)\s+-[a-z]*c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/)
       if (nm) {
         const inner = nm[1] ?? nm[2] ?? ''
         const nestedNet =
@@ -4703,8 +4782,25 @@ export function classifyBashCommand(
     // the outer segment is just echo + a token. B7: a substitution's verdict
     // is part of the segment — `echo $(cp a /outside)` / `echo $(ruby -e
     // 'File.write(...)')` must not be absorbed as a benign read.
-    for (const { body } of extractCommandSubstitutions(s)) {
-      const inner = classifyBashCommand(body, denyReadPaths)
+    // F2: bash re-unescapes nested backtick bodies one layer per re-parse
+    // (`echo \`echo \\\`id\\\`\`` executes the innermost `id`) — unescape to
+    // a fixpoint, re-extract, and re-classify at every layer so a command
+    // hidden behind ≥2 escaped backtick layers (gzip -I sh at depth 2) fails
+    // closed here just like in index.ts's deep loop.
+    for (const { body, bt } of extractCommandSubstitutions(s)) {
+      let inner = classifyBashCommand(body, denyReadPaths)
+      let cur = body
+      for (let g = 0; g < 8; g++) {
+        const norm = unescapeSubstitutionBody(cur, bt)
+        if (norm === cur) break
+        const ci = classifyBashCommand(norm, denyReadPaths)
+        if (PRIORITY.indexOf(ci.category) < PRIORITY.indexOf(inner.category)) {
+          inner = ci
+        }
+        const nxt = extractCommandSubstitutions(norm)
+        if (nxt.length === 0) break
+        cur = nxt[0]!.body
+      }
       if (inner.forceDeny) {
         resolvedReads.push(...(inner.targetPaths.length > 0 ? inner.targetPaths : [dir]))
       }

@@ -124,14 +124,33 @@ const RULES: Record<Lang, LangRules> = {
       /\bimportlib\s*\.\s*import_module\s*\(/,
       /\bfrom\s+importlib\s+import\s+import_module\b/,
       /\bimport_module\s*\(\s*["']/,
+      // F3-c: `import importlib.util as u; u.spec_from_file_location(…)`
+      // aliases the module away from the risky literal-name regex below —
+      // the import itself is the unverifiable-code-source marker.
+      /\bimport\s+importlib\b/,
+      /\bfrom\s+importlib\s+import\b/,
     ],
     risky: [
       // H3b/F3: python loading code from a path it mutates (sys.path) or an
       // env override (os.environ PYTHONPATH) — the injected module is
       // unverifiable. os.system executes an arbitrary shell string.
+      // FP-2: pure-relative-literal sys.path mutations are exempted inside
+      // scanCode() so this layer agrees with the classifier's
+      // pythonSysPathThreat (PYTHONPATH=./lib env form is allowed).
       /\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend)\s*\(/,
+      // F3-b: bound-alias mutations — `ins=sys.path.insert; ins(0,"/tmp/evil")`
+      // or `p=sys.path; p.insert(0,"/tmp/evil")` — the alias hides the
+      // mutation from the literal-name regex above (the `;`-terminated binding
+      // and the later `alias(…)` call are both matched).
+      /\b([A-Za-z_]\w*)\s*=\s*sys\s*\.\s*path(?:\s*\.\s*(?:insert|append|extend))?\s*(?:\(|;)/,
       /\bsys\s*\.\s*path\s*(?:\[[^\]]*\]\s*=|=\s*)/,
       /\bos\s*\.\s*environ\s*\[\s*["']PYTHONPATH["']\s*\]\s*=/,
+      // F3-c: site.addsitedir adds a whole directory of packages at runtime
+      // (the classifier's sitecustomize/PYTHONHOME net covers startup paths);
+      // importlib.util.spec_from_file_location loads a module from an
+      // arbitrary file — both are unverifiable code sources.
+      /\bsite\s*\.\s*addsitedir\s*\(/,
+      /\bimportlib\s*\.\s*util\s*\.\s*(?:spec_from_file_location|module_from_spec)\s*\(/,
       /\bos\s*\.\s*system\s*\(/,
     ],
   },
@@ -404,7 +423,13 @@ function extractHeredocs(command: string): { bodies: HeredocHit[]; clean: string
       // Language = interpreter on this line (first word, env stripped).
       const toks = tokenize(line.replace(/^[A-Za-z_]\w*=\S+\s+/, ''))
       const first = (toks[0] ?? '').split('/').pop()?.toLowerCase() ?? ''
-      const lang = INTERPRETERS[first]
+      // F1-c: `find … -exec ruby - {} \; <<'RB'` feeds the heredoc to the
+      // -exec interpreter, not to `find` — pick the interpreter out of the
+      // -exec clause so its body is scanned with the right language instead
+      // of being dropped as unverifiable-by-luck.
+      const exeM = line.match(/-\s*exec\s+(\S+)/)
+      const exeFirst = exeM ? (exeM[1].split('/').pop() ?? '').toLowerCase() : ''
+      const lang = INTERPRETERS[exeFirst] ?? INTERPRETERS[first]
       if (lang) {
         active = { delim, stripTabs, lang, body: [] }
         clean.push(line)
@@ -546,7 +571,24 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
     // as network hits (they are not egress; the caller downgrades to unknown).
     for (const re of rules.risky) {
       re.lastIndex = 0
-      if (re.test(line)) unverifiable = true
+      if (re.test(line)) {
+        // FP-2: a sys.path mutation whose string arguments are all pure
+        // relative literals ("lib", "./lib", ".", "x/y") stays inside the
+        // session cwd — classifier's pythonSysPathThreat allows it and the
+        // two layers must agree (PYTHONPATH=./lib env form is allowed).
+        // Any absolute path, colon path, variable or substitution still
+        // fails closed (and non-literal args yield no string match → deny).
+        if (language === 'python' &&
+            /\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend)\s*\(/.test(line)) {
+          const strs = [...line.matchAll(/["']([^"']*)["']/g)].map((x) => x[1])
+          if (strs.length > 0 && strs.every((s) =>
+            !s.startsWith('/') && !s.includes(':') && !s.includes('$') &&
+            !s.includes('`') && !s.includes('"'))) {
+            continue
+          }
+        }
+        unverifiable = true
+      }
     }
   }
 
