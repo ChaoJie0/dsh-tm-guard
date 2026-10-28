@@ -1060,6 +1060,9 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
         // B1-class RCE primitives. They are denied in EVERY workspace state,
         // regardless of how many write targets were extracted — the archive
         // content reaches a shell without any extracted file being checked.
+        // forceDeny also overrides the decide() temp-dir allowance, which
+        // previously let the sink run when the cwd/target sat under /tmp (f轮 B5).
+        classification.forceDeny = true
         pathsProtected = false
         classification.reason += ' [archive exec sink (bytes -> interpreter): denied in every workspace]'
       } else if (

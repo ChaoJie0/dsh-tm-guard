@@ -57,7 +57,7 @@ const MAX_HITS = 5
 /* Interpreter registry                                                */
 /* ------------------------------------------------------------------ */
 
-type Lang = 'python' | 'node' | 'shell' | 'ruby' | 'php' | 'perl'
+type Lang = 'python' | 'node' | 'shell' | 'ruby' | 'php' | 'perl' | 'tclsh' | 'swift' | 'awk' | 'elixir'
 
 const INTERPRETERS: Record<string, Lang> = {
   python: 'python', python3: 'python', python2: 'python',
@@ -65,6 +65,10 @@ const INTERPRETERS: Record<string, Lang> = {
   ruby: 'ruby',
   php: 'php', php7: 'php', php8: 'php',
   perl: 'perl',
+  tclsh: 'tclsh', wish: 'tclsh',
+  swift: 'swift',
+  awk: 'awk',
+  elixir: 'elixir', elixirc: 'elixir', escript: 'elixir', mix: 'elixir',
   bash: 'shell', sh: 'shell', zsh: 'shell', ksh: 'shell',
   pwsh: 'shell',
 }
@@ -93,6 +97,11 @@ interface LangRules {
   /** Shell-out to a network command (os.system("curl …"), child_process…). */
   shellNet: RegExp[]
   dyn: RegExp[]
+  /** Unverifiable-risky primitives: file writes/deletes/permission/links,
+   *  process spawn/exec, socket connect/bind, pipe opens, ARGV/ENV-carried
+   *  targets. We cannot prove these innocent statically, so a hit makes the
+   *  whole scan fail closed (unverifiable → conservative deny). */
+  risky: RegExp[]
 }
 
 const RULES: Record<Lang, LangRules> = {
@@ -116,6 +125,7 @@ const RULES: Record<Lang, LangRules> = {
       /\bfrom\s+importlib\s+import\s+import_module\b/,
       /\bimport_module\s*\(\s*["']/,
     ],
+    risky: [],
   },
   node: {
     importNet: [
@@ -132,6 +142,10 @@ const RULES: Record<Lang, LangRules> = {
       /\beval\s*\(/,
       /\bnew\s+Function\s*\(/,
     ],
+    risky: [
+      /\bprocess\.(kill|spawn)\b/,
+      /\bDeno\.(run|writeTextFile|writeFile|connect|listen|mkdir|remove|symlink)\b/,
+    ],
   },
   shell: {
     importNet: [],
@@ -144,6 +158,7 @@ const RULES: Record<Lang, LangRules> = {
     ],
     shellNet: [],
     dyn: [],
+    risky: [],
   },
   ruby: {
     importNet: [
@@ -154,6 +169,23 @@ const RULES: Record<Lang, LangRules> = {
     ],
     shellNet: [],
     dyn: [/\beval\s*\(/],
+    risky: [
+      // file write / truncate / permission / link / rename primitives
+      /\bFile\.(write|binwrite|truncate|chmod|chown|rename|move|symlink|hardlink|link|delete|unlink)\b/,
+      /\bFile\.open\s*\(\s*['"][wa+]/,
+      /\bFileUtils\.(write|cp|cp_r|mv|rm|rm_f|rm_r|rm_rf|remove_file|remove_entry|remove_entry_secure|mkdir|mkdir_p|chmod|chown|symlink|link)\b/,
+      /\bDir\.(mkdir|rmdir|delete|unlink)\b/,
+      /\bIO\.(write|binwrite|truncate)\b/,
+      /\bopen\s*\(\s*['"][|wa+]/,
+      // process spawn / exec
+      /\b(system|exec|spawn|fork|Process\.spawn|Process\.kill|IO\.popen)\b/,
+      // sockets
+      /\b(TCPSocket|TCPServer|UDPSocket|Socket|IPSocket)\b/,
+      // dynamic eval family
+      /\b(instance_eval|class_eval|module_eval)\s*\(/,
+      // ARGV-carried targets
+      /\bARGV\b/,
+    ],
   },
   php: {
     importNet: [],
@@ -162,6 +194,13 @@ const RULES: Record<Lang, LangRules> = {
     ],
     shellNet: [],
     dyn: [/\b(eval|assert)\s*\(/],
+    risky: [
+      /\b(file_put_contents|fwrite|fputs|unlink|rename|chmod|chown|symlink|mkdir|rmdir|unlink)\b/,
+      /\bfopen\s*\([^)]*['"][wa]/,
+      /\b(exec|system|shell_exec|passthru|popen|proc_open|pcntl_exec)\b/,
+      /\b(socket_create|socket_connect|stream_socket_server)\b/,
+      /\b\$argv\b/,
+    ],
   },
   perl: {
     importNet: [
@@ -171,6 +210,75 @@ const RULES: Record<Lang, LangRules> = {
     callNet: [],
     shellNet: [],
     dyn: [/\beval\s*(["'{(]|\s*\{)/],
+    risky: [
+      // open with write/pipe modes
+      /\bopen\s*\([^)]*['"](?:>|>>|>\||\|)/,
+      /\bopen\s+(?:my\s+)?\$\w+\s*,\s*['"](?:>|>>|\|)/,
+      // file mutation primitives
+      /\b(rename|unlink|truncate|chmod|chown|symlink|link|mkdir|rmdir|utime)\b/,
+      // process spawn / exec / backticks
+      /\b(system|exec)\b|`/,
+      // sockets
+      /\b(IO::Socket|IO::Socket::INET|IO::Socket::IP|Socket)\b/,
+      // ARGV/ENV-carried targets
+      /\b\$ARGV\b|\b\$ENV\{/,
+    ],
+  },
+  tclsh: {
+    importNet: [],
+    callNet: [],
+    shellNet: [],
+    dyn: [/\beval\b/],
+    risky: [
+      /\b(exec|socket|open|source)\b/,
+      /\bfile\s+(delete|rename|mkdir|link)\b/,
+    ],
+  },
+  swift: {
+    importNet: [],
+    callNet: [
+      /\bURLSession\s*\.\s*(shared|dataTask|downloadTask)\b|\bData\s*\(\s*contentsOf\s*:\s*URL\b/,
+    ],
+    shellNet: [],
+    dyn: [],
+    risky: [
+      /\b(FileManager|Process)\b/,
+      /\bString\s*\(\s*contentsOf(?:File)?\b/,
+      /\bwrite\s*\(\s*to\b/,
+      /\bsocket\b/,
+    ],
+  },
+  awk: {
+    importNet: [],
+    callNet: [],
+    shellNet: [],
+    dyn: [],
+    risky: [
+      // command execution primitives
+      /\bsystem\s*\(/,
+      /\bexec\s*\(/,
+      // redirections inside the program body (quoted target path)
+      /(?:>|>>)\s*["'][^"']+/,
+      // pipe to a shell command (`"cmd" | getline`, `cmd | getline`)
+      /\|\s*["'][^"']*/,
+      /\|\s*getline\b/,
+      /\bclose\s*\(\s*["'][^"']*/,
+    ],
+  },
+  elixir: {
+    importNet: [],
+    callNet: [
+      /:gen_tcp\.connect\s*\(|:gen_udp\.open\s*\(|:httpc\.request\s*\(/,
+      /\bHTTPoison\.(get|post|put|delete)\s*\(|\bTesla\.(get|post|put|delete)\s*\(/,
+      /\bReq\.(get|post|put|delete)\s*\(/,
+    ],
+    shellNet: [/\bSystem\.cmd\s*\(|\bPort\.open\s*\(/],
+    dyn: [/\bCode\.(eval_string|compile_string)\s*\(/],
+    risky: [
+      /\bFile\.(write!?|rm!?|rm_rf!?|ln_s!?|chmod!?|chown!?|mkdir!?|mkdir_p!?|cp!?|cp_r!?|mv!?|open!?)\b/,
+      /\bIO\.binwrite\s*\(|\bIO\.write\s*\(/,
+      /\b(exec|spawn)\s*\(/,
+    ],
   },
 }
 
@@ -397,6 +505,14 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
     }
 
     for (const re of rules.dyn) {
+      re.lastIndex = 0
+      if (re.test(line)) unverifiable = true
+    }
+
+    // Unverifiable-risky primitives (writes/deletes/processes/sockets/ARGV):
+    // cannot prove innocent statically → fail closed, but do not report them
+    // as network hits (they are not egress; the caller downgrades to unknown).
+    for (const re of rules.risky) {
       re.lastIndex = 0
       if (re.test(line)) unverifiable = true
     }
@@ -666,12 +782,58 @@ export async function scanCommandForEgress(
       continue
     }
 
+    // xargs runs its inner command on stdin lines — recurse so the inner
+    // interpreter code / write verbs are scanned (BLOCKER 7b: `echo /etc/x |
+    // xargs ruby -e 'File.write(ARGV[0],"x")'`). Skip xargs' own option
+    // cluster (incl. value-taking -I/-i/-L/-l/-n/-P/-s/-d/-E and attached
+    // forms like -I{} / -n1) and scan the rest as a command.
+    if (first === 'xargs') {
+      let j = 1
+      while (j < toks.length) {
+        const t = toks[j]
+        if (!t.startsWith('-')) break
+        if ((t === '-I' || t === '-i' || t === '-L' || t === '-l' || t === '-n' ||
+             t === '-P' || t === '-s' || t === '-d' || t === '-E') &&
+            toks[j + 1] && !toks[j + 1].startsWith('-')) { j += 2; continue }
+        j++
+        continue
+      }
+      const inner = toks.slice(j).join(' ')
+      if (inner) {
+        const sub = await scanCommandForEgress(inner, state.depth + 1, state.cdDirs)
+        hits.push(...sub.hits)
+        state.unverifiable ||= sub.unverifiable
+        state.scannedFiles.push(...sub.scannedFiles)
+      }
+      continue
+    }
+
     if (!lang && !isNpx && !isGoRun) continue
 
     const language: Lang = isNpx || isGoRun ? 'node' : lang!
     const positionals: string[] = []
     let i = 1
-    if (isNpx) {
+    if (lang === 'awk') {
+      // awk: the first non-flag positional is the PROGRAM text (unless -f
+      // already supplies a script file); remaining positionals are data or
+      // script files. The program is a code space the token extractor cannot
+      // see, so scan it like inline code.
+      const hasScriptFile = toks.some((t) => t === '-f' || t.startsWith('--file='))
+      let sawProgram = false
+      while (i < toks.length) {
+        const t = toks[i]
+        if (t.startsWith('--file=')) { positionals.push(t.slice(7)); i++; continue }
+        if (t.startsWith('-')) { i++; continue }
+        if (!hasScriptFile && !sawProgram) {
+          if (scanCode(t, 'awk', `inline:awk program`, hits)) state.unverifiable = true
+          sawProgram = true
+          i++
+          continue
+        }
+        positionals.push(t)
+        i++
+      }
+    } else if (isNpx) {
       while (i < toks.length) {
         const t = toks[i]
         if (/^--(yes|-yes|no-install|no|package=\S+)/.test(t) || /^-[yp]$/.test(t)) { i++; continue }
@@ -682,7 +844,7 @@ export async function scanCommandForEgress(
     } else {
       while (i < toks.length) {
         const t = toks[i]
-        if (t === '-c' || t === '-e' || t === '--eval') {
+        if (t === '-c' || t === '-e' || t === '--eval' || t === '-r' || t === '-R') {
           if (i + 1 < toks.length) {
             const code = unquote(toks[i + 1])
             if (scanCode(code, language, `inline:${first} ${t}`, hits)) state.unverifiable = true

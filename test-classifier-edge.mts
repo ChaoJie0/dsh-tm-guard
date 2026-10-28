@@ -250,9 +250,10 @@ test('B2: find -exec cat stays read (no false positive)', () => {
   assert.equal(c.category, 'read')
 })
 
-test('B2: perl -ne read-only filter stays read', () => {
-  const { c } = gate("perl -ne 'print'")
-  assert.equal(c.category, 'read')
+test('B2: perl -ne read-only filter stays local_exec (allow)', () => {
+  const { c, d } = gate("perl -ne 'print'")
+  assert.equal(c.category, 'local_exec')
+  assert.equal(d.allow, true)
 })
 
 // --- B2-residual: same-root bypasses reported in round-3 review ---
@@ -520,9 +521,9 @@ test('B5: puts "operating system" stays local_exec (no false positive)', () => {
   assert.equal(d.allow, true)
 })
 
-test('B5: perl say "the system" stays read (no false positive)', () => {
+test('B5: perl say "the system" stays local_exec (allow, no false positive)', () => {
   const { c, d } = gate('perl -e \'say "the system"\'')
-  assert.equal(c.category, 'read')
+  assert.equal(c.category, 'local_exec')
   assert.equal(d.allow, true)
 })
 
@@ -925,9 +926,9 @@ test('G8b: bare ruby -rsocket fails closed as network (deny)', () => {
   assert.equal(d.allow, false)
 })
 
-test('G8: bare perl -Mstrict local flag stays read (allow)', () => {
+test('G8: bare perl -Mstrict local flag stays local_exec (allow)', () => {
   const { c, d } = gate(`perl -Mstrict -e 'print(1)'`)
-  assert.equal(c.category, 'read')
+  assert.equal(c.category, 'local_exec')
   assert.equal(d.allow, true)
 })
 
@@ -970,9 +971,9 @@ test('G8-B1: env -u X (arg-taking flag) perl -MLWP::Simple fails closed (deny)',
   assert.equal(d.allow, false)
 })
 
-test('G8-B1: env -i perl -Mstrict stays read (allow)', () => {
+test('G8-B1: env -i perl -Mstrict stays local_exec (allow)', () => {
   const { c, d } = gate(`env -i perl -Mstrict -e '1'`)
-  assert.equal(c.category, 'read')
+  assert.equal(c.category, 'local_exec')
   assert.equal(d.allow, true)
 })
 
@@ -1014,9 +1015,9 @@ test('G8-B2: ruby -r"socket" fails closed as network (deny)', () => {
   assert.equal(d.allow, false)
 })
 
-test('G8-B2: perl -M\'strict\' stays read (allow)', () => {
+test('G8-B2: perl -M\'strict\' stays local_exec (allow)', () => {
   const { c, d } = gate(`perl -M'strict' -e '1'`)
-  assert.equal(c.category, 'read')
+  assert.equal(c.category, 'local_exec')
   assert.equal(d.allow, true)
 })
 
@@ -1065,9 +1066,9 @@ test('G8-B3: env -C/tmp perl -MLWP::Simple fails closed as network (deny)', () =
   assert.equal(d.allow, false)
 })
 
-test('G8-B3: env -C/ perl -Mstrict stays read (allow)', () => {
+test('G8-B3: env -C/ perl -Mstrict stays local_exec (allow)', () => {
   const { c, d } = gate(`env -C/ perl -Mstrict -e '1'`)
-  assert.equal(c.category, 'read')
+  assert.equal(c.category, 'local_exec')
   assert.equal(d.allow, true)
 })
 

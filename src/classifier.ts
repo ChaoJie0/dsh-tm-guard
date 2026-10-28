@@ -47,6 +47,12 @@ export interface ClassifyResult {
   mutates?: boolean
 }
 
+/** Most-restrictive-first ranking for merging segment verdicts (B7). */
+const PRIORITY: OpCategory[] = [
+  'system', 'network', 'vcs_remote', 'package', 'process',
+  'mixed', 'unknown', 'file_write', 'vcs_local', 'local_exec', 'local_network', 'read',
+]
+
 /* ------------------------------------------------------------------ */
 /* Command word lists                                                  */
 /* ------------------------------------------------------------------ */
@@ -70,7 +76,7 @@ const READ_COMMANDS = new Set([
   'mdfind', // Spotlight search — local, read-only
   'code', 'cursor', // editors launched in background = read-ish
   'jq', 'yq', // filters; redirect handled separately
-  'sed', 'awk', 'perl', // filters without -i; redirect handled separately
+  'sed', // filters without -i; redirect handled separately
   'sort', 'uniq', 'cut', 'paste', 'join', 'comm', 'tr', 'col',
   'expand', 'unexpand', 'fold', 'fmt', 'pr', 'rev', 'tac',
   'split', 'csplit', 'shuf',
@@ -152,6 +158,10 @@ const LOCAL_EXEC_COMMANDS = new Set([
   'ruby', 'php', 'lua', 'luajit', 'tclsh', 'wish', 'rscript', 'julia',
   'java', 'javac', 'kotlin', 'kotlinc', 'scala', 'groovy', 'dotnet', 'mono',
   'swift', 'rustc', 'ghc', 'runhaskell', 'runghc', 'elixir', 'escript',
+  // Code-carrying hosts: perl/awk inline programs and script files are
+  // statically scanned for risky primitives (B1/B3/B4/B6) instead of riding
+  // read; a plain `awk '{print}'` / `perl -pe 's/x/y/'` stays clean and allows.
+  'perl', 'awk',
   // Build / task runners
   'make', 'cmake', 'ninja', 'bazel', 'bazelisk', 'rake', 'rake',
   // Test runners
@@ -756,13 +766,34 @@ function extractWritePaths(command: string): string[] {
 
   // sed -i / perl -i / ruby -i in-place edits: after the -i flag there is an
   // optional backup-suffix token (macOS passes ''), then the script, then the
-  // target files.
+  // target files. `-i` may ride inside a short cluster (`perl -pi`,
+  // `ruby -pi`, `perl -ni`, `perl -pi.bak`) — B1 regression: without the
+  // cluster match, `perl -pi -e 's/x/y/' /etc/hosts` was classified local_exec
+  // with zero write targets and sailed through.
   if (cmd === 'sed' || cmd === 'perl' || cmd === 'ruby') {
-    const idx = tokens.findIndex((t) => t === '-i' || /^-i\S/.test(t))
+    let idx = -1
+    for (let k = 0; k < tokens.length; k++) {
+      const t = tokens[k]
+      if (t === '-i') { idx = k; break }
+      if (t.startsWith('-') && !t.startsWith('--') && /^[a-zA-Z0-9]*i(?:\.\S+)?$/.test(t.slice(1))) {
+        idx = k
+        break
+      }
+    }
     if (idx >= 0) {
       let j = idx + 1
       if (tokens[idx] === '-i' && tokens[j] === '') j++ // macOS: -i '' suffix
-      j++ // skip the script expression itself
+      // Skip remaining flags AND -e/-E/-M script values so the trailing
+      // non-flag tokens are the real target files (`perl -pi -e 's/x/y/'
+      // /etc/hosts` → /etc/hosts, not the script text).
+      while (j < tokens.length) {
+        const t = tokens[j]
+        // -e / -E / -M / -m take a value (script or module); a short cluster
+        // ending in `e` (-pe, -ne) also carries the script value after it.
+        if (t === '-E' || t === '-M' || t === '-m' || /^-[a-zA-Z]*e$/.test(t)) { j += 2; continue }
+        if (t.startsWith('-')) { j++; continue }
+        break
+      }
       for (; j < tokens.length; j++) {
         if (tokens[j] && !tokens[j].startsWith('-')) paths.push(tokens[j])
       }
@@ -1024,6 +1055,120 @@ function extractWritePaths(command: string): string[] {
       // written; `-d`/`-x` are membership filters, not write targets.
       const first = tokens.slice(1).find((t) => !t.startsWith('-'))
       if (first) paths.push(first)
+    }
+  }
+
+  // B7: zero-target / implicit-target writers whose options the extractor
+  // missed — without extraction they classify as file_write with 0 targets and
+  // sail through the cwd-rollback allowance into an unprotected path.
+  // cpio: `-D DIR` / `--directory DIR` is where extracted members land.
+  if (cmd === 'cpio') {
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i]
+      if ((t === '-D' || t === '--directory') && tokens[i + 1]) { paths.push(tokens[i + 1]); break }
+      if (t.startsWith('--directory=')) { paths.push(t.slice(12)); break }
+    }
+  }
+  // rar/unrar: `x`/`e` extract into cwd, or `-wDIR`/`-oDIR` when given.
+  if (cmd === 'rar' || cmd === 'unrar') {
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i]
+      if (t.startsWith('-w') && t.length > 2) { paths.push(t.slice(2)); break }
+      if (t.startsWith('-o') && t.length > 2 && t[2] !== '+' && t[2] !== '-' && t[2] !== 'p') {
+        paths.push(t.slice(2))
+        break
+      }
+    }
+  }
+  // zstd: `-o OUT` separate value (the glued `--output=` form is already
+  // covered); without `-o` the input is compressed in place (f → f.zst).
+  if (cmd === 'zstd' || cmd === 'unzstd') {
+    let hasOut = false
+    for (let i = 1; i < tokens.length; i++) {
+      if (tokens[i] === '-o' && tokens[i + 1] && !tokens[i + 1].startsWith('-')) {
+        paths.push(tokens[i + 1])
+        hasOut = true
+        break
+      }
+    }
+    if (!hasOut) {
+      const first = tokens.slice(1).find((t) => !t.startsWith('-'))
+      if (first) paths.push(first)
+    }
+  }
+  // gzip/bzip2/xz/lz4 compress or decompress IN PLACE: the input file is the
+  // write target (`gzip /etc/hosts` rewrites it → /etc/hosts.gz). Decompress
+  // to stdout (`-dc` / `-d -c`) writes no input file.
+  if (cmd === 'gzip' || cmd === 'gunzip' || cmd === 'bzip2' || cmd === 'bunzip2' ||
+      cmd === 'xz' || cmd === 'unxz' || cmd === 'lz4' || cmd === 'lzop') {
+    const decompressStdout = tokens.some((t, i) =>
+      (t === '-dc' || t === '-cd' || t === '--stdout' || t === '--to-stdout') ||
+      (t === '-d' && tokens.some((u, j) => j !== i && (u === '-c' || u === '--stdout'))))
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i]
+      if (t.startsWith('-')) continue
+      if (t === '-') continue // stdout sink
+      if (t === '<') { i++; continue } // stdin redirect: the next token is a read input, not a write target
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue
+      if (decompressStdout) continue // input is read, output goes to stdout
+      paths.push(t)
+    }
+  }
+  // rar/unrar: `x <archive> [dest-dir]` extracts INTO dest-dir — the trailing
+  // non-flag positional is the write destination (`rar x a.rar /srv/out`).
+  if (cmd === 'rar' || cmd === 'unrar') {
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i]
+      if (t.startsWith('-')) continue
+      if (t.endsWith('.rar') || t.endsWith('.zip') || t.endsWith('.7z')) continue
+      paths.push(t)
+      break
+    }
+  }
+  // ed/ex/vim open a FILE for editing — the first non-flag positional is the
+  // write target (`ed /etc/hosts` can rewrite /etc/hosts; `vim -c ':w /tmp/x'`
+  // is separately handled by the editor-injection detector).
+  if (cmd === 'ed' || cmd === 'ex' || cmd === 'vim' || cmd === 'vi' || cmd === 'nvim') {
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i]
+      if (t.startsWith('-')) continue
+      if (t.startsWith('+') || t === '-') continue
+      if (t === '--') continue
+      paths.push(t)
+      break
+    }
+  }
+  // patch: `-d DIR` chdirs before applying hunks — writes land under DIR.
+  if (cmd === 'patch') {
+    for (let i = 1; i < tokens.length; i++) {
+      if (tokens[i] === '-d' && tokens[i + 1]) { paths.push(tokens[i + 1]); break }
+      if (tokens[i].startsWith('--directory=')) { paths.push(tokens[i].slice(12)); break }
+    }
+  }
+  // find -exec <copy-verb> {} <target>: the trailing non-placeholder token is
+  // the write destination (`find . -name x -exec cp {} /tmp/out \;`).
+  // Deletion verbs keep their existing actionVerbDestructive handling.
+  if (cmd === 'find' || cmd === 'fd') {
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i]
+      if (t !== '-exec' && t !== '-execdir' && t !== '-ok' && !t.startsWith('-exec')) continue
+      const verb = tokens[i + 1]
+      if (!verb || verb.startsWith('-')) continue
+      if (!['cp', 'mv', 'tee', 'dd', 'install', 'ln'].includes(verb.toLowerCase())) continue
+      for (let j = i + 2; j < tokens.length; j++) {
+        const a = tokens[j]
+        if (a === ';' || a === '+' || a === '{}') continue
+        if (a.startsWith('-')) break
+        let k = j
+        while (k + 1 < tokens.length) {
+          const nxt = tokens[k + 1]
+          if (nxt === ';' || nxt === '+' || nxt === '{}') break
+          if (nxt.startsWith('-')) break
+          k++
+        }
+        paths.push(tokens[k])
+        break
+      }
     }
   }
 
@@ -2601,7 +2746,25 @@ function stripUvRunFlags(s: string): string {
     const first = toks.find((t) => !t.startsWith('-') && t !== '{}')
     if (first) {
       const idx = toks.indexOf(first)
-      return classifyBashCommand(toks.slice(idx).join(' '), denyReadPaths)
+      const innerCmd = toks.slice(idx).join(' ')
+      // B7: a write verb whose DESTINATION is the {} placeholder cannot be
+      // verified statically — stdin lines are attacker-chosen paths
+      // (`echo /etc/x | xargs -I{} cp f {}`). If the placeholder is a SOURCE
+      // (`cp {} /tmp/x`), the concrete destination still flows through the
+      // normal write-path check.
+      const writeVerbM = innerCmd.match(/^(?:cp|mv|tee|dd|install|ln|unlink|rm|trash)\b/)
+      if (writeVerbM) {
+        const innerToks = innerCmd.split(/\s+/)
+        if (innerToks[innerToks.length - 1] === '{}') {
+          return {
+            category: 'unknown',
+            reason: `xargs ${writeVerbM[1]} destination is a stdin placeholder: ${fullCmd}`,
+            targetPaths: [],
+            mutates: true,
+          }
+        }
+      }
+      return classifyBashCommand(innerCmd, denyReadPaths)
     }
     return {
       category: 'local_exec',
@@ -2944,7 +3107,16 @@ function stripUvRunFlags(s: string): string {
     }
   }
 
-  // File write commands
+  function decompressToStdout(cmd: string): boolean {
+  const toks = cmd.split(/\s+/)
+  const hasD = toks.some((t) => t === '-d' || t === '--decompress' || t === '--uncompress' ||
+    /^-.*d.*$/.test(t) && !t.includes('no'))
+  const hasC = toks.some((t) => t === '-c' || t === '--stdout' || t === '--to-stdout' ||
+    /^-.*c.*$/.test(t))
+  return hasD && hasC
+}
+
+// File write commands
   if (FILE_WRITE_COMMANDS.has(firstWord) || FILE_WRITE_COMMANDS.has(fullCmd)) {
     // tee always writes to at least one file
     if (firstWord === 'tee') {
@@ -2955,6 +3127,20 @@ function stripUvRunFlags(s: string): string {
       }
     }
 
+    // Compress/decompress to STDOUT (`-dc`, `-d -c`, `--stdout`) writes no
+    // file — classify as read so a piped tail (`gzip -dc < a.gz | ruby -e
+    // 'File.write("/etc/gz",…)'`) reaches the egress scan on the tail.
+    if ((firstWord === 'gzip' || firstWord === 'gunzip' || firstWord === 'bzip2' ||
+         firstWord === 'bunzip2' || firstWord === 'xz' || firstWord === 'unxz' ||
+         firstWord === 'lz4' || firstWord === 'lzop') &&
+        decompressToStdout(trimmed)) {
+      return {
+        category: 'read',
+        reason: `decompress to stdout: ${fullCmd}`,
+        targetPaths: [],
+      }
+    }
+
     // Pure-listing/print/dry-run archive ops write nothing to disk (unless an
     // explicit output redirection makes them a real write).
     if (isReadOnlyArchiveOp(firstWord, trimmed) && !hasOutputRedirect(trimmed)) {
@@ -2962,6 +3148,25 @@ function stripUvRunFlags(s: string): string {
         category: 'read',
         reason: `read-only archive operation: ${fullCmd}`,
         targetPaths: [],
+      }
+    }
+
+    // B4: editor -c/--eval shell escapes and escape writes are invisible to
+    // the write-path extractor; fail closed before granting file_write.
+    const editorInjection = detectEditorCommandInjection(trimmed, firstWord)
+    if (editorInjection) return editorInjection
+
+    // Compression front-ends that run an EXTERNAL program on the stream
+    // (gzip --use-compress-program=…, --compress-program …) are unverifiable
+    // code sinks — the extracted write target would vouch for a run of the
+    // external program. Fail closed.
+    if (/^(gzip|gunzip|xz|unxz|bzip2|bunzip2|lz4|lzma|unlzma)\b/.test(firstWord) &&
+        /--(?:use-)?compress-program(\s+|=)\S+/.test(trimmed)) {
+      return {
+        category: 'unknown',
+        reason: `compression with external program (unverifiable): ${fullCmd}`,
+        targetPaths: [],
+        mutates: true,
       }
     }
 
@@ -3225,8 +3430,14 @@ function extractCommandSubstitutions(s: string): string[] {
   }
   let i = 0
   while (i < s.length) {
-    const start = s.indexOf('$(', i)
-    if (start === -1) break
+    // `$(...)`, `>(...)` and `<(...)` process substitutions are command
+    // bodies (the `>` form is a write channel — B7 `echo a >(tee /tmp/x)`).
+    const dollar = s.indexOf('$(', i)
+    const gt = s.indexOf('>(', i)
+    const lt = s.indexOf('<(', i)
+    const starts = [dollar, gt, lt].filter((v) => v !== -1)
+    if (starts.length === 0) break
+    const start = Math.min(...starts)
     let depth = 0
     let end = -1
     for (let j = start + 2; j < s.length; j++) {
@@ -3255,6 +3466,7 @@ const INTERPRETER_CODE_FLAGS: Record<string, string[]> = {
   node: ['-e', '--eval'], nodejs: ['-e', '--eval'], npx: ['-e'],
   ruby: ['-e'], perl: ['-e', '-E'], php: ['-r', '-R'],
   osascript: ['-e'], jsc: ['-e'], swift: ['-e'],
+  elixir: ['-e'], elixirc: ['-e'], escript: ['-e'],
 }
 
 /** Substring hit for an absolute sensitive prefix, with a directory/quote/
@@ -3275,6 +3487,10 @@ function scanCodeForSensitivePaths(
   denyReadPaths: string[],
 ): string[] {
   const hits: string[] = []
+  // B2: dynamic HOME references (ruby Dir.home / ENV["HOME"], perl $ENV{HOME})
+  // concatenated with a sensitive subpath — `File.read(Dir.home+"/.ssh/x")`.
+  // A bare `puts ENV["HOME"]` carries no sensitive subpath and stays allowed.
+  const dynHomeRef = /Dir\.home\b|ENV\s*\[\s*["']HOME["']\s*\]|\$ENV\s*\{\s*HOME\s*\}|getenv\s*\(\s*["']HOME["']\s*\)|ENV\s*\.\s*fetch\s*\(\s*["']HOME["']/.test(code)
   for (const raw of denyReadPaths) {
     const abs = expandHome(raw).replace(/\/+$/, '')
     const homeRel = raw.replace(/^~\//, '') // e.g. .ssh / Library/Keychains
@@ -3284,6 +3500,7 @@ function scanCodeForSensitivePaths(
     if (code.includes(`$HOME/${homeRel}`) || code.includes(`\${HOME}/${homeRel}`)) {
       hits.push(raw)
     }
+    if (dynHomeRef && homeRel && code.includes(homeRel)) hits.push(raw)
   }
   return hits
 }
@@ -3845,6 +4062,81 @@ function detectDestructiveRead(trimmed: string, firstWord: string): ClassifyResu
 }
 
 /**
+ * B4: editor hosts (vim/nvim/vi/emacs/ex/ed) executing shell escapes or
+ * writing through -c/--eval command strings that the write-path extractor
+ * cannot see (`vim -es -c ':w /abs/outside' -c q f`, `emacs --eval
+ * "(shell-command …)"`). Fail closed to unknown.
+ */
+function detectEditorCommandInjection(
+  trimmed: string,
+  firstWord: string,
+): ClassifyResult | null {
+  const cmd = trimmed
+  if (firstWord === 'vim' || firstWord === 'nvim' || firstWord === 'vi' ||
+      firstWord === 'ex' || firstWord === 'ed') {
+    const cmds = [...cmd.matchAll(/(?:-c|--cmd|-s|-es)\s+(?:"([^"]*)"|'([^']*)'|([^\s-][^\s]*))/g)]
+    for (const m of cmds) {
+      const c = m[1] ?? m[2] ?? m[3]
+      if (/:!|:silent\s*!|:bd?!|:r\s*!|^!/m.test(c)) {
+        return { category: 'unknown', reason: `vim/ex -c shell escape: ${c.slice(0, 60)}`, targetPaths: [], mutates: true }
+      }
+      const wm = c.match(/:w(?:rite)?!?\s+(?:"([^"]+)"|'([^']+)'|(\S+))/)
+      if (wm) {
+        const target = wm[1] ?? wm[2] ?? wm[3]
+        if (target.startsWith('/') || target.startsWith('~') || target.includes('..')) {
+          return { category: 'unknown', reason: `vim/ex -c write to escape path: ${target.slice(0, 60)}`, targetPaths: [], mutates: true }
+        }
+      }
+      // embedded interpreter escapes inside the editor command string
+      // (`vim -Es -c "lua os.execute('id')"`, `-c "py3 eval(...)"`).
+      if (/os\.execute\s*\(|luaeval\s*\(|py3?eval\s*\(|py3?do\s+|\b:lua\b|exe\s*\(/.test(c)) {
+        return { category: 'unknown', reason: `editor command embeds interpreter execution: ${c.slice(0, 60)}`, targetPaths: [], mutates: true }
+      }
+      // A -c value that STARTS an embedded interpreter (vim `-c 'lua …'`,
+      // `-c 'py3 …'`, `-c 'perl …'`, `-c 'ruby …'`) is a code-carrying host
+      // whose body cannot be statically verified — fail closed.
+      if (/^(?:lua|py3?|python|perl|ruby|php)\b/.test(c.trim())) {
+        return { category: 'unknown', reason: `editor -c runs embedded interpreter: ${c.slice(0, 60)}`, targetPaths: [], mutates: true }
+      }
+    }
+    // A -s/-S script FILE fed to the editor executes arbitrary command
+    // stream the static checker cannot see (vim -s /tmp/cmds.vim).
+    const scriptM = cmd.match(/(?:^|[\s;|&])vim\s+(?:-\w+\s+)*-s\s+(\S+)|(?:^|[\s;|&])vim\s+(?:-\w+\s+)*-S\s+(\S+)/)
+    if (scriptM) {
+      return { category: 'unknown', reason: `vim -s script file (unverifiable command stream): ${scriptM[1] ?? scriptM[2]}`, targetPaths: [], mutates: true }
+    }
+  }
+  if (firstWord === 'emacs') {
+    const evals = [...cmd.matchAll(/(?:--eval|-e|--funcall)\s+(?:"([^"]*)"|'([^']*)'|([^\s-][^\s]*))/g)]
+    for (const m of evals) {
+      const e = m[1] ?? m[2] ?? m[3]
+      if (/shell-command|call-process|start-process|write-region|process-\w+/.test(e)) {
+        return { category: 'unknown', reason: `emacs eval executes/writes: ${e.slice(0, 60)}`, targetPaths: [], mutates: true }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * B4: ex/ed/vim silent mode fed an editing command stream via a pipe/printf
+ * whose body writes an absolute path or invokes a shell command
+ * (`printf 'w /tmp/x' | ex -s f`). The editor's write target lives in the
+ * OTHER segment's payload, invisible to this segment's path extractor.
+ */
+function detectStdinEditorEscape(command: string): ClassifyResult | null {
+  const m = /(?:^|[\s;|&])(?:ex|ed)\s+(?:-\w+\s+)*-s\b|vim\s+(?:-[\w]+\s+)*-es\b/i.exec(command)
+  if (!m) return null
+  if (/\bw(?:rite)?\s+(?:\/|~|\S*\.\.)/.test(command)) {
+    return { category: 'unknown', reason: `stdin editor writes an absolute/escape path`, targetPaths: [], mutates: true }
+  }
+  if (/(?:^|\|)\s*(?:printf|echo)\s+["']?[^"'|]*!(?:\s|$)/.test(command)) {
+    return { category: 'unknown', reason: `stdin editor executes a shell command`, targetPaths: [], mutates: true }
+  }
+  return null
+}
+
+/**
  * Detect `find … -name <sensitive-name> -exec <read-cmd> {}` — a read channel
  * whose sensitive path only appears as a pattern + `{}` placeholder, invisible
  * to the literal-path scan. Returns a synthetic sensitive path (or null).
@@ -3879,6 +4171,22 @@ function scanFindExecForSensitiveRead(
  *   covering both direct reads (`cat ~/.ssh/config`) and reads smuggled
  *   through redirection (`cat ~/.ssh/config > project/out.txt`).
  */
+/**
+ * Normalize shell HOME parameter-expansion forms so downstream path matching
+ * sees a canonical `$HOME`. Covers `${HOME:?}` (and other ${HOME...} forms)
+ * plus a leading `VAR=$HOME` assignment whose later `$VAR` references alias
+ * HOME — both are the B2 read-side bypass shapes (`cat ${HOME:?}/.ssh/x`,
+ * `H=$HOME cat $H/.ssh/x`).
+ */
+function normalizeEnvForms(command: string): string {
+  let s = command.replace(/\$\{HOME(?:[:+=-][^}]*)?\}/g, '$HOME')
+  const assign = /(?:^|[\s;|&])([A-Za-z_][A-Za-z0-9_]*)=(\$HOME|\$\{HOME\})(?:\s|$)/.exec(s)
+  if (assign && assign[1] !== 'HOME') {
+    s = s.replace(new RegExp(`\\$${assign[1]}(?![A-Za-z0-9_])`, 'g'), '$HOME')
+  }
+  return s
+}
+
 export function classifyBashCommand(
   command: string,
   denyReadPaths: string[] = [],
@@ -3893,6 +4201,14 @@ export function classifyBashCommand(
   // Heredoc bodies are local script code — collapse them into one marker so
   // the ; / | / && inside them don't create false unknown segments.
   command = stripHeredocs(command)
+
+  // B2: normalize ${HOME...} / $H-alias expansions before any path extraction.
+  command = normalizeEnvForms(command)
+
+  // B4: ex/ed/vim silent-mode editing streams whose payload writes an
+  // absolute path or shells out — cross-segment, checked on the whole line.
+  const stdinEditor = detectStdinEditorEscape(command)
+  if (stdinEditor) return stdinEditor
 
   const segments = splitCommandSegments(command)
 
@@ -3943,11 +4259,37 @@ export function classifyBashCommand(
     }
     // Command substitution bodies ($(...) / `…`) are re-classified as their
     // own commands: `echo $(cat ~/.ssh/id_rsa)` must be denied even though
-    // the outer segment is just echo + a token.
+    // the outer segment is just echo + a token. B7: a substitution's verdict
+    // is part of the segment — `echo $(cp a /outside)` / `echo $(ruby -e
+    // 'File.write(...)')` must not be absorbed as a benign read.
     for (const body of extractCommandSubstitutions(s)) {
       const inner = classifyBashCommand(body, denyReadPaths)
       if (inner.forceDeny) {
         resolvedReads.push(...(inner.targetPaths.length > 0 ? inner.targetPaths : [dir]))
+      }
+      if (PRIORITY.indexOf(inner.category) < PRIORITY.indexOf(results[i].category)) {
+        results[i] = {
+          ...inner,
+          reason: `Command substitution ${inner.category}: ${inner.reason}`,
+        }
+        // resolvedWrites was collected before this merge; fold in the
+        // substitution's targets so `echo $(cp a /etc/evil2)` reports /etc/evil2.
+        for (const p of inner.targetPaths ?? []) {
+          resolvedWrites.push(toAbsolute(p, dir))
+        }
+      } else if (inner.category === 'file_write' && results[i].category === 'file_write') {
+        // Same severity: union the write targets. Without this,
+        // `cat x > >(tee /etc/evil)` keeps the process-substitution token
+        // itself (`>(tee …`) as the target and loses /etc/evil.
+        results[i] = {
+          ...results[i],
+          targetPaths: [...new Set([...(results[i].targetPaths ?? []), ...(inner.targetPaths ?? [])])],
+        }
+        // resolvedWrites was collected from the pre-merge segment; fold in the
+        // substitution's targets so the final path check sees /etc/evil.
+        for (const p of inner.targetPaths ?? []) {
+          resolvedWrites.push(toAbsolute(p, dir))
+        }
       }
     }
     // Interpreter -c/-e code strings: scan for sensitive path references the
@@ -3991,10 +4333,7 @@ export function classifyBashCommand(
   }
 
   // Priority order for "most restrictive"
-  const priority: OpCategory[] = [
-    'system', 'network', 'vcs_remote', 'package', 'process',
-    'mixed', 'unknown', 'file_write', 'vcs_local', 'local_exec', 'local_network', 'read',
-  ]
+  const priority = PRIORITY
 
   let worst: ClassifyResult = results[0]
   for (const r of results) {

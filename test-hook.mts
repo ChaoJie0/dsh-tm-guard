@@ -481,9 +481,13 @@ check('bash rsync to UNPROTECTED dst (deny, F1)',
   { name: 'bash', arguments: { command: 'rsync -a /tmp/src/ /srv/unprotected/', description: 'local sync' } },
   { allow: false, category: 'file_write' }, [])
 
-check('bash gzip in UNPROTECTED cwd (deny, F1 fw/0)',
+check('bash gzip with in-place target in cwd (allow, F1 fw/1 target inside cwd)',
   { name: 'bash', arguments: { command: 'gzip big.log', description: 'compress' } },
-  { allow: false, category: 'file_write' }, [], false)
+  { allow: true, category: 'file_write', paths: [`${process.cwd()}/big.log`] }, [], false)
+
+check('bash gzip --use-compress-program to UNPROTECTED target (deny, unverifiable sink)',
+  { name: 'bash', arguments: { command: 'gzip --use-compress-program=/bin/sh big.log', description: 'compress' } },
+  { allow: false, category: 'unknown' }, [], false)
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail > 0 ? 1 : 0)
