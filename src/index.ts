@@ -43,6 +43,7 @@ import {
   isTempPath,
   hasArchiveExecSink,
   hasDotdotAcrossSymlink,
+  extractCommandSubstitutions,
   type GateDecision,
 } from './classifier.ts'
 import { scanCommandForEgress } from './scan-scripts.ts'
@@ -1024,6 +1025,51 @@ export function apply(ctx: Context, rawConfig?: Partial<TmGuardConfig>) {
               classification.reason +=
                 ' [static-script-egress: dynamic eval/exec/__import__ — cannot verify no network egress]'
             }
+          }
+        }
+      }
+
+      // B2 (g 轮): command/process substitution bodies (`$(…)`, backticks,
+      // `<(...)`) smuggle write/egress/archive-RCE payloads behind a benign
+      // outer command (`echo $(ruby -e 'File.write("/etc/pwn","x")')`,
+      // `echo $(tar --to-command=sh -xf evil.tar)`). The classifier merge
+      // keeps the most-restrictive *category* but never runs the egress scan
+      // on the inner body, and hasArchiveExecSink is substitution-blind.
+      // Scan every body here, regardless of the outer classification.
+      const rawCmdSub =
+        (args.command as string) ??
+        (args.input as string) ??
+        (args.cmd as string) ??
+        (args.code as string) ??
+        ''
+      if (
+        typeof rawCmdSub === 'string' &&
+        rawCmdSub &&
+        /\$\(|`|<\(/.test(rawCmdSub) &&
+        !classification.forceDeny
+      ) {
+        for (const body of extractCommandSubstitutions(rawCmdSub)) {
+          if (!body.trim()) continue
+          if (hasArchiveExecSink(body)) {
+            classification.forceDeny = true
+            classification.reason +=
+              ' [substitution body is an archive exec sink (bytes -> interpreter): denied]'
+            break
+          }
+          const subEgress = await scanCommandForEgress(body)
+          if (subEgress.hits.length > 0) {
+            const h = subEgress.hits[0]
+            classification.category = 'network'
+            classification.forceDeny = true
+            classification.reason +=
+              ` [substitution-body static-egress: ${h.where} (${h.language}): ${h.snippet}]`
+            break
+          }
+          if (subEgress.unverifiable) {
+            classification.category = 'unknown'
+            classification.reason +=
+              ' [substitution body unverifiable (dynamic code): cannot prove no egress]'
+            break
           }
         }
       }

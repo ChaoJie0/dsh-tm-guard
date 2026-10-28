@@ -163,6 +163,32 @@ await expectUnverifiable(`xargs ruby -e 'File.write(ARGV[0],"x")'`, 'xargs inner
 // L5-b: gzip -dc piped ruby write reaches the egress scan (BLOCKER 7b tail)
 await expectUnverifiable(`gzip -dc < a.gz | ruby -e 'File.write("/etc/gz","x")'`, 'gzip -dc | ruby write')
 
+// --- g 轮 B1: ruby receiver-indirect / any-position write modes ---
+await expectUnverifiable(`ruby -e 'File.open("/etc/pwn","w"){|f| f.write("x")}'`, 'g B1 File.open mode-any-position')
+await expectUnverifiable(`ruby -e 'File.open("/etc/pwn","w+"){|f|f.puts 1}'`, 'g B1 File.open w+')
+await expectUnverifiable(`ruby -e 'File.send(:write,"/tmp/send-probe","pwned")'`, 'g B1 File.send write')
+await expectUnverifiable(`ruby -e 'f=File.open("/etc/pwn","w");f.write("x")'`, 'g B1 open+write')
+await expectClean(`ruby -e 'File.open("data.txt"){|f| puts f.gets}'`, 'g B1 read-mode open stays clean')
+
+// --- g 轮 B2: substitution bodies carry egress payloads ---
+// The index.ts hook scans each $()/`/<() body as its own command; these
+// tests exercise the scan on the extracted body (the classifier-level
+// substitution merge is asserted in test-classifier-edge.mts).
+for (const [cmd, label] of [
+  [`ruby -e 'File.write("/etc/pwn","x")'`, 'g B2 $() ruby write body'],
+  [`ruby -e 'File.write("/etc/pwn","x")'`, 'g B2 backtick ruby write body'],
+  [`ruby -e 'File.write("/etc/pwn","x")'`, 'g B2 <() ruby write body'],
+]) {
+  await expectUnverifiable(cmd, label)
+}
+await expectClean(`git status`, 'g B2 benign substitution body clean')
+
+// --- g 轮 B1 perl mirrors (IO::File->new / sysopen / O_WRONLY) ---
+await expectUnverifiable(`perl -e 'IO::File->new(">pwn.txt")'`, 'g B1 perl IO::File->new write mode')
+await expectUnverifiable(`perl -e 'sysopen(FH, "/etc/pwn", O_WRONLY)'`, 'g B1 perl sysopen O_WRONLY')
+await expectUnverifiable(`perl -e 'sysopen(FH, $ARGV[0], O_APPEND|O_CREAT)'`, 'g B1 perl sysopen flags via ARGV')
+await expectClean(`perl -e 'print "hi\\n"'`, 'g B1 perl print stays clean')
+
 // --- cleanup ------------------------------------------------------
 rmSync(dir, { recursive: true, force: true })
 

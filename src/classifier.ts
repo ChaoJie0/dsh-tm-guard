@@ -2725,6 +2725,19 @@ function stripUvRunFlags(s: string): string {
         targetPaths: [],
       }
     }
+    // B6 (g 轮): a bare shell with NO arguments reads and executes stdin as
+    // code (`cat x.sh | bash`, `echo x | sh`). Fail closed. Any argument —
+    // a script (`bash script.sh`), `-c`/`-n` (handled above), or any option
+    // (`bash -x -c "…"`, `bash --norc script.sh`) — names an explicit target
+    // and keeps the historical classification; archive exec sinks inside
+    // those stay denied at the hook layer via hasArchiveExecSink.
+    if (!rest.trim()) {
+      return {
+        category: 'unknown',
+        reason: `bare shell may execute stdin code (unverifiable): ${fullCmd.slice(0, 60)}`,
+        targetPaths: [],
+      }
+    }
     return {
       category: 'local_exec',
       reason: `Shell execution: ${fullCmd}`,
@@ -2778,6 +2791,30 @@ function stripUvRunFlags(s: string): string {
   // subcommands (npm test, cargo test, go run…) are allowed while install/fetch
   // (which hit the network) stay blocked.
   if (LOCAL_EXEC_COMMANDS.has(firstWord) || PY_INTERPRETER_RE.test(firstWord) || LOCAL_EXEC_COMMANDS.has(fullCmd)) {
+    // B8 (g 轮): awk sits in LOCAL_EXEC_COMMANDS. An opaque awk program FILE
+    // (`-f/--file=`, incl. glued `-fe`) cannot be verified — fail closed.
+    // An inline program that writes/executes through an indirect channel
+    // (`-v c="id" 'BEGIN{c|getline}'`, `ENVIRON["CMD"]|getline`,
+    // `print "y" > f`) has no literal command/path to match — fail closed.
+    if (firstWord === 'awk' || firstWord === 'gawk') {
+      if (/(?:^|\s)-f(?:\s|$)/.test(rest) || /(?:^|\s)--file=/.test(rest) || /(?:^|\s)-f[A-Za-z0-9_.-]/.test(rest)) {
+        return {
+          category: 'unknown',
+          reason: `awk program file (unverifiable): ${fullCmd.slice(0, 60)}`,
+          targetPaths: [],
+        }
+      }
+      // Program text may be a quoted block containing spaces; test the whole
+      // rest for the indirect command/write surface (`> f` via -v variable,
+      // `c|getline`, ENVIRON, system/exec).
+      if (/\bsystem\s*\(|\bexec\s*\(|\|\s*(?:getline\b|["'])|>\s*(?:["']|[A-Za-z_]\w*)|ENVIRON\s*\[/.test(rest)) {
+        return {
+          category: 'unknown',
+          reason: `awk program executes indirect commands or writes (unverifiable): ${fullCmd.slice(0, 60)}`,
+          targetPaths: [],
+        }
+      }
+    }
     // R14 W1: sensitive-path scan on the inline code now runs inside
     // classifySingleCommand so it flows through every wrapper recursion
     // (nohup/env/assignment/subshell), not just the outer per-segment
@@ -2857,6 +2894,21 @@ function stripUvRunFlags(s: string): string {
         category: 'file_write',
         reason: `Local command with write target: ${fullCmd}`,
         targetPaths: writes,
+      }
+    }
+    // B6 (g 轮): a bare code-host interpreter with NO arguments reads and
+    // executes code from stdin (`cat evil.rb | ruby`, `gzip -dc evil.gz |
+    // ruby`, `cat x.sh | bash`). The pipe content is not on the command line;
+    // fail closed — the same posture as a heredoc. Any argument (a script,
+    // -e/-c/-m, heredoc marker, flag) names an explicit target and keeps the
+    // historical classification (e.g. `ruby -w`, `node <<'NODE'`,
+    // `python3 -m http.server`, `bash -x -c "…"` all stay local_exec).
+    if (/^(?:ruby|perl|php|python\d*|node|nodejs|bash|sh|zsh|dash|ksh|tclsh|elixir|elixirc|escript)\b/.test(firstWord) &&
+        !rest.trim()) {
+      return {
+        category: 'unknown',
+        reason: `bare interpreter may execute stdin code (unverifiable): ${fullCmd.slice(0, 60)}`,
+        targetPaths: [],
       }
     }
     return {
@@ -3201,6 +3253,8 @@ function stripUvRunFlags(s: string): string {
         targetPaths: [],
       }
     }
+    // B8 (g 轮): `awk -f PROGRAM` / `awk --file=PROGRAM` fail-closed — moved
+    // to the LOCAL_EXEC_COMMANDS branch where awk actually classifies.
     return {
       category: 'read',
       reason: `Read-only command: ${fullCmd}`,
@@ -3419,7 +3473,7 @@ function splitCommandSegments(command: string): string[] {
  * caught by re-classifying the inner command. Arithmetic `$((x << 2))` yields
  * a harmless body; nesting is handled by the recursive re-classification.
  */
-function extractCommandSubstitutions(s: string): string[] {
+export function extractCommandSubstitutions(s: string): string[] {
   const out: string[] = []
   const btRe = /`([^`]*)`/g
   let m: RegExpExecArray | null
@@ -3618,16 +3672,23 @@ const DELETE_API_SURFACE =
 
 const INLINE_DESTRUCTIVE_RE = new RegExp([
   DELETE_API_SURFACE.source,
-  // B4 (g 轮): the write/create surface is equally destructive through an
-  // inline interpreter — File.write/open(w)/FileUtils cp/touch/mkdir,
-  // python open(...,"w"), shutil.copy, node writeFileSync. Without these, a
+  // B4 (g 轮): the write-content surface is equally destructive through an
+  // inline interpreter — File.write/FileUtils.write, python open(...,"w"),
+  // node writeFileSync. Without these, a
   // `find -exec ruby -e 'File.write("/etc/pwn","x")'` sailed through as read.
-  /\bFile\.(?:write|binwrite|open|truncate|chmod|chown|rename|move|symlink|hardlink|link|mkdir)\b/,
-  /\bFileUtils\.(?:write|cp|cp_r|mv|mkdir|mkdir_p|touch|chmod|chown|symlink|link|rm|rm_f|rm_r|rm_rf)\b/,
-  /\bopen\s*\([^)]*['"](?:w|a|r\+|w\+|wb|ab)/,
-  /\bIO\.(?:write|binwrite|truncate|open)\b/,
-  /\bos\.(?:remove|unlink|rmdir|makedirs|mkdir)\b/,
-  /\bshutil\.(?:copy|copyfile|move|rmtree)\b/,
+  // Copy / mkdir methods are deliberately NOT listed (FileUtils.cp/mkdir_p
+  // stay local_exec per the FileUtils-narrowing test contract); only content
+  // writes and deletions hard-deny. Bare `File.open(...)` is also NOT listed —
+  // a read-mode open (`File.open("data.txt"){|f| puts f.gets}`) must stay
+  // clean; only an open carrying an explicit write mode string matches below.
+  /\bFile\.(?:write|binwrite|truncate)\b/,
+  /\bFileUtils\.write\b/,
+  /\bFile\.open\s*\([^)]*['"](?:w|a|r\+|w\+|wb|ab|wt)/,
+  /\bopen\s*\([^)]*,\s*['"](?:w|a|r\+|w\+|wb|ab)/,
+  /\bIO\.(?:write|binwrite|truncate)\s*\(/,
+  /\bIO\.open\s*\([^)]*['"](?:w|a|r\+|w\+|wb|ab)/,
+  /\bos\.(?:remove|unlink|rmdir)\b/,
+  /\bshutil\.(?:move|rmtree)\b/,
   /\.writeFileSync?\s*\(/,
   /Kernel\.(system|exec)/,
   /\bsystem\s*\(/,
