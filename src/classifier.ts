@@ -3127,6 +3127,18 @@ function stripUvRunFlags(s: string): string {
       }
     }
 
+    // B3: external-program guard MUST run BEFORE decompressToStdout — adding
+    // `-dc` to `--use-compress-program` must not reorder the guard away.
+    if (/^(gzip|gunzip|xz|unxz|bzip2|bunzip2|lz4|lzma|unlzma|lzop)\b/.test(firstWord) &&
+        /--(?:use-)?compress-program(\s+|=)\S+/.test(trimmed)) {
+      return {
+        category: 'unknown',
+        reason: `compression with external program (unverifiable): ${fullCmd}`,
+        targetPaths: [],
+        mutates: true,
+      }
+    }
+
     // Compress/decompress to STDOUT (`-dc`, `-d -c`, `--stdout`) writes no
     // file — classify as read so a piped tail (`gzip -dc < a.gz | ruby -e
     // 'File.write("/etc/gz",…)'`) reaches the egress scan on the tail.
@@ -3155,20 +3167,6 @@ function stripUvRunFlags(s: string): string {
     // the write-path extractor; fail closed before granting file_write.
     const editorInjection = detectEditorCommandInjection(trimmed, firstWord)
     if (editorInjection) return editorInjection
-
-    // Compression front-ends that run an EXTERNAL program on the stream
-    // (gzip --use-compress-program=…, --compress-program …) are unverifiable
-    // code sinks — the extracted write target would vouch for a run of the
-    // external program. Fail closed.
-    if (/^(gzip|gunzip|xz|unxz|bzip2|bunzip2|lz4|lzma|unlzma)\b/.test(firstWord) &&
-        /--(?:use-)?compress-program(\s+|=)\S+/.test(trimmed)) {
-      return {
-        category: 'unknown',
-        reason: `compression with external program (unverifiable): ${fullCmd}`,
-        targetPaths: [],
-        mutates: true,
-      }
-    }
 
     return {
       category: 'file_write',
@@ -3620,6 +3618,17 @@ const DELETE_API_SURFACE =
 
 const INLINE_DESTRUCTIVE_RE = new RegExp([
   DELETE_API_SURFACE.source,
+  // B4 (g 轮): the write/create surface is equally destructive through an
+  // inline interpreter — File.write/open(w)/FileUtils cp/touch/mkdir,
+  // python open(...,"w"), shutil.copy, node writeFileSync. Without these, a
+  // `find -exec ruby -e 'File.write("/etc/pwn","x")'` sailed through as read.
+  /\bFile\.(?:write|binwrite|open|truncate|chmod|chown|rename|move|symlink|hardlink|link|mkdir)\b/,
+  /\bFileUtils\.(?:write|cp|cp_r|mv|mkdir|mkdir_p|touch|chmod|chown|symlink|link|rm|rm_f|rm_r|rm_rf)\b/,
+  /\bopen\s*\([^)]*['"](?:w|a|r\+|w\+|wb|ab)/,
+  /\bIO\.(?:write|binwrite|truncate|open)\b/,
+  /\bos\.(?:remove|unlink|rmdir|makedirs|mkdir)\b/,
+  /\bshutil\.(?:copy|copyfile|move|rmtree)\b/,
+  /\.writeFileSync?\s*\(/,
   /Kernel\.(system|exec)/,
   /\bsystem\s*\(/,
   /\bsystem\s+["']\S/,
@@ -3704,6 +3713,29 @@ function actionVerbDestructive(trimmed: string): string | null {
     if (FIND_DESTRUCTIVE_EXEC.has(verb)) return verb
   }
   return null
+}
+
+/**
+ * B5 (g 轮): extract the trailing destination of a
+ * `find -exec cp/mv/ln/install/tee {} DEST` (or `-execdir`) action so the
+ * out-of-cwd destination is coverage-checked. The literal `\;`/`+` terminator
+ * and the `{}` placeholder are dropped; the last real token is the DEST.
+ */
+function findExecDestinations(trimmed: string): string[] {
+  const out: string[] = []
+  const re = /(?:--exec|-(?:exec(?:dir)?|ok|x))\s+(\S+)([^;\n]*?)(?:\\?;\s*|(?:\+\s*))/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(trimmed))) {
+    const verb = m[1].split('/').pop()?.toLowerCase() ?? ''
+    if (!FIND_DESTRUCTIVE_EXEC.has(verb)) continue
+    const tail = (m[2] ?? '').trim()
+    if (!tail) continue
+    const toks = tail.split(/\s+/).filter((t) => t && t !== '{}' && t !== ';' && t !== '+')
+    if (toks.length === 0) continue
+    const dst = toks[toks.length - 1].replace(/^["']|["']$/g, '')
+    if (dst && !dst.startsWith('-')) out.push(dst)
+  }
+  return out
 }
 
 const SHELL_WRAP = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'tcsh', 'csh'])
@@ -3969,6 +4001,23 @@ function findActionInlineThreat(trimmed: string): { kind: 'delete' | 'egress'; s
       }
       const flag = moduleFlagEgress(action, verb)
       if (flag) return { kind: 'egress', signal: flag }
+      // B4 (g 轮): an interpreter with a SCRIPT FILE argument and no -e/-c
+      // (`-exec ruby evil.rb {}`) executes an opaque program the read path
+      // never scans — fail closed, same posture as awk -f.
+      const actionToks = action.split(/\s+/).filter(Boolean)
+      const hasInlineFlag = /-(?:e|c|E|n|p|ne|pe|np|pn)\b/.test(action)
+      let interpSeen = false
+      for (const t of actionToks) {
+        const clean = t.replace(/^["']|["']$/g, '')
+        const base = clean.split('/').pop()?.toLowerCase() ?? ''
+        if (base === verb && !interpSeen) { interpSeen = true; continue }
+        if (interpSeen && !clean.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(clean)) {
+          if (!hasInlineFlag && /\.(?:rb|py|pl|pm|php|js|mjs|cjs)$/.test(clean)) {
+            return { kind: 'delete', signal: `${verb} script file (${clean})` }
+          }
+          break
+        }
+      }
       // Fallback scan the whole action when nested quotes truncate the extracted
       // code body; the shell-out rule already requires a literal network program.
       if (FIND_SHELLOUT_RE.test(action)) return { kind: 'egress', signal: `${verb} subprocess shell-out` }
@@ -4017,11 +4066,14 @@ function detectDestructiveRead(trimmed: string, firstWord: string): ClassifyResu
     if (hasDelete || actionVerb) {
       const start = extractFindStart(trimmed)
       const action = hasDelete ? '-delete' : `-${actionVerb}`
-      if (start) {
+      const targets = hasDelete
+        ? (start ? [start] : [])
+        : (start ? [start, ...findExecDestinations(trimmed)] : findExecDestinations(trimmed))
+      if (targets.length > 0) {
         return {
           category: 'file_write',
           reason: `${firstWord} mutates matched files (${action})`,
-          targetPaths: [start],
+          targetPaths: targets,
           mutates: true,
         }
       }

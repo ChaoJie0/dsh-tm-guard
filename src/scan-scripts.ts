@@ -172,11 +172,18 @@ const RULES: Record<Lang, LangRules> = {
     risky: [
       // file write / truncate / permission / link / rename primitives
       /\bFile\.(write|binwrite|truncate|chmod|chown|rename|move|symlink|hardlink|link|delete|unlink)\b/,
-      /\bFile\.open\s*\(\s*['"][wa+]/,
+      // B1: File.open(path,"w") — the write mode may be ANY argument, not just
+      // the first string (File.open's first arg is the path). Match a write
+      // mode string anywhere inside the parens; File.open("t") read stays clean.
+      /\bFile\.open\s*\([^)]*['"](?:w|a|r\+|w\+|wb|ab|wt)/,
+      // B1: receiver-indirection write (File.send(:write,…), public_send…)
+      /\bFile\.send\s*\(\s*:?(?:write|binwrite|truncate|delete|unlink)\b/,
       /\bFileUtils\.(write|cp|cp_r|mv|rm|rm_f|rm_r|rm_rf|remove_file|remove_entry|remove_entry_secure|mkdir|mkdir_p|chmod|chown|symlink|link)\b/,
       /\bDir\.(mkdir|rmdir|delete|unlink)\b/,
       /\bIO\.(write|binwrite|truncate)\b/,
       /\bopen\s*\(\s*['"][|wa+]/,
+      // B1: Kernel.open(path, "w…") — mode in a later argument
+      /\bopen\s*\([^)]*,\s*['"](?:w|a|r\+|w\+|wb|ab)/,
       // process spawn / exec
       /\b(system|exec|spawn|fork|Process\.spawn|Process\.kill|IO\.popen)\b/,
       // pipe-open reads execute the command (IO.read("|dig …") etc.)
@@ -758,7 +765,16 @@ export async function scanCommandForEgress(
   // 3. Each command segment
   outer: for (const seg of splitSeparators(clean)) {
     if (hits.length >= MAX_HITS) break
-    const toks = tokenize(seg.replace(/^[A-Za-z_]\w*=\S+\s+/, ''))
+    // B8: strip every leading `VAR=value` env assignment, including quoted
+    // values (`CMD='curl https://evil/x' awk …`) — a bare regex previously
+    // only handled one unquoted `\S+` and left the interpreter hidden.
+    let segEnvStripped = seg
+    for (;;) {
+      const m = segEnvStripped.match(/^[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S+)\s+/)
+      if (!m) break
+      segEnvStripped = segEnvStripped.slice(m[0].length)
+    }
+    const toks = tokenize(segEnvStripped)
     if (toks.length === 0) continue
     const first = (toks[0] ?? '').split('/').pop()?.toLowerCase() ?? ''
     const lang = INTERPRETERS[first]
@@ -825,6 +841,15 @@ export async function scanCommandForEgress(
       while (i < toks.length) {
         const t = toks[i]
         if (t.startsWith('--file=')) { positionals.push(t.slice(7)); i++; continue }
+        if (t === '-f') { if (toks[i + 1]) { positionals.push(toks[i + 1]); i += 2 }; continue }
+        // B8: `-v name=value` (possibly quoted) assigns an awk variable that a
+        // `BEGIN{var|getline}` body may execute — skip BOTH tokens so the
+        // program text is scanned as code, not mistaken for a data file.
+        if (t === '-v') {
+          if (toks[i + 1]) i += 2
+          else i += 1
+          continue
+        }
         if (t.startsWith('-')) { i++; continue }
         if (!hasScriptFile && !sawProgram) {
           if (scanCode(t, 'awk', `inline:awk program`, hits)) state.unverifiable = true
