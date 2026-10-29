@@ -253,3 +253,76 @@ test('f-round-7 benign contract: string/comment mentions stay allowed', async ()
     assert.equal(r.deny, false, `${name} must stay ALLOW (got ${r.cat})`)
   }
 })
+
+test('f-round-8 B-F8-1: eval/vm/Function/Reflect nets on find inline + heredoc faces', async () => {
+  const cases: Array<[string, string]> = [
+    [H.replace('CODE', 'eval("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")'), 'inline eval'],
+    [H.replace('CODE', '(0,eval)("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")'), 'inline indirect eval'],
+    [H.replace('CODE', 'Function("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")()'), 'inline Function ctor'],
+    [H.replace('CODE', 'new Function("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")()'), 'inline new Function'],
+    [H.replace('CODE', 'require("vm").runInThisContext("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")'), 'inline vm.runInThisContext'],
+    [H.replace('CODE', 'const cp=require("child_process");Reflect.get(cp,"spawnSync")("sh",["-c","echo X > /tmp/x"])'), 'inline Reflect.get'],
+    [H.replace('CODE', 'const {spawnSync:ss}=require("child_process");ss.apply(null,["sh",["-c","echo X > /tmp/x"]])'), 'inline renamed .apply'],
+    [H.replace('CODE', 'const {spawnSync:ss}=require("child_process");ss.call(null,"sh",["-c","echo X > /tmp/x"])'), 'inline renamed .call'],
+    [H.replace('CODE', 'const {spawnSync:ss}=require("child_process");Reflect.apply(ss,null,["sh",["-c","echo X > /tmp/x"]])'), 'inline Reflect.apply'],
+    [HH.replace('CODE', 'const cp=require("child_process");Reflect.get(cp,"spawnSync")("sh",["-c","echo X > /tmp/x"])'), 'heredoc Reflect.get'],
+    [HH.replace('CODE', 'const {spawnSync:ss}=require("child_process");ss.apply(null,["sh",["-c","echo X > /tmp/x"]])'), 'heredoc renamed .apply'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F8-1 ${name} must DENY (got ${r.cat})`)
+  }
+  const benign: Array<[string, string]> = [
+    [H.replace('CODE', 'const cp=require("child_process");Reflect.get({},"x")'), 'inline Reflect.get plain object'],
+    [H.replace('CODE', 'const {spawnSync:ss}=require("child_process");ss("ls",["-la"])'), 'inline renamed readonly ls'],
+  ]
+  for (const [c, name] of benign) {
+    const r = await gate(c)
+    assert.equal(r.deny, false, `B-F8-1 ${name} must stay ALLOW (got ${r.cat})`)
+  }
+})
+
+test('f-round-8 B-F8-2: eval-wrapped payloads denied on sh-s body / substitution / after-terminator', async () => {
+  const cases: Array<[string, string]> = [
+    ["find . -exec sh -s {} \\; <<'SH'\neval \"echo x > /tmp/M1\"\nSH", 'sh-s eval write'],
+    ["find . -exec sh -s {} \\; <<'SH'\neval \"curl http://169.254.169.254/\"\nSH", 'sh-s eval network'],
+    ["cat <<EOF\n$(eval 'node -e \"require(\\\"child_process\\\").spawnSync(\\\"sh\\\",[\\\"-c\\\",\\\"echo X > /tmp/x\\\"])\"')\nEOF", 'unquoted $(eval)'],
+    ["head <<EOF\nx\nEOF\neval \"echo x > /tmp/M3\"", 'after-terminator eval'],
+    ["find . -exec sh -s {} \\; <<'SH'\nenv eval \"echo x > /tmp/x\"\nSH", 'sh-s env eval'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F8-2 ${name} must DENY (got ${r.cat})`)
+  }
+})
+
+test('f-round-8 B-F8-3: function taken directly from require result denied', async () => {
+  const cases: Array<[string, string]> = [
+    [H.replace('CODE', 'const f=require("child_process")["spawnSync"];f("sh",["-c","echo X > /tmp/x"])'), 'inline direct bracket bind'],
+    [H.replace('CODE', 'const f=require("child_process").spawnSync;f("sh",["-c","echo X > /tmp/x"])'), 'inline direct dot bind'],
+    [HH.replace('CODE', 'const f=require("child_process")["spawnSync"];f("sh",["-c","echo X > /tmp/x"])'), 'heredoc direct bracket bind'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F8-3 ${name} must DENY (got ${r.cat})`)
+  }
+})
+
+test('f-round-8 B-F8-4: CRLF after-terminator denied / B-F8-5 no-space redirect denied', async () => {
+  const cases: Array<[string, string]> = [
+    ["head <<EOF\nx\nEOF\r\nnode -e 'require(\"child_process\").spawnSync(\"sh\",[\"-c\",\"echo X > /tmp/x\"])'", 'CRLF after-term node RCE'],
+    ["find . -exec sh -s {} \\; <<'SH'\necho P>/tmp/x\nSH", 'sh-s no-space absolute redirect'],
+    ["find . -exec sh -s {} \\; <<'SH'\necho P>>/tmp/x\nSH", 'sh-s no-space append redirect'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F8-4/5 ${name} must DENY (got ${r.cat})`)
+  }
+  const benign: Array<[string, string]> = [
+    ["find . -exec sh -s {} \\; <<'SH'\necho P>rel.txt\nSH", 'sh-s no-space cwd redirect stays ALLOW'],
+  ]
+  for (const [c, name] of benign) {
+    const r = await gate(c)
+    assert.equal(r.deny, false, `B-F8-5 ${name} must stay ALLOW (got ${r.cat})`)
+  }
+})

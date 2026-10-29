@@ -703,8 +703,16 @@ function extractWritePaths(command: string): string[] {
       i++
       continue
     }
-    const glued = t.match(/^(?:\d?>>?|&>>?)(?![&\d])(.+)$/)
+    const glued = t.match(/^(?:\d?>>?|&>>?)(?![&\d=])(.+)$/)
     if (glued && glued[1]) paths.push(glued[1])
+    // B-F8-5: a word GLUED to the redirect operator with no space at all —
+    // `echo P>/tmp/x` / `echo P>>/tmp/x` — bash redirects onto the target
+    // even without whitespace, and the classifier must not let the
+    // cwd-constraint escape through the missing space. Only tokens that
+    // START with a non-redirect word match here (a bare `>file` token is
+    // already handled by the glued branch above).
+    const tailGlued = t.match(/^(.+?)(?<=[^=])(?:\d?>>?|&>>?)(?![&\d=])(.+)$/)
+    if (tailGlued && tailGlued[2]) paths.push(tailGlued[2])
   }
 
   // Glued WRITE-typed option values: `--output=…`, `--out=…`, `-o=…`,
@@ -2321,7 +2329,7 @@ function matchCatastrophic(command: string): ClassifyResult | null {
 function hasOutputRedirect(command: string): boolean {
   // Match >, >>, 1>, 1>>, &>, &>> but not 2> (stderr only)
   // and not when the target is /dev/null
-  const re = /(?:^|[\s;|&])(?:\d?>>?|&>>?)\s*([^\s;|&]+)/g
+  const re = /(?:^|[\s;|&]|(?<![&\d\w])[^=\s;|&])(?:\d?>>?|&>>?)(?![=])\s*([^\s;|&]+)/g
   let m: RegExpExecArray | null
   while ((m = re.exec(command)) !== null) {
     const target = m[1].replace(/^['"]|['"]$/g, '')
@@ -3766,8 +3774,15 @@ function heredocCodeThreat(st: string, allowRelativeWrite: boolean): { kind: 'de
   // wrote a cwd-relative path (`echo x > out.txt` → cwd + out.txt); only a
   // write OUTSIDE the cwd is a constraint violation.
   const targetOutside = (inner.targetPaths ?? []).some((p) => p.startsWith('/') && !p.startsWith(cwdPrefix) && p !== process.cwd())
+  // B-F8-2: `mixed` = the inner command mixes benign and dangerous parts
+  // (e.g. `eval "echo x > /tmp/x"` — eval-with-string classifies as mixed).
+  // The top-level sh -c face treats mixed as dangerous; the heredoc body
+  // must agree (B-F7-4 "sh -s walks sh -c constraints"), otherwise wrapping
+  // any payload in `eval "…"`/`$(eval …)`/post-terminator `eval …` would
+  // ride through all three new paths.
   if (inner.category === 'delete' || inner.category === 'network' || inner.category === 'unknown' ||
-      inner.category === 'system' || inner.category === 'file_write' && (!allowRelativeWrite || targetOutside)) {
+      inner.category === 'system' || inner.category === 'mixed' ||
+      inner.category === 'file_write' && (!allowRelativeWrite || targetOutside)) {
     return { kind: inner.category === 'delete' ? 'delete' : 'egress', signal: `${inner.category}: ${(inner.reason ?? '').slice(0, 40)}` }
   }
   return null
@@ -3787,7 +3802,10 @@ function heredocBodyDanger(command: string, depth = 0): { kind: 'delete' | 'egre
     const esc = delim.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const bodyStart = m.index + m[0].length
     const rest = command.slice(bodyStart)
-    const termRe = new RegExp(`\\n[ \\t]*${esc}(?=\\n|$)`)
+    // B-F8-4: tolerate a CR before the LF — bash accepts CRLF line endings,
+    // and a `EOF\r\nnode -e '<RCE>'` tail otherwise evades the terminator
+    // match (and thus the after-terminator scan).
+    const termRe = new RegExp(`\\n[ \\t]*${esc}\\r?(?=\\n|$)`)
     const tm = rest.match(termRe)
     if (!tm) continue
     const body = rest.slice(0, tm.index)
@@ -4694,6 +4712,14 @@ const F6_COMPUTED_BIND_RE =
 // prose; treat its presence as a marker (fail-closed).
 const F6_CP_MODULE_RE = /(?:require\s*\(\s*|from\s+)(?:["'`])child_process(?:["'`])/g
 
+// B-F8-1: node/js dynamic code-execution primitives on the find inline face —
+// the top-level classify and the heredoc face already fail closed on these;
+// the find -e face must not stay the escape hatch. Covers direct/indirect
+// eval, Function constructor, vm sandbox entry points, and string-arg
+// timers. Region-filtered by callers (string/comment mentions stay benign).
+const F8_JS_DYNAMIC_EXEC_RE =
+  /\b(?:eval|(?:0\s*,\s*eval))\s*\(|,\s*eval\s*\)\s*\(|\bFunction\s*\(|\bnew\s+Function\b|\b(?:vm|node:vm)\s*\.\s*(?:runInThisContext|runInNewContext|runInContext|compileFunction)\s*\(|require\s*\(\s*["'`]vm["'`]\s*\)\s*\.\s*(?:runInThisContext|runInNewContext|runInContext|compileFunction)\s*\(|\bnew\s+vm\.Script\b|\bsetTimeout\s*\(\s*["'`]|\bsetImmediate\s*\(\s*["'`]/g
+
 function f6AdjudicateCall(code: string, openIdx: number): string | null {
   const ca = f6CallArgs(code, openIdx)
   if (!ca) return null
@@ -4815,16 +4841,51 @@ function f6CpDispatchThreat(code: string): string | null {
     const verb = m[3] ?? m[4] ?? ''
     if (/^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(verb)) fvars.add(m[1])
   }
+  // B-F8-3: function taken DIRECTLY from the require result —
+  // `const f=require("child_process")["spawnSync"]` / `…).spawnSync` — the
+  // receiver is the module itself, not an alias, so fbindRe misses it.
+  const directBindRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*["'`]child_process["'`]\s*\)\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([A-Za-z_$][\w$]*?)["'`]\s*\])/g
+  while ((m = directBindRe.exec(code)) !== null) {
+    const verb = m[2] ?? m[3] ?? ''
+    if (/^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(verb)) fvars.add(m[1])
+  }
   // renamed/plain function variables invoked later: `ss(…)` — adjudicate like
   // a direct exec-family call (read-only binaries stay ALLOW).
   if (fvars.size > 0) {
-    const callRe = new RegExp(`\\b(?:${[...fvars].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*\\(`, 'g')
+    const fv = [...fvars].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+    // B-F8-1: also catch method-indirection calls on the renamed closure —
+    // `ss.apply(null,…)` / `ss.call(…)` bypass a bare `ss(` net.
+    const callRe = new RegExp(`\\b(?:${fv})(?:\\.\\s*(?:apply|call|bind)\\s*)?\\(`, 'g')
     let cm: RegExpExecArray | null
     while ((cm = callRe.exec(code)) !== null) {
       const openIdx = cm.index + cm[0].length - 1
       const t = f6AdjudicateCall(code, openIdx)
       if (t) return `renamed child_process function invoked: ${t}`
     }
+    // B-F8-1: `Reflect.apply(ss,null,[…])` forwards the renamed closure.
+    const raRe = new RegExp(`Reflect\\.\\s*apply\\s*\\(\\s*(?:${fv})\\s*,`, 'g')
+    let rm: RegExpExecArray | null
+    while ((rm = raRe.exec(code)) !== null) {
+      return 'renamed child_process function forwarded via Reflect.apply'
+    }
+  }
+  // B-F8-1: `Reflect.get(cp,"spawnSync")` / `Reflect.get(cp,"spawnSync")(…)` —
+  // member read through Reflect; the result may be bound or invoked, so an
+  // exec-family verb fails closed; any dynamic/concatenated verb also fails
+  // closed. A non-exec literal key (plain object member reads) stays benign.
+  const reflectGetRe = /Reflect\.\s*get\s*\(\s*([^,]+?)\s*,\s*["'`]([^"'`]*)["'`]\s*\)/g
+  let rgm: RegExpExecArray | null
+  while ((rgm = reflectGetRe.exec(code)) !== null) {
+    if (/^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(rgm[2])) {
+      return `Reflect.get child_process member ${rgm[2]}`
+    }
+  }
+  // Reflect.get with a dynamic/concatenated verb key — fail closed.
+  const reflectGetDynRe = /Reflect\.\s*get\s*\(\s*([^,]+?)\s*,\s*([^)]+)\)\s*\(/g
+  let rgd: RegExpExecArray | null
+  while ((rgd = reflectGetDynRe.exec(code)) !== null) {
+    const key = rgd[2].trim()
+    if (!/^["'`][^"'`]+["'`]$/.test(key)) return 'Reflect.get dynamic verb dispatch'
   }
   // square-bracket dispatch on an alias: `cp[m](…)` / `cp["spawn"+"Sync"](…)` / `` cp[`spawn${k}`](…) `` —
   // any non-literal-verb key fails closed; a literal exec-family key is adjudicated.
@@ -5232,6 +5293,13 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
         // benign body merely *mentioning* spawn/exec/child_process stays
         // allowed; an unterminated string keeps everything fail-closed.
         const literalPr = protectedRegions(literalCode)
+        // B-F8-1: node/js dynamic code execution (eval/vm/Function/timers) on
+        // the find inline face. Independent of the child_process marker —
+        // `eval("echo x > /tmp/x")` carries no cp marker yet must fail closed.
+        // Python keeps its own adjudication (f6PyThreat); do not widen here.
+        if (!/^python/.test(verb) && hasOutside(literalCode, F8_JS_DYNAMIC_EXEC_RE, literalPr)) {
+          return { kind: 'egress', signal: `${verb} inline dynamic code execution (eval/vm/Function)` }
+        }
         const cpMarker = hasOutside(literalCode, /child_process|\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/, literalPr) ||
           F6_MEMBER_SLOT_RE.test(literalCode) || F6_CP_MODULE_RE.test(literalCode)
         if (cpMarker) {
