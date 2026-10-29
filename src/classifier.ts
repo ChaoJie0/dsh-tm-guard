@@ -4712,18 +4712,43 @@ const F6_COMPUTED_BIND_RE =
 // prose; treat its presence as a marker (fail-closed).
 const F6_CP_MODULE_RE = /(?:require\s*\(\s*|from\s+)(?:["'`])child_process(?:["'`])/g
 
-// B-F8-1: node/js dynamic code-execution primitives on the find inline face —
-// the top-level classify and the heredoc face already fail closed on these;
-// the find -e face must not stay the escape hatch. Covers direct/indirect
-// eval, Function constructor, vm sandbox entry points, and string-arg
-// timers. Region-filtered by callers (string/comment mentions stay benign).
-const F8_JS_DYNAMIC_EXEC_RE =
-  /\b(?:eval|(?:0\s*,\s*eval))\s*\(|,\s*eval\s*\)\s*\(|\bFunction\s*\(|\bnew\s+Function\b|\b(?:vm|node:vm)\s*\.\s*(?:runInThisContext|runInNewContext|runInContext|compileFunction)\s*\(|require\s*\(\s*["'`]vm["'`]\s*\)\s*\.\s*(?:runInThisContext|runInNewContext|runInContext|compileFunction)\s*\(|\bnew\s+vm\.Script\b|\bsetTimeout\s*\(\s*["'`]|\bsetImmediate\s*\(\s*["'`]/g
+// B-F8-1 note: the original literal-token dynamic-exec net
+// (F8_JS_DYNAMIC_EXEC_RE) is superseded by f8JsDynExecThreat (B-F9-1), which
+// covers the same primitives plus alias/method/constructor-chain/bracket-dynamic
+// forms. The literal net is deliberately removed so the two cannot drift.
 
-function f6AdjudicateCall(code: string, openIdx: number): string | null {
+/**
+ * B-F9 (dsh review 936a6fc): adjudicate an exec-family call site. `skipMode`
+ * accounts for method-indirection arg layouts that differ from a direct call:
+ *   - 0: direct call — argv starts at parts[0]
+ *   - 1: `.call(…)` — parts[0] is thisArg, argv starts at parts[1]
+ *   - 2: `.apply(…)` / `Reflect.apply(fn,thisArg,argvArray)` — parts[0] is
+ *     thisArg, parts[1] is the argv ARRAY literal; quoted elements are pulled
+ *     out of the array (read-only `ss.apply(null,['ls',['-la']])` stays ALLOW,
+ *     matching the bare `ss('ls')` contract).
+ */
+function f6AdjudicateCall(code: string, openIdx: number, skipMode = 0): string | null {
   const ca = f6CallArgs(code, openIdx)
   if (!ca) return null
-  const parts = f6SplitArgs(ca.args)
+  let parts = f6SplitArgs(ca.args)
+  if (skipMode > 0) {
+    if (parts.length <= skipMode) return 'exec-family call with no argv'
+    parts = parts.slice(skipMode)
+    // apply-style indirections forward argv as an array literal in the first
+    // remaining parameter (`ss.apply(thisArg,['sh',['-c',…]])`,
+    // `Reflect.apply(fn,thisArg,['sh',…])`): pull quoted elements out as the
+    // argv so a read-only `ss.apply(null,['ls',['-la']])` stays ALLOW,
+    // matching the bare `ss('ls')` contract.
+    const arr0 = parts[0].trim()
+    if (arr0.startsWith('[')) {
+      const els = [...arr0.matchAll(/["']([^"']*)["']/g)].map((x) => x[1])
+      if (els.length === 0) return 'exec-family apply with empty argv array'
+      parts = els.map((e) => `'${e}'`)
+    } else if (arr0.startsWith('`')) {
+      // backtick-wrapped apply argv array is not a literal — fail closed
+      return `non-literal apply argv array (${arr0.slice(0, 24)})`
+    }
+  }
   if (parts.length === 0) return 'exec-family call with no argv'
   const first = parts[0].trim()
   const lit0 = first.match(/^["']([^"']*)["']$/)
@@ -4752,14 +4777,23 @@ function f6AdjudicateCall(code: string, openIdx: number): string | null {
 
 function f6ExecThreat(code: string): string | null {
   const pr = protectedRegions(code)
-  const re = /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*(?:\[[^\]]*\])?\s*\(/g
+  // B-F9-1 (dsh review 936a6fc): `cp.spawnSync.apply(cp,[argv])` / `.call(…)`
+  // bypassed the bare `spawnSync(` net — the verb is followed by a method
+  // indirection, not an opening paren. Match the optional indirection and
+  // adjudicate with the matching skipMode (apply: thisArg + argv array).
+  const re = /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*(?:\[[^\]]*\])?\s*(?:\.\s*(?:apply|call|bind)\s*)?\(/g
   re.lastIndex = 0
   let m: RegExpExecArray | null
   while ((m = re.exec(code)) !== null) {
     const inRegion = pr.regions.some(([s, e]) => m!.index >= s && m!.index < e)
     if (!pr.unterminated && inRegion) continue
+    const ind = m[0].match(/\.\s*(apply|call|bind)\s*\($/)
+    // method indirection: `.call(thisArg,argv…)` and `.apply(thisArg,argvArray)`
+    // both skip the thisArg (skipMode 1); the argv array is unwrapped inside
+    // f6AdjudicateCall. `Reflect.apply(fn,thisArg,argvArray)` skips two.
+    const skipMode = ind ? 1 : 0
     const openIdx = m.index + m[0].length - 1
-    const t = f6AdjudicateCall(code, openIdx)
+    const t = f6AdjudicateCall(code, openIdx, skipMode)
     if (t) return t
   }
   // member-slot call shape (template/string keys): not region-filtered — the
@@ -4786,6 +4820,107 @@ function f6ExecThreat(code: string): string | null {
     const inRegion = pr.regions.some(([s, e]) => bm!.index >= s && bm!.index < e)
     if (!pr.unterminated && inRegion) continue
     return 'exec-family binding (variable invoked later, unverifiable)'
+  }
+  return null
+}
+
+/**
+ * B-F9-1 (dsh review 936a6fc): the literal-token dynamic-exec net
+ * (F8_JS_DYNAMIC_EXEC_RE) was trivially bypassed on the find inline face by
+ * method references, aliases, generic constructor chains, and bracket-dynamic
+ * keys — `eval.call(…)`, `var e=eval; e(…)`, `[].constructor.constructor(…)`,
+ * `var v=require("vm"); v.runInThisContext(…)`, `globalThis["eva"+"l"](…)`,
+ * `new (require("vm").Script)(…)`. These primitives can execute an arbitrary
+ * string, so every reachable invocation form fails closed here (string/comment
+ * mentions are excluded via region filtering). `eval`/`Function`/`vm` constant
+ * bodies are intentionally NOT trusted — matching the fail-closed posture the
+ * heredoc/top-level faces already take — the tradeoff is declared rather than
+ * hidden.
+ */
+function f8JsDynExecThreat(code: string, pr: { regions: Array<[number, number]>; unterminated: boolean }): string | null {
+  const outside = (idx: number) => !pr.unterminated && pr.regions.some(([s, e]) => idx >= s && idx < e)
+  // direct + indirect eval invocation forms
+  const evalCallRe = /\beval\s*\(|(?:0\s*,\s*eval|,\s*eval)\s*\)\s*\(|\beval\s*\.\s*(?:call|apply)\s*\(/g
+  for (const m of code.matchAll(evalCallRe)) {
+    if (!outside(m.index)) return `dynamic code execution: eval invocation (${m[0].slice(0, 20)})`
+  }
+  // eval bound to a variable (`var e=eval`) then invoked — alias tracking
+  const evalAliasRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:globalThis\s*\[\s*["'`]eval["'`]\s*\]|(?:\bglobalThis\s*\.\s*)?eval)\b/g
+  for (const m of code.matchAll(evalAliasRe)) {
+    if (outside(m.index)) continue
+    const aliasRe = new RegExp(`\\b${m[1]}\\s*\\(`, 'g')
+    for (const c of code.matchAll(aliasRe)) {
+      if (!outside(c.index)) return `dynamic code execution: eval alias ${m[1]} invoked`
+    }
+  }
+  // bracket-dynamic eval on the global object: `globalThis["eva"+"l"](…)`
+  const globalEvalRe = /globalThis\s*\[\s*["'`](?:eva["'`]\s*\+\s*["'`]l|eval)["'`]\s*\]\s*\(/g
+  for (const m of code.matchAll(globalEvalRe)) {
+    if (!outside(m.index)) return `dynamic code execution: global bracket eval`
+  }
+  // Reflect.get(globalThis,"eval")(…)
+  const refEvalRe = /Reflect\.\s*get\s*\(\s*globalThis\s*,\s*["'`]eval["'`]\s*\)\s*\(/g
+  for (const m of code.matchAll(refEvalRe)) {
+    if (!outside(m.index)) return `dynamic code execution: Reflect.get global eval`
+  }
+  // Function constructor: direct, new, call/apply method, alias, global bracket, ctor chain
+  const funcCallRe = /\bFunction\s*\(|\bnew\s+Function\s*\(|\bFunction\s*\.\s*(?:call|apply)\s*\(/g
+  for (const m of code.matchAll(funcCallRe)) {
+    if (!outside(m.index)) return `dynamic code execution: Function constructor (${m[0].slice(0, 20)})`
+  }
+  const funcAliasRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:globalThis\s*\[\s*["'`]Function["'`]\s*\]|(?:\bglobalThis\s*\.\s*)?Function)\b/g
+  for (const m of code.matchAll(funcAliasRe)) {
+    if (outside(m.index)) continue
+    const aliasRe = new RegExp(`\\b${m[1]}\\s*\\(`, 'g')
+    for (const c of code.matchAll(aliasRe)) {
+      if (!outside(c.index)) return `dynamic code execution: Function alias ${m[1]} invoked`
+    }
+  }
+  const globalFuncRe = /globalThis\s*\[\s*["'`](?:Func["'`]\s*\+\s*["'`]tion|Function)["'`]\s*\]\s*\(/g
+  for (const m of code.matchAll(globalFuncRe)) {
+    if (!outside(m.index)) return `dynamic code execution: global bracket Function`
+  }
+  const refFuncRe = /Reflect\.\s*get\s*\(\s*globalThis\s*,\s*["'`]Function["'`]\s*\)\s*\(/g
+  for (const m of code.matchAll(refFuncRe)) {
+    if (!outside(m.index)) return `dynamic code execution: Reflect.get global Function`
+  }
+  // generic constructor chain: `[].constructor.constructor(…)` and the
+  // single-link `(function(){}).constructor(…)` — the Function constructor is
+  // reachable through ANY value's `.constructor` property when that value is a
+  // function, so a member `.constructor(` invocation fails closed (a bare
+  // `o.constructor` READ or a `o.constructor === X` comparison has no `(` and
+  // stays benign).
+  const ctorChainRe = /\.\s*constructor\s*\(/g
+  for (const m of code.matchAll(ctorChainRe)) {
+    if (!outside(m.index)) return `dynamic code execution: generic constructor chain`
+  }
+  // vm entry points: direct member, require().method, alias-bound receiver,
+  // paren Script (`new (require("vm").Script)(…)` and bare `require("vm").Script(…)` — the
+  // latter throws on Node 26 but is covered as defense-in-depth).
+  const vmModuleRe = /require\s*\(\s*["'`](?:node:)?vm["'`]\s*\)/g
+  for (const m of code.matchAll(vmModuleRe)) {
+    if (outside(m.index)) continue
+    const tail = code.slice(m.index + m[0].length)
+    if (/(?:\.\s*(?:runInThisContext|runInNewContext|runInContext|compileFunction)\s*\(|\.\s*Script\s*\(|\)?\s*\.\s*Script\s*\()/.test(tail)) {
+      return `dynamic code execution: vm entry point via require`
+    }
+  }
+  const vmMemberRe = /\b(?:vm|node:vm)\s*\.\s*(?:runInThisContext|runInNewContext|runInContext|compileFunction)\s*\(|\bnew\s+vm\.Script\s*\(/g
+  for (const m of code.matchAll(vmMemberRe)) {
+    if (!outside(m.index)) return `dynamic code execution: vm member entry point`
+  }
+  const vmAliasRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*["'`](?:node:)?vm["'`]\s*\)/g
+  for (const m of code.matchAll(vmAliasRe)) {
+    if (outside(m.index)) continue
+    const aliasRe = new RegExp(`\\b${m[1]}\\s*\\.\\s*(?:runInThisContext|runInNewContext|runInContext|compileFunction)\\s*\\(`, 'g')
+    for (const c of code.matchAll(aliasRe)) {
+      if (!outside(c.index)) return `dynamic code execution: vm alias ${m[1]} entry point`
+    }
+  }
+  // string-arg timers (Node 26 rejects string callbacks — defense in depth)
+  const timerRe = /\bset(?:Timeout|Immediate)\s*\(\s*["'`]/g
+  for (const m of code.matchAll(timerRe)) {
+    if (!outside(m.index)) return `dynamic code execution: string-arg timer`
   }
   return null
 }
@@ -4850,35 +4985,56 @@ function f6CpDispatchThreat(code: string): string | null {
     if (/^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(verb)) fvars.add(m[1])
   }
   // renamed/plain function variables invoked later: `ss(…)` — adjudicate like
-  // a direct exec-family call (read-only binaries stay ALLOW).
+  // a direct exec-family call (read-only binaries stay ALLOW). B-F9-1: the
+  // method-indirection forms `.apply(…)`/`.call(…)` are adjudicated with the
+  // matching skipMode so a read-only `ss.apply(null,['ls',['-la']])` /
+  // `ss.call(null,'ls',['-la'])` stays ALLOW — consistent with bare `ss('ls')`.
   if (fvars.size > 0) {
     const fv = [...fvars].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
-    // B-F8-1: also catch method-indirection calls on the renamed closure —
-    // `ss.apply(null,…)` / `ss.call(…)` bypass a bare `ss(` net.
     const callRe = new RegExp(`\\b(?:${fv})(?:\\.\\s*(?:apply|call|bind)\\s*)?\\(`, 'g')
     let cm: RegExpExecArray | null
     while ((cm = callRe.exec(code)) !== null) {
+      const ind = cm[0].match(/\.\s*(apply|call|bind)\s*\($/)
+      // `.apply(thisArg,argvArray)` and `.call(thisArg,argv…)` both skip one
+      // (the thisArg); the argv array is unwrapped inside f6AdjudicateCall.
+      const skipMode = ind ? 1 : 0
       const openIdx = cm.index + cm[0].length - 1
-      const t = f6AdjudicateCall(code, openIdx)
+      const t = f6AdjudicateCall(code, openIdx, skipMode)
       if (t) return `renamed child_process function invoked: ${t}`
     }
-    // B-F8-1: `Reflect.apply(ss,null,[…])` forwards the renamed closure.
+    // B-F9-1: `Reflect.apply(ss,null,[…])` forwards the renamed closure.
+    // A literal argv array is adjudicated (read-only stays ALLOW, matching
+    // `ss.apply(null,['ls',['-la']])`); non-literal argv fails closed.
     const raRe = new RegExp(`Reflect\\.\\s*apply\\s*\\(\\s*(?:${fv})\\s*,`, 'g')
     let rm: RegExpExecArray | null
     while ((rm = raRe.exec(code)) !== null) {
-      return 'renamed child_process function forwarded via Reflect.apply'
+      const openIdx = code.indexOf('(', rm.index)
+      const t = f6AdjudicateCall(code, openIdx, 2)
+      if (t) return `renamed child_process function forwarded via Reflect.apply: ${t}`
     }
   }
-  // B-F8-1: `Reflect.get(cp,"spawnSync")` / `Reflect.get(cp,"spawnSync")(…)` —
-  // member read through Reflect; the result may be bound or invoked, so an
-  // exec-family verb fails closed; any dynamic/concatenated verb also fails
-  // closed. A non-exec literal key (plain object member reads) stays benign.
+  // B-F8-1 / B-F9-1: `Reflect.get(cp,"spawnSync")` / `Reflect.get(cp,"spawnSync")(…)` —
+  // member read through Reflect. A literal exec-family key with an IMMEDIATE
+  // call is adjudicated like a direct call (read-only argv stays ALLOW, matching
+  // the bare `cp["spawnSync"]('ls')` contract); the same key WITHOUT an
+  // immediate call may be bound and invoked later — fail closed. Any
+  // dynamic/concatenated verb also fails closed. A non-exec literal key (plain
+  // object member reads) stays benign.
   const reflectGetRe = /Reflect\.\s*get\s*\(\s*([^,]+?)\s*,\s*["'`]([^"'`]*)["'`]\s*\)/g
   let rgm: RegExpExecArray | null
   while ((rgm = reflectGetRe.exec(code)) !== null) {
-    if (/^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(rgm[2])) {
-      return `Reflect.get child_process member ${rgm[2]}`
+    if (!/^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(rgm[2])) continue
+    // is there an immediate invocation right after the Reflect.get closing paren?
+    const callIdx = code.indexOf('(', rgm.index + rgm[0].length)
+    const openAt = rgm.index + rgm[0].length
+    let immediateCall = false
+    if (callIdx >= 0) {
+      const between = code.slice(openAt, callIdx)
+      if (/^[\s]*$/.test(between)) immediateCall = true
     }
+    if (!immediateCall) return `Reflect.get child_process member ${rgm[2]} (bound, invoked later)`
+    const t = f6AdjudicateCall(code, callIdx)
+    if (t) return `Reflect.get child_process member ${rgm[2]}: ${t}`
   }
   // Reflect.get with a dynamic/concatenated verb key — fail closed.
   const reflectGetDynRe = /Reflect\.\s*get\s*\(\s*([^,]+?)\s*,\s*([^)]+)\)\s*\(/g
@@ -4886,6 +5042,28 @@ function f6CpDispatchThreat(code: string): string | null {
   while ((rgd = reflectGetDynRe.exec(code)) !== null) {
     const key = rgd[2].trim()
     if (!/^["'`][^"'`]+["'`]$/.test(key)) return 'Reflect.get dynamic verb dispatch'
+  }
+  // B-F9-2 (dsh review 936a6fc): `Reflect.apply(cp[v],cp,[…])` /
+  // `Reflect.apply(cp["sp"+"awnSync"],cp,[…])` — an alias member forwarded
+  // through Reflect.apply. A dynamic/concatenated key cannot be adjudicated
+  // (fail closed); a literal exec-family key is adjudicated on the argv array
+  // (read-only stays ALLOW, matching direct `cp["spawnSync"](…)`).
+  if (cpAliases.size > 0) {
+    const raDynRe = new RegExp(`Reflect\\.\\s*apply\\s*\\(\\s*(?:${[...cpAliases].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*\\[`, 'g')
+    let rdm: RegExpExecArray | null
+    while ((rdm = raDynRe.exec(code)) !== null) {
+      const keyStart = code.indexOf('[', rdm.index)
+      const keyEnd = code.indexOf(']', keyStart)
+      const key = code.slice(keyStart + 1, keyEnd).trim()
+      const litKey = key.match(/^(?:`|'|")([^`'"]+)(?:`|'|")$/)
+      if (litKey && /^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(litKey[1])) {
+        const openIdx = code.indexOf('(', rdm.index)
+        const t = f6AdjudicateCall(code, openIdx, 2)
+        if (t) return `child_process alias member via Reflect.apply: ${t}`
+        continue
+      }
+      return 'child_process alias member forwarded via Reflect.apply (dynamic key)'
+    }
   }
   // square-bracket dispatch on an alias: `cp[m](…)` / `cp["spawn"+"Sync"](…)` / `` cp[`spawn${k}`](…) `` —
   // any non-literal-verb key fails closed; a literal exec-family key is adjudicated.
@@ -5297,8 +5475,12 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
         // the find inline face. Independent of the child_process marker —
         // `eval("echo x > /tmp/x")` carries no cp marker yet must fail closed.
         // Python keeps its own adjudication (f6PyThreat); do not widen here.
-        if (!/^python/.test(verb) && hasOutside(literalCode, F8_JS_DYNAMIC_EXEC_RE, literalPr)) {
-          return { kind: 'egress', signal: `${verb} inline dynamic code execution (eval/vm/Function)` }
+        if (!/^python/.test(verb)) {
+          // B-F9-1: replace the literal-token net with the alias/method/ctor/bracket
+          // aware f8JsDynExecThreat (eval.call, eval alias, constructor chains,
+          // vm alias, bracket-dynamic keys, Reflect.get(globalThis,…)).
+          const jsDyn = f8JsDynExecThreat(literalCode, literalPr)
+          if (jsDyn) return { kind: 'egress', signal: `${verb} ${jsDyn}` }
         }
         const cpMarker = hasOutside(literalCode, /child_process|\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/, literalPr) ||
           F6_MEMBER_SLOT_RE.test(literalCode) || F6_CP_MODULE_RE.test(literalCode)

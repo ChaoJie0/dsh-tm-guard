@@ -326,3 +326,59 @@ test('f-round-8 B-F8-4: CRLF after-terminator denied / B-F8-5 no-space redirect 
     assert.equal(r.deny, false, `B-F8-5 ${name} must stay ALLOW (got ${r.cat})`)
   }
 })
+
+test('f-round-9 B-F9-1: indirect dynamic-exec forms denied on find inline (alias/method/ctor/bracket/vm)', async () => {
+  // NOTE: CODE must stay single-quote-free — the outer find -e template wraps
+  // it in single quotes and an inner quote would truncate extraction. All
+  // indirect forms below use double-quoted payload strings.
+  const cases: Array<[string, string]> = [
+    [H.replace('CODE', 'eval.call(null,"require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")'), 'inline eval.call'],
+    [H.replace('CODE', 'eval.apply(null,["require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])"])'), 'inline eval.apply'],
+    [H.replace('CODE', 'var e=eval;e("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")'), 'inline eval alias'],
+    [H.replace('CODE', '(0,eval)("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")'), 'inline indirect eval comma'],
+    [H.replace('CODE', 'Function.call(null,"return require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")()'), 'inline Function.call'],
+    [H.replace('CODE', '[].constructor.constructor("return require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")()'), 'inline ctor chain'],
+    [H.replace('CODE', '(function(){}).constructor("return require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")()'), 'inline fn ctor single-link'],
+    [H.replace('CODE', 'var v=require("vm");v.runInThisContext("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")'), 'inline vm alias'],
+    [H.replace('CODE', 'new (require("vm").Script)("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])").runInThisContext()'), 'inline vm Script new'],
+    [H.replace('CODE', 'globalThis["eva"+"l"]("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")'), 'inline bracket concat eval'],
+    [H.replace('CODE', 'Reflect.get(globalThis,"eval")("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])")'), 'inline Reflect.get global eval'],
+    [H.replace('CODE', 'setTimeout("require(\\"child_process\\").spawnSync(\\"sh\\",[\\"-c\\",\\"echo X > /tmp/x\\"])",1)'), 'inline string-arg timer'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F9-1 ${name} must DENY (got ${r.cat})`)
+  }
+})
+
+test('f-round-9 B-F9-2: Reflect.apply/get dynamic-member dispatch denied, read-only argv stays ALLOW', async () => {
+  const deny: Array<[string, string]> = [
+    [H.replace('CODE', 'const cp=require("child_process");var v="spawnSync";Reflect.apply(cp[v],cp,["sh",["-c","echo X > /tmp/x"]])'), 'inline reflect.apply dynamic member'],
+    [H.replace('CODE', 'const cp=require("child_process");Reflect.apply(cp["sp"+"awnSync"],cp,["sh",["-c","echo X > /tmp/x"]])'), 'inline reflect.apply concat key'],
+    [H.replace('CODE', 'const cp=require("child_process");Reflect.get(cp,"sp"+"awnSync")("sh",["-c","echo X > /tmp/x"])'), 'inline reflect.get concat key'],
+    [HH.replace('CODE', 'const cp=require("child_process");var v="spawnSync";Reflect.apply(cp[v],cp,["sh",["-c","echo X > /tmp/x"]])'), 'heredoc reflect.apply dynamic member'],
+    [HH.replace('CODE', 'const cp=require("child_process");cp.spawnSync.apply(cp,["sh",["-c","echo X > /tmp/x"]])'), 'heredoc cp.spawnSync.apply'],
+    [HH.replace('CODE', 'const cp=require("child_process");cp.spawnSync.call(cp,"sh",["-c","echo X > /tmp/x"])'), 'heredoc cp.spawnSync.call'],
+    [H.replace('CODE', 'const cp=require("child_process");var f=Reflect.get(cp,"spawnSync");f("sh",["-c","echo X > /tmp/x"])'), 'inline Reflect.get bound then invoked'],
+    // heredoc face: any require("child_process") body stays fail-closed via the
+    // pre-existing F6_CP_MODULE_RE gate regardless of argv (read-only included).
+    [HH.replace('CODE', 'const cp=require("child_process");cp.spawnSync.apply(cp,["ls",["-la"]])'), 'heredoc cp.spawnSync.apply readonly fails closed'],
+  ]
+  for (const [c, name] of deny) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F9-2 ${name} must DENY (got ${r.cat})`)
+  }
+  const allow: Array<[string, string]> = [
+    [H.replace('CODE', 'const {spawnSync:ss}=require("child_process");ss.apply(null,["ls",["-la"]])'), 'inline renamed .apply readonly'],
+    [H.replace('CODE', 'const {spawnSync:ss}=require("child_process");ss.call(null,"ls",["-la"])'), 'inline renamed .call readonly'],
+    [H.replace('CODE', 'const cp=require("child_process");Reflect.apply(cp["spawnSync"],cp,["ls",["-la"]])'), 'inline Reflect.apply literal readonly'],
+    [H.replace('CODE', 'const {spawnSync:ss}=require("child_process");Reflect.apply(ss,null,["ls",["-la"]])'), 'inline Reflect.apply fvar readonly'],
+    [H.replace('CODE', 'const cp=require("child_process");Reflect.get(cp,"spawnSync")("ls",["-la"])'), 'inline Reflect.get literal readonly'],
+    [H.replace('CODE', 'var o={x:1};Reflect.get(o,"x")'), 'inline plain object Reflect.get'],
+    [H.replace('CODE', 'console.log("eval.call(1)")'), 'inline string eval mention'],
+  ]
+  for (const [c, name] of allow) {
+    const r = await gate(c)
+    assert.equal(r.deny, false, `B-F9-2 ${name} must stay ALLOW (got ${r.cat})`)
+  }
+})
