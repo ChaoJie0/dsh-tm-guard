@@ -5523,6 +5523,12 @@ function f6JsDanger(code: string): string | null {
         let base = t
         const dq = t.indexOf('=')
         if (dq !== -1) base = t.slice(0, dq).trim()
+        if (base.startsWith('[') && base.includes(':')) {
+          // computed key destructure — ["value"]:f — colon at depth 0 after
+          // the bracketed key names the binding
+          const m2 = base.match(/^\s*\[\s*[^\]]+\]\s*:\s*([A-Za-z_$][\w$]*)/)
+          if (m2) { out.push(m2[1]); continue }
+        }
         if (base.startsWith('[') || base.startsWith('{')) { walk(base.slice(1, -1)); continue }
         let depth = 0, inStr: string | null = null, colon = -1
         for (let i = 0; i < base.length; i++) {
@@ -5628,18 +5634,64 @@ function f6JsDanger(code: string): string | null {
   }
   // f-round-14 B-F14-2: catch parameters that receive a thrown source —
   // try{throw eval}catch(e){} / catch([e]) — the binding inherits the throw
-  // expression's source kind (AC17/X1/Y1 family)
+  // expression's source kind (AC17/X1/Y1 family). f-round-15 B-F15-3: the
+  // throw may sit inside a nested block / function / arrow body or throw a
+  // member read (globalThis.eval) — pair EVERY thrown source with the next
+  // catch parameter after it instead of requiring literal adjacency.
   const catchBind = new Map<string, string>()
-  for (const m of stripped.matchAll(/try\s*\{[^}]*?\bthrow\s+([^;{}]+?)\s*(?=[;}])[^}]*?\}\s*catch\s*\(\s*([A-Za-z_$][\w$]*|\[[\s\S]*?\])\s*\)/g)) {
-    const src = m[1].trim()
-    const names = m[2].startsWith('[') ? patternNames(m[2]) : [m[2]]
-    for (const nm of names) catchBind.set(nm, src)
+  {
+    const throwSrcs: Array<{ idx: number; src: string }> = []
+    for (const m of stripped.matchAll(/\bthrow\s+((?:(?:globalThis|globalThis\s*\.\s*self)\s*\.\s*)?(?:eval|Function)\b|\brequire\s*\(\s*["'\x60](?:node:)?child_process["'\x60]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'\x60]child_process["'\x60]\s*\))/g)) {
+      throwSrcs.push({ idx: m.index, src: m[1].trim() })
+    }
+    const catchParams: Array<{ idx: number; name: string }> = []
+    for (const m of stripped.matchAll(/\bcatch\s*\(\s*([A-Za-z_$][\w$]*|\[[\s\S]*?\])\s*\)/g)) {
+      catchParams.push({ idx: m.index, name: m[1].trim() })
+    }
+    for (const t of throwSrcs) {
+      const c = catchParams.find((cc) => cc.idx > t.idx)
+      if (c) {
+        const names = c.name.startsWith('[') ? patternNames(c.name) : [c.name]
+        for (const nm of names) catchBind.set(nm, t.src)
+      }
+    }
+  }
+  // f-round-15 B-F15-3: a function/arrow returning an array containing a
+  // dynamic source hands that source out — `function f(){return[eval]}` /
+  // `()=>[Function]`. A destructure whose RHS calls such a function, is an
+  // IIFE, or awaits a source-array inherits the dyn seed (B2-28/29/47).
+  const retArrFn = new Set<string>()
+  for (const m of stripped.matchAll(/\bfunction\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{[\s\S]*?\breturn\s*\[[\s\S]*?\b(?:eval|Function)\b[\s\S]*?\]/g)) {
+    retArrFn.add(m[1])
+  }
+  const dynSeedNames = new Set<string>()
+  {
+    const dynRhsRe = (rhs: string): boolean => {
+      const t = rhs.trim()
+      if (retArrFn.size > 0 && new RegExp(`^(?:${[...retArrFn].map(esc).join('|')})\\s*\\(`).test(t)) return true
+      if (/^\(\(\)\s*=>\s*\[[\s\S]*?\b(?:eval|Function)\b/.test(t)) return true
+      if (/^await\s+\[[\s\S]*?\b(?:eval|Function)\b/.test(t)) return true
+      return false
+    }
+    for (const [nm, rhs] of rhsMap) {
+      if (dynRhsRe(rhs)) dynSeedNames.add(nm)
+    }
   }
   // f-round-14 B-F14-1: descriptor-of-source bindings — `var d=desc(SRC)` is a
   // descriptor container whose `.value` is the exec member value (descVal)
   const descBind = new Set<string>()
-  for (const m of stripped.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:(?:Object\.)?getOwnPropertyDescriptor|Reflect\.getOwnPropertyDescriptor|(?:Object\.)?getOwnPropertyDescriptors)\s*\(/g)) {
-    descBind.add(m[1])
+  for (const m of stripped.matchAll(/\b(?:const|let|var)\s+(\{[^=;]*\}|\[[^\]]*\]|[A-Za-z_$][\w$]*)\s*=\s*(?:(?:Object\.)?getOwnPropertyDescriptor|Reflect\.getOwnPropertyDescriptor|(?:Object\.)?getOwnPropertyDescriptors)\s*\(/g)) {
+    for (const nm of patternNames(m[1])) descBind.add(nm)
+  }
+  // f-round-15 B-F15-3: nested destructure default values —
+  // {value:[e]=[eval]} / [a=[Function]] — the default expression is the
+  // binding's value even when the RHS supplies no explicit member (AG7)
+  {
+    const defRe = /\[([A-Za-z_$][\w$]*|\[[^\]]*\])\]\s*=\s*((?:\[[\s\S]*?\])|(?:[A-Za-z_$][\w$]*)|(?:\w+\([^)]*\)))(?=\s*[,}\]])/g
+    for (const m of stripped.matchAll(defRe)) {
+      const names = patternNames(m[1])
+      for (const nm of names) rhsMap.set(nm, m[2].trim())
+    }
   }
   // module-name variables: var n = "child_process" / "child" + "_process"
   const modNames = new Set<string>()
@@ -5657,6 +5709,7 @@ function f6JsDanger(code: string): string | null {
   const modReq = new Set<string>()
   const gbmF = new Set<string>()
   const dyn = new Set<string>()
+  for (const nm of dynSeedNames) dyn.add(nm)
   const dynC = new Set<string>()
   const gAlias = new Set<string>()
   const refGet = new Set<string>()
@@ -5666,6 +5719,7 @@ function f6JsDanger(code: string): string | null {
   const fAlias = new Set<string>()
   const desc = new Set<string>()
   const descVal = new Set<string>()
+  for (const nm of descBind) descVal.add(nm)
   const marks = new Map<string, Set<string>>()
 
   const namesOf = (set: Set<string>) => [...set].map(esc).join('|') || '(?!x)x'
@@ -5707,6 +5761,7 @@ function f6JsDanger(code: string): string | null {
     if (/^\{\s*[A-Za-z_$][\w$]*\s*:\s*Reflect\.\s*get\s*\}$/.test(t) || new RegExp(`^${namesOf(refGetMem)}$`).test(t)) res.add('refGetMem')
     if (/^globalThis$/.test(t) || new RegExp(`^${namesOf(gAlias)}$`).test(t)) res.add('gAlias')
     if (/^eval$/.test(t) || /^Function$/.test(t) ||
+        /^globalThis\s*\.\s*(?:eval|Function)$/.test(t) ||
         /^globalThis\s*\[\s*["'`](?:eval|Function|eva["'`]\s*\+\s*["'`]l|Func["'`]\s*\+\s*["'`]tion)["'`]\s*\]$/.test(t) ||
         /^\[\]\s*\.\s*constructor(?:\s*\.\s*constructor)?$/.test(t) ||
         /^\(\[\]\)\s*\.\s*constructor(?:\s*\.\s*constructor)?$/.test(t) ||
@@ -5737,9 +5792,19 @@ function f6JsDanger(code: string): string | null {
       // [require("child_process").spawnSync] / [cp.execFileSync]
       if (new RegExp(`(?:${CP_MOD})|(?:${namesOf(cp)})\\b`).test(inner) &&
           /\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/.test(inner)) res.add('derived')
+      // f-round-15 B-F15-1: container of an exec-member VALUE — [f] (f in descVal)
+      if (new RegExp(`\\b(?:${namesOf(descVal)})\\b`).test(inner)) res.add('descVal')
     }
     if (new RegExp(`^(?:(?:Object\\.)?getOwnPropertyDescriptor|Reflect\\.getOwnPropertyDescriptor|(?:Object\\.)?getOwnPropertyDescriptors)\\s*\\(\\s*(?:${CP_MOD}|(?:${namesOf(cp)}|${namesOf(container)}))(?=[\\s,;)])`).test(t)) res.add('desc')
     if (new RegExp(`^${namesOf(desc)}$`).test(t)) res.add('desc')
+    // f-round-15 B-F15-1: exec-member VALUE names propagate through aliasing —
+    // var g=f (f in descVal) / var {x}=cp member (objDestr) / Reflect accessor
+    // names all carry exec-member semantics
+    if (new RegExp(`^${namesOf(descVal)}$`).test(t)) res.add('descVal')
+    if (new RegExp(`^${namesOf(objDestr)}$`).test(t) || new RegExp(`^${namesOf(derived)}$`).test(t)) res.add('derived')
+    if (new RegExp(`^${namesOf(refGetMem)}$`).test(t)) res.add('refGetMem')
+    if (new RegExp(`^${namesOf(refGet)}$`).test(t)) res.add('refGet')
+    if (new RegExp(`^${namesOf(refApply)}$`).test(t)) res.add('refApply')
     if (new RegExp(`^Reflect\\.\\s*get\\s*\\(\\s*(?:${namesOf(cp)}|${namesOf(container)}|${namesOf(derived)})\\b`).test(t) ||
         /^Object\.\s*getOwnPropertyDescriptor\s*\(\s*(?:require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\)|(?:[A-Za-z_$][\w$]*))(?=[\s,;)])/.test(t) && new RegExp(`^(?:require\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\)|${namesOf(cp)})`).test(t) ||
         new RegExp(`^(?:${namesOf(cp)}|${namesOf(container)})\\s*(?:\\.\\s*[A-Za-z_$][\w$]*|\\[\\s*["'\x60][^"'\x60]+["'\x60]\\s*\\])\\s*$`).test(t) ||
@@ -5848,9 +5913,7 @@ function f6JsDanger(code: string): string | null {
   // object, invisible to text adjacency after return/pass-through).
   {
     const d6Re = /getOwnPropertyDescriptor\s*\(\s*(?:require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\))(?=[\s,;)])/g
-    const d6Ro = (tt: string) => /^(?:null|undefined|this|true|false|-?\d+(?:\.\d+)?)$/.test(tt) ||
-      /^["'`][^"'`]*["'`]$/.test(tt) ||
-      (/^\[\s*\S+\s*\]$/.test(tt) && !/[\>\|;&]|\$\(|`/.test(tt) && !/\+\s*["'`]/.test(tt))
+    const d6Ro = (tt: string) => isROArg(tt)
     for (const m of stripped.matchAll(d6Re)) {
       if (outside(m.index)) continue
       // B-F14-2: destructured descriptor value `{value:f}=desc(SRC);f(RO)` is
@@ -5861,7 +5924,7 @@ function f6JsDanger(code: string): string | null {
           /\b(?:const|let|var)\s*\[[^\]]*\]\s*=\s*[A-Za-z_$][\w$]*\s*\.\s*$/.test(pre) ||
           /\b(?:const|let|var)\s*\[[^\]]*\]\s*=\s*$/.test(pre)) continue
       const tail = stripped.slice(m.index + m[0].length, m.index + m[0].length + 200)
-      const v = tail.match(/\.\s*value\s*\(([^;)]*?)\)/)
+      const v = tail.match(/(?:\.[\w$]+|\[\s*["'\x60]value["'\x60]\s*\])\s*\(([^;)]*?)\)/)
       if (v) {
         const elems = splitTopLevel(v[1], ',')
         if (elems.length > 0 && elems.every(d6Ro)) continue
@@ -5891,7 +5954,7 @@ function f6JsDanger(code: string): string | null {
   // template body and returns the compiled function; Function aliases
   // (F=Function / [F]=[Function]) included. eval tagged templates are lazy
   // (no execution) and stay benign.
-  r = hit(new RegExp(`\\b(?:Function|(?:${namesOf(fAlias)}))\\s*\\x60[^\\x60]*\\x60`), 'Function tagged-template invocation', true)
+  r = hit(new RegExp(`\\b(?:Function|(?:${namesOf(fAlias)}))\\s*(?:\\.\\s*bind\\s*\\([^)]*\\)\\s*)?\\x60[^\\x60]*\\x60`), 'Function tagged-template invocation', true)
   if (r) return r
   // ---- globalThis non-literal bracket call (nested arrays / joins included) ----
   {
@@ -5913,7 +5976,7 @@ function f6JsDanger(code: string): string | null {
       }
       const key = stripped.slice(m.index + m[0].length, j).trim()
       const after = stripped.slice(j + 1).replace(/^\s*/, '')
-      if (after.startsWith('(')) {
+      if (after.startsWith('(') || /^\[\s*-?\d+\s*\]\s*\(/.test(after)) {
         if (!isPureLit(key) || isEvalKey(key)) {
           if (!outside(m.index)) return `globalThis bracket call (${key.slice(0, 20)})`
         }
@@ -5968,6 +6031,28 @@ function f6JsDanger(code: string): string | null {
     }
   }
 
+  // f-round-15: recursive read-only-argument adjudicator (RODV2 closure) —
+  // scalars / strings / nested arrays whose leaves are all provably benign
+  // (function decl hoists above every net that uses it)
+  function isROArg(t: string): boolean {
+    const x = t.trim()
+    if (x === '') return false
+    if (/^(?:null|undefined|this|true|false|-?\d+(?:\.\d+)?)$/.test(x)) return true
+    if (/^["'`][^"'`]*["'`]$/.test(x)) {
+      // f-round-15 B-F15-1 (RODV2 closure): literal argv strings are read-only
+      // only when they carry no shell redirect / command substitution
+      const lit = x.slice(1, -1)
+      if (/>>|>|\$\s*\(/.test(lit)) return false
+      return true
+    }
+    if (/^\[[\s\S]*\]$/.test(x)) {
+      const inner = x.slice(1, -1).trim()
+      if (inner === '') return true
+      return splitTopLevel(inner, ',').every((el) => isROArg(el.trim()))
+    }
+    return false
+  }
+
   // ---- binding nets ----
   const alt = (set: Set<string>) => namesOf(set)
   // N1: non-literal member read/call on cp / derived / container
@@ -5999,15 +6084,10 @@ function f6JsDanger(code: string): string | null {
     const n10 = new RegExp(`getOwnPropertyDescriptor\\s*\\(\\s*(?:${alt(cp)}|${alt(container)})(?=[\\s,;)])`, 'g')
     for (const m of stripped.matchAll(n10)) {
       const tail = stripped.slice(m.index + m[0].length, m.index + m[0].length + 200)
-      const v = tail.match(/\.\s*value\s*\(([^;)]*?)\)/)
+      const v = tail.match(/(?:\.[\w$]+|\[\s*["'\x60]value["'\x60]\s*\])\s*\(([^;)]*?)\)/)
       if (v) {
         const elems = splitTopLevel(v[1], ',')
-        const ro = elems.length > 0 && elems.every((e: string) => {
-          const t = e.trim()
-          return /^(?:null|undefined|this|true|false|-?\d+(?:\.\d+)?)$/.test(t) ||
-            /^["'`][^"'`]*["'`]$/.test(t) ||
-            (/^\[\s*\S+\s*\]$/.test(t) && !/[\>\|;&]|\$\(|`/.test(t) && !/\+\s*["'`]/.test(t))
-        })
+        const ro = elems.length > 0 && elems.every((e: string) => isROArg(e.trim()))
         if (ro) continue
       }
       return `descriptor extraction from child_process source (${m[0].slice(0, 24)})`
@@ -6053,6 +6133,13 @@ function f6JsDanger(code: string): string | null {
     const n2b = new RegExp(`\\b(?:${alt(dynC)})\\s*\\[\\s*[^\\]]+\\s*\\]\\s*\\(`, 'g')
     for (const m of stripped.matchAll(n2b)) {
       if (!outside(m.index)) return `array-stored dynamic source invoked (${m[0].slice(0, 24)})`
+    }
+    // f-round-15 B-F15-4: Function-alias binding invoked by subscript or any
+    // call form — a Function alias executes its string on ANY call
+    // (`var [,...F]=[0,Function];F[0]("return 2")()` — Y3 rest-destructure)
+    const n2c = new RegExp(`\\b(?:${alt(fAlias)})\\s*(?:\\[\\s*[^\\]]+\\s*\\]\\s*|\\.\\s*(?:apply|call|bind|constructor)\\s*)?\\(`, 'g')
+    for (const m of stripped.matchAll(n2c)) {
+      if (!outside(m.index)) return `function-alias source invoked (${m[0].slice(0, 24)})`
     }
   }
   // N3: globalThis-alias non-literal bracket call
@@ -6103,6 +6190,16 @@ function f6JsDanger(code: string): string | null {
       return `child_process member value invoked (${m[0].slice(0, 24)})`
     }
   }
+  // f-round-15 B-F15-4: Promise.reject(SOURCE).catch(predicate) hands the
+  // source to the predicate — fail closed on ANY exec-family member access
+  // (computed/concat key, optional chaining) inside the chain (AD9 family)
+  {
+    const prSrc = `(?:require\\s*\\(\\s*["'\x60](?:node:)?child_process["'\x60]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\)|(?:${namesOf(cp)}|${namesOf(container)}|${namesOf(dyn)}|${namesOf(dynC)}|${namesOf(descVal)}|${namesOf(derived)}))`
+    const prRe = new RegExp(`Promise\\s*\\.\\s*reject\\s*\\(\\s*${prSrc}\\s*\\)[\\s\\S]*?\\.\\s*catch\\s*\\([\\s\\S]*?(?:\\.\\s*[A-Za-z_$][\\w$]*|\\[\\s*[^\\]]+\\s*\\])\\s*(?:\\?\\.\\s*)?\\(`, 'g')
+    for (const m of stripped.matchAll(prRe)) {
+      if (!outside(m.index)) return `Promise.reject source into catch predicate (${m[0].slice(0, 24)})`
+    }
+  }
   // ---- f-round-13 B-F13-1/B-F13-2: value-passing fail-closed ----
   // The binding nets above only see declaration/assignment names. Sources that
   // travel through function parameters / callbacks / extractors / default
@@ -6110,6 +6207,80 @@ function f6JsDanger(code: string): string | null {
   // Whitelist = pure functions that never invoke their argument.
   const allSrc = new Set<string>([...cp, ...reqF, ...crF, ...modReq, ...gbmF, ...reqLike, ...dyn, ...dynC, ...gAlias, ...container, ...derived])
   const allSrcRe = allSrc.size ? `(?:${namesOf(allSrc)})` : '(?!x)x'
+  // f-round-15 B-F15-1/B-F15-2: unified chain-root adjudication. A source
+  // binding (descriptor value / dyn eval alias / Function alias / derived
+  // exec-member value / destructured member / Reflect-get member) or a literal
+  // eval/Function invoked through ANY member/optional/subscript/paren chain —
+  // .call/.apply/.bind forwarding, optional member calls, Reflect.apply,
+  // container subscripts, re-alias, timer/global forwarding — is executable.
+  // dyn/Function-alias/eval-literal roots are unconditional; descriptor/derived
+  // value roots adjudicate argv read-only-ness (RODV2 closure).
+  const capDeny = new Set<string>([...dyn, ...dynC, ...fAlias])
+  const capRO = new Set<string>([...descVal, ...derived, ...objDestr, ...refApply, ...refGetMem, ...refGet, 'Reflect.apply', 'Reflect.construct'])
+  {
+    if (capDeny.size + capRO.size > 0) {
+      const capChain = new RegExp(`\\b(?:${alt(capDeny)}|${alt(capRO)})(?:\\s*(?:\\?\\.[A-Za-z_$][\\w$]*|\\.[A-Za-z_$][\\w$]*|\\[\\s*[^\\]]*\\s*\\]|\\([^)]*\\)))*\\s*(?:\\?\\.[A-Za-z_$][\\w$]*)?\\s*(?:\\?\\.\\s*)?\\(`, 'g')
+      for (const m of stripped.matchAll(capChain)) {
+        if (outside(m.index)) continue
+        const head = m[0]
+        // root may be a dotted member (Reflect.apply) — match the longest
+        // capDeny/capRO element that heads the matched call chain
+        let root = ''
+        for (const nm of capDeny) {
+          if (head.startsWith(nm) && /^[\s.(?\[]/.test(head.slice(nm.length))) { root = nm; break }
+        }
+        if (!root) {
+          for (const nm of capRO) {
+            if (head.startsWith(nm) && /^[\s.(?\[]/.test(head.slice(nm.length))) { root = nm; break }
+          }
+        }
+        if (root && capDeny.has(root)) {
+          return `dynamic code execution source invoked (${head.slice(0, 24)})`
+        }
+        if (root && capRO.has(root)) {
+          const open = stripped.indexOf('(', m.index + head.length - 1)
+          let depth = 0, e2 = -1
+          for (let i = open; i < stripped.length; i++) {
+            const ch = stripped[i]
+            if (ch === '(') depth++
+            else if (ch === ')') { depth--; if (depth === 0) { e2 = i; break } }
+          }
+          if (e2 > open) {
+            const args = stripped.slice(open + 1, e2)
+            let elems = splitTopLevel(args, ',')
+            // Reflect.apply/construct forward the LAST element as the argument
+            // list; earlier elements are receiver/this refs — adjudicate only
+            // the forwarded list
+            if (root.startsWith('Reflect.')) elems = elems.slice(-1)
+            const readOnlyArgs = elems.length > 0 && elems.every(isROArg)
+            if (!readOnlyArgs) return `exec-capable binding invoked with non-readonly args (${head.slice(0, 24)})`
+          }
+        }
+      }
+    }
+    // literal eval/Function roots through member/subscript chains:
+    // eval.bind(null).call(...), [eval][0].call(...), Function.call(...)
+    const litChain = new RegExp(`\\b(?:eval|Function)(?:\\s*(?:\\?\\.[A-Za-z_$][\\w$]*|\\.[A-Za-z_$][\\w$]*|\\[\\s*[^\\]]*\\s*\\]|\\([^)]*\\)))*\\s*(?:\\?\\.[A-Za-z_$][\\w$]*)?\\s*(?:\\?\\.\\s*)?\\(`, 'g')
+    for (const m of stripped.matchAll(litChain)) {
+      if (outside(m.index)) continue
+      const head = m[0]
+      // Function.call/apply on a non-dynamic receiver (e.g. Function.prototype
+      // reflection) is common in real scripts — only fail when the chain starts
+      // with a source verb or subscript (bind/call/apply/constructor/index)
+      const chain = head.replace(/^(?:eval|Function)/, '')
+      // source verbs / subscripts on the literal root are always executable
+      if (/^\s*\.\s*(?:bind|call|apply|constructor)\b/.test(chain) || /^\s*\[/.test(chain)) {
+        return `dynamic code execution source invoked (${head.slice(0, 24)})`
+      }
+      // chained member followed by a further chain before the call — fail closed
+      if (/^\s*\./.test(chain)) {
+        const rest = chain.replace(/^\s*\.\s*[A-Za-z_$][\w$]*/, '')
+        if (/\.|\[|\(/.test(rest)) {
+          return `dynamic code execution source invoked (${head.slice(0, 24)})`
+        }
+      }
+    }
+  }
   const hasSrcTok = (s: string): boolean => {
     const a = s.trim()
     if (new RegExp(`\\b${allSrcRe}\\b`).test(a)) return true
@@ -6198,10 +6369,18 @@ function f6JsDanger(code: string): string | null {
     const headClean = head.replace(/\s+/g, '')
     const srcHeadRe = new RegExp(`\\b${allSrcRe}\\b`)
     if (/^(?:Object\.keys|JSON\.stringify|JSON\.parse|String|Number|Boolean|Array\.isArray|console\.(?:log|info|warn|error|debug))$/.test(headClean)) continue
-    const isReadOnlyArg = (t: string) =>
-      /^(?:null|undefined|this|true|false|-?\d+(?:\.\d+)?)$/.test(t) ||
-      /^["'`][^"'`]*["'`]$/.test(t) ||
-      (/^\[[\s\S]*\]$/.test(t) && !/[\>\|;&]|\$\(|`/.test(t) && !/\+\s*["'`]/.test(t))
+    const isReadOnlyArg = (t: string): boolean => {
+      const x = t.trim()
+      if (x === '') return false
+      if (/^(?:null|undefined|this|true|false|-?\d+(?:\.\d+)?)$/.test(x)) return true
+      if (/^["'`][^"'`]*["'`]$/.test(x)) return true
+      if (/^\[[\s\S]*\]$/.test(x)) {
+        const inner = x.slice(1, -1).trim()
+        if (inner === '') return true
+        return splitTopLevel(inner, ',').every((el) => isReadOnlyArg(el.trim()))
+      }
+      return false
+    }
     // RO3: Reflect.get(module-source, literal-key) — benign descriptor read
     if (/^Reflect\.\s*get$/.test(headClean)) {
       const g = args.match(new RegExp(`^(?:${allSrcRe}|require\\s*\\(\\s*["'\\x60]child_process["'\\x60]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*["'\\x60]child_process["'\\x60]\\s*\\))\\s*,\\s*["'\\x60][^"'\\x60]+["'\\x60]$`))
@@ -6304,8 +6483,20 @@ function f6JsDanger(code: string): string | null {
     // closed regardless of args (a pure literal `["spawnSync"]` key or plain
     // numeric index is handled by the RO nets above; splice keys like
     // `["sp"+"awnSync"]` and variable keys like `[k]` are not provable).
-    if (/\]\s*$/.test(headClean) && !/\[\s*["'`][^"'`+]*["'`]\s*\]\s*$/.test(headClean) && !/\[\s*-?\d+\s*\]\s*$/.test(headClean)) {
-      return `computed member call (${headClean.slice(0, 20)})`
+    {
+      // f-round-15 B-F15-3: scan EVERY bracket group in the head for
+      // non-literal keys — `[globalThis[b]][0](...)` ends with a numeric
+      // index and slipped past the old tail-only check
+      let bs = headClean.replace(/\(\s*\)/g, '')
+      const tailIdx = bs.match(/^(.*?)(?:\[\s*-?\d+\s*\])+$/)
+      if (tailIdx) bs = tailIdx[1]
+      const badKey = [...bs.matchAll(/\[\s*([^\]]*?)\s*\]/g)].some((g) => {
+        const key = g[1].trim()
+        if (key === '') return false
+        if (/^["'`][^"'`]*["'`]$/.test(key) || /^-?\d+$/.test(key)) return false
+        return true
+      })
+      if (badKey) return `computed member call (${headClean.slice(0, 20)})`
     }
     // B2 parity: direct literal require("child_process")["spawnSync"](...) —
     // adjudicated by the direct nets; fail closed only on source-tainted args.
@@ -6335,9 +6526,7 @@ function f6JsDanger(code: string): string | null {
   // are provably benign (AJ2); a dynamic/var key or non-readonly args fail
   // closed.
   {
-    const ro = (t: string) => /^(?:null|undefined|this|true|false|-?\d+(?:\.\d+)?)$/.test(t) ||
-      /^["'`][^"'`]*["'`]$/.test(t) ||
-      (/^\[[\s\S]*\]$/.test(t) && !/[\>\|;&]|\$\(|`/.test(t) && !/\+\s*["'`]/.test(t))
+    const ro = (t: string) => isROArg(t)
     const descSrc = `(?:${CP_MOD}|(?:${namesOf(cp)}|${namesOf(container)}))`
     const descChain = `(?:(?:\\?\\.\\s*)?(?:\\.\\s*(?!value\\b)[A-Za-z_$][\\w$]*|\\[\\s*-?\\d+\\s*\\]|\\[\\s*["'\\x60](?!value["'\\x60])[^"\\x60]+["'\\x60]\\s*\\])){0,2}`
     const descCallRe = new RegExp(`(?:(?:Object\\.)?getOwnPropertyDescriptor|Reflect\\.getOwnPropertyDescriptor|(?:Object\\.)?getOwnPropertyDescriptors)\\s*\\(\\s*${descSrc}\\s*(?:,\\s*((?:["'\x60][^"'\x60]*["'\x60])|[^,;)]+))?\\s*\\)${descChain}\\s*(?:(?:\\?\\.\\s*)?\\.\\s*value|\\[\\s*["'\x60]value["'\x60]\\s*\\])\\s*(?:\\?\\.\\s*)?\\(([^;)]*)\\)`, 'g')
@@ -6356,10 +6545,20 @@ function f6JsDanger(code: string): string | null {
   // invisible to text adjacency after return/pass-through (AJ4/AJ9/AJ10
   // family). Read-only calls (AJ2/AC1/AJ15) stay benign.
   {
-    const ro = (t: string) => /^(?:null|undefined|this|true|false|-?\d+(?:\.\d+)?)$/.test(t) ||
-      /^["'`][^"'`]*["'`]$/.test(t) ||
-      (/^\[[\s\S]*\]$/.test(t) && !/[\>\|;&]|\$\(|`/.test(t) && !/\+\s*["'`]/.test(t))
-    const valRe = /\.\s*value\s*(?:\?\.\s*)?\(\s*([^;)]*)\)/g
+    const ro = (t: string) => isROArg(t)
+    // f-round-15 B-F15-1: timers defer the exec source — setTimeout(f,0,SH) —
+    // first argument carries exec-member semantics, rest must be read-only
+    const tmRe = /\b(?:setTimeout|setInterval|setImmediate|process\.\s*nextTick)\s*\(([^;]*?)\)/g
+    for (const m of stripped.matchAll(tmRe)) {
+      const args = m[1]
+      const parts = splitTopLevel(args, ',')
+      const first = parts[0]?.trim() ?? ''
+      if (new RegExp(`^(?:${alt(capDeny)})$`).test(first)) return `dynamic code execution source invoked (${first})`
+      if (new RegExp(`^(?:${alt(capRO)})$`).test(first)) {
+        if (!parts.slice(1).every((p) => isROArg(p.trim()))) return `dynamic code execution source invoked (${first})`
+      }
+    }
+    const valRe = /(?:\.\s*value|\[\s*["'\x60]value["'\x60]\s*\])\s*(?:\?\.\s*)?\(\s*([^;)]*)\)/g
     for (const m of stripped.matchAll(valRe)) {
       if (outside(m.index)) continue
       const elems = splitTopLevel(m[1], ',')
