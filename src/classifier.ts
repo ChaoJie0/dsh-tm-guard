@@ -3624,6 +3624,58 @@ function stripUvRunFlags(s: string): string {
 /* ------------------------------------------------------------------ */
 
 /**
+ * f-round-6 B-F5-1: scan heredoc BODIES before stripHeredocs collapses them.
+ * A body fed to an interpreter is opaque code that the split/segs path never
+ * sees — adjudicate it with the same nets as an inline -e/-c body (exec
+ * family, python shell-out, destructive words, network), so `find -exec env
+ * node - <<JS … spawnSync("sh",["-c",…]) JS` fails closed while a benign
+ * body (`print(1)`, `subprocess.run(["ls","-la"])`) keeps its historical
+ * allow. Returns a ClassifyResult when dangerous, null otherwise.
+ */
+function heredocBodyDanger(command: string): { kind: 'delete' | 'egress'; signal: string } | null {
+  const re = /<<-?\s*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z_][A-Za-z0-9_]*))/g
+  re.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(command)) !== null) {
+    const delim = m[1] ?? m[2] ?? m[3]
+    if (!delim) continue
+    const esc = delim.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const bodyStart = m.index + m[0].length
+    const rest = command.slice(bodyStart)
+    const termRe = new RegExp(`\\n[ \\t]*${esc}(?=\\n|$)`)
+    const tm = rest.match(termRe)
+    if (!tm) continue
+    const body = rest.slice(0, tm.index)
+    re.lastIndex = bodyStart + tm.index + tm[0].length
+    const lt = body.replace(/\\(["'\\])/g, '$1')
+    if (/child_process/.test(lt) || /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/.test(lt)) {
+      const directSafe =
+        /require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*\(\s*["'][^"']*["']\s*(?:,\s*\[?\s*["'][^"']*["']\s*(?:,\s*["'][^"']*["'])*\]?\s*)?\)/.test(lt) &&
+        f6ExecThreat(lt) === null
+      if (!directSafe) {
+        const t = f6ExecThreat(lt)
+        return { kind: 'egress', signal: `heredoc body: unverifiable child_process exec family${t ? `: ${t}` : ''}` }
+      }
+    }
+    const pyT = f6PyThreat(lt)
+    if (pyT) return { kind: 'egress', signal: `heredoc body: python ${pyT}` }
+    if (FIND_FIND_DESTRUCTIVE_RE.test(lt)) {
+      return { kind: 'delete', signal: 'heredoc body: inline delete/spawn' }
+    }
+    if (FIND_INLINE_EGRESS_RE.test(lt)) {
+      return { kind: 'egress', signal: 'heredoc body: inline network' }
+    }
+    if (FIND_SHELLOUT_RE.test(lt)) {
+      return { kind: 'egress', signal: 'heredoc body: subprocess shell-out' }
+    }
+    if (NONPY_LAUNCH_WORD.test(maskStringLiterals(lt))) {
+      return { kind: 'delete', signal: 'heredoc body: inline launcher' }
+    }
+  }
+  return null
+}
+
+/**
  * Replace heredoc bodies (`<<EOF … EOF`) with a single `<<heredoc` marker so
  * script bodies are not split into bogus segments by `;`, `|` or `&&` inside
  * them (a heredoc fed to `node`/`python`/`bash` is local script code, not a
@@ -4346,6 +4398,179 @@ function moduleFlagEgress(action: string, verb: string): string | null {
   return null
 }
 
+// f-round-6 (dsh F5 review): exec-family adjudication robust to wrapper
+// prefixes, argv0 relays, flag reordering and non-literal argv0. A literal
+// binary + literal argv is NOT statically safe — env/find/xargs/sh/
+// interpreters exec a shell based on argv contents — so fail closed unless
+// argv[0] is a pure read-only binary with no code-execution semantics.
+const F6_READ_BINARIES = new Set([
+  'ls','cat','echo','printf','basename','dirname','true','false','pwd',
+  'uname','hostname','wc','head','tail','grep','cp','mv','install','ln',
+  'touch','mkdir','git','date','df','du','stat','chmod','chown',
+])
+const F6_SHELLS = new Set(['sh','bash','dash','zsh','ksh','tcsh','csh'])
+const F6_INTERPS = new Set([
+  'python','python2','python3','python3.12','pypy','node','nodejs','ruby',
+  'perl','perl5','php','php-cli','awk','gawk','sed',
+])
+const F6_RELAYS = new Set([
+  'env','nice','nohup','time','stdbuf','ionice','strace','setsid','command',
+  'find','xargs','busybox','sudo','su','eval',
+])
+// find-action wrapper prefixes to skip while extracting the real interpreter
+// verb (extended from the original single `env`).
+const F6_WRAP_PREFIX = new Set([
+  'env','nice','nohup','time','stdbuf','ionice','strace','setsid','command','sudo','su',
+])
+// code-execution flags: `-c`, `-e`, `-E`, `-r`, `-R`, `-s`, merged short
+// options (`-xc`), and --eval/--exec/--execute/--prompt. `--norc`/`--noprofile`
+// are NOT code exec (no c/e/r/s letter in the single-dash short-option sense).
+const F6_CODE_EXEC_FLAG = /^(?:-[ceErRs])$|^-[a-zA-Z]*[ceErRs][a-zA-Z]*$|^--(?:eval|exec|execute|prompt)$/
+
+/** Extract balanced call args starting at a `(`. Returns {args, end} or null. */
+function f6CallArgs(code: string, openIdx: number): { args: string; end: number } | null {
+  let depth = 0
+  let i = openIdx
+  for (; i < code.length; i++) {
+    if (code[i] === '(') depth++
+    else if (code[i] === ')') {
+      depth--
+      if (depth === 0) break
+    }
+  }
+  if (i >= code.length) return null
+  return { args: code.slice(openIdx + 1, i), end: i }
+}
+
+/** Split call args on top-level commas (bracket/brace aware). */
+function f6SplitArgs(args: string): string[] {
+  const parts: string[] = []
+  let bdepth = 0
+  let cur = ''
+  for (let k = 0; k < args.length; k++) {
+    const ch = args[k]
+    if (ch === '[' || ch === '{') bdepth++
+    else if (ch === ']' || ch === '}') bdepth--
+    if (ch === ',' && bdepth === 0) { parts.push(cur); cur = ''; continue }
+    cur += ch
+  }
+  parts.push(cur)
+  return parts
+}
+
+/**
+ * f-round-6 B-F5-2: adjudicate every exec-family call in a node code string.
+ * Returns a threat signal, or null when every call site is a read-only binary.
+ */
+function f6ExecThreat(code: string): string | null {
+  const re = /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*(?:\[[^\]]*\])?\s*\(/g
+  re.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(code)) !== null) {
+    const openIdx = m.index + m[0].length - 1
+    const ca = f6CallArgs(code, openIdx)
+    if (!ca) continue
+    const parts = f6SplitArgs(ca.args)
+    if (parts.length === 0) return 'exec-family call with no argv'
+    const first = parts[0].trim()
+    const lit0 = first.match(/^["']([^"']*)["']$/)
+    if (!lit0) return `non-literal argv[0] (${first.slice(0, 24)})`
+    const bin = (lit0[1].split('/').pop() ?? '').toLowerCase()
+    const rest = parts.slice(1).map((p) => p.trim().replace(/^["']|["']$/g, ''))
+    // flags may be a bare token, a quoted token, or elements inside a literal
+    // argv array (`['-c','id']`) — extract every quoted string first.
+    const hasFlag = rest.some((t) => {
+      const strings = [...t.matchAll(/["']([^"']*)["']/g)].map((x) => x[1])
+      if (strings.length === 0) return F6_CODE_EXEC_FLAG.test(t)
+      return strings.some((s) => F6_CODE_EXEC_FLAG.test(s))
+    })
+    if (F6_SHELLS.has(bin)) {
+      if (hasFlag) return `shell ${bin} with code-exec flag`
+      continue
+    }
+    if (F6_RELAYS.has(bin)) return `exec-family relay ${bin}`
+    if (F6_INTERPS.has(bin)) {
+      if (hasFlag) return `interpreter ${bin} with code-exec flag`
+      continue
+    }
+    if (F6_READ_BINARIES.has(bin)) continue
+    return `unverifiable binary ${bin}`
+  }
+  return null
+}
+
+/**
+ * f-round-6 B-F5-3: python subprocess/os shell-out adjudication — `shell=`
+ * truthy (non-False/0), getattr dispatch, bare from-imports, and argv0
+ * relays are all fail-closed; only read-only binary argv stays benign.
+ */
+function f6PyThreat(code: string): string | null {
+  // f-round-6 B-F5-3: same-line alias tracking — `import subprocess as s;
+  // s.run(…)` / `o=os; o.system(…)` hide the literal `subprocess.`/`os.`
+  // regexes on the find-inline python face.
+  const spAliases = new Set<string>()
+  for (const m of code.matchAll(/(?:import\s+subprocess\s+as\s+(\w+)|(\w+)\s*=\s*subprocess\b)/g)) {
+    if (m[1]) spAliases.add(m[1])
+    if (m[2]) spAliases.add(m[2])
+  }
+  for (const m of code.matchAll(/from\s+subprocess\s+import\s+(?:(\w+)(?:\s+as\s+(\w+))?)/g)) {
+    if (m[2]) spAliases.add(m[2])
+    else if (m[1] && /^(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)$/.test(m[1])) spAliases.add(m[1])
+  }
+  const osAliases = new Set<string>()
+  for (const m of code.matchAll(/(?:import\s+os\s+as\s+(\w+)|(\w+)\s*=\s*os\b)/g)) {
+    if (m[1]) osAliases.add(m[1])
+    if (m[2]) osAliases.add(m[2])
+  }
+  for (const m of code.matchAll(/from\s+os\s+import\s+(?:(\w+)(?:\s+as\s+(\w+))?)/g)) {
+    if (m[2]) osAliases.add(m[2])
+    else if (m[1] && /^(?:system|popen|spawn|execl|execv|posix_spawn)$/.test(m[1])) osAliases.add(m[1])
+  }
+  if (osAliases.size > 0) {
+    const rx = new RegExp(`\\b(?:${[...osAliases].map((a) => a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*\\.\\s*(?:system|popen|spawn|execl|execv|posix_spawn)\\s*\\(`)
+    if (rx.test(code)) return 'os alias shell-out call'
+  }
+  if (spAliases.size > 0) {
+    const rx = new RegExp(`\\b(?:${[...spAliases].map((a) => a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*\\.\\s*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)\\s*\\(`)
+    if (rx.test(code)) return 'subprocess alias shell-out call'
+  }
+  if (/getattr\s*\(\s*(?:os|subprocess)\b\s*,\s*["'](?:system|popen|run|call|Popen|check_output|check_call|exec[a-z]*|spawn[a-z]*|posix_spawn)["']/.test(code))
+    return 'getattr os/subprocess dispatch'
+  if (/from\s+os\s+import\s+[^;\n]*(?:system|popen|spawn|execl|execv|posix_spawn)/.test(code))
+    return 'from os import shell-out name'
+  if (/from\s+subprocess\s+import\s+[^;\n]*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)/.test(code))
+    return 'from subprocess import shell-out name'
+  const re = /\bsubprocess\s*\.\s*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)\s*\(/g
+  re.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(code)) !== null) {
+    const openIdx = m.index + m[0].length - 1
+    const ca = f6CallArgs(code, openIdx)
+    if (!ca) continue
+    const args = ca.args
+    if (/\bshell\s*=\s*(?!False\b|0\b)[^,)\s]+/.test(args)) return 'subprocess shell=truthy'
+    const parts = f6SplitArgs(args)
+    const first = (parts[0] ?? '').trim()
+    const arrLit = first.match(/^\[\s*["']([^"']*)["']/)
+    if (arrLit) {
+      const bin = (arrLit[1].split('/').pop() ?? '').toLowerCase()
+      const rest = args.slice(first.length)
+      const hasFlag = /["'][^"']*-[ceErRs][^"']*["']/.test(rest)
+      if (F6_SHELLS.has(bin) && hasFlag) return `python subprocess argv0 shell ${bin}`
+      if (F6_INTERPS.has(bin) && hasFlag) return `python subprocess argv0 interp ${bin}`
+      if (F6_READ_BINARIES.has(bin)) continue
+      return `python subprocess unverifiable binary ${bin}`
+    }
+    const strLit = first.match(/^["']([^"']*)["']$/)
+    if (strLit) {
+      if (/\bshell\s*=\s*(?!(?:False|0)\b)(?:True|1|[^,)\s]+)/.test(args)) return 'subprocess string cmd with shell truthy'
+      continue
+    }
+    return 'python subprocess non-literal argv'
+  }
+  return null
+}
+
 /** Extract the quoted code after -c/-e/-E/--eval from an action substring. */
 function findInlineCode(action: string): string | null {
   // H2: php uses `-r`/`-R` for inline code (ruby -e, perl -e/-E, python -c,
@@ -4444,14 +4669,16 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
   while ((am = actionRe.exec(trimmed))) {
     const action = trimmed.slice(am.index + am[0].length)
 
-    // Direct interpreter verb: skip env, options, NAME=value, read the token.
+    // Direct interpreter verb: skip wrapper prefixes (f-round-6: the whole
+    // wrapper set, not just env — `nice node`, `env env python3`, `time node`,
+    // `command -v`), options, NAME=value, then read the token.
     const tokens = action.split(/\s+/).filter(Boolean)
     let verb = ''
     for (const t of tokens) {
       const clean = t.replace(/^["']|["']$/g, '')
       const base = clean.split('/').pop()?.toLowerCase() ?? ''
       if (
-        base === 'env' ||
+        F6_WRAP_PREFIX.has(base) ||
         clean.startsWith('-') ||
         /^[A-Za-z_][A-Za-z0-9_]*=/.test(clean)
       ) continue
@@ -4476,28 +4703,31 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
         // escaped-quote forms (`require(\"child_process\")`), so adjudicate
         // on the unescaped code.
         const literalCode = code.replace(/\\(["'\\])/g, '$1')
-        const argV0Rce = literalCode.match(
-          /(?:spawn|spawnSync|execFile|execFileSync)\s*\(\s*["'][^"']*\b(sh|bash|dash|zsh|ksh|python3?|python|node|nodejs|ruby|perl|php)\b[^"']*["']\s*,\s*\[?\s*["'][^"']*-[ceEr][^"']*["']/) ||
-          // f-round-4 B-N1-a (python): subprocess argv[0]-shell is the same RCE.
-          literalCode.match(
-            /\bsubprocess\s*\.\s*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)\s*\(\s*\[?\s*["'][^"']*\b(sh|bash|dash|zsh|ksh|python3?|python|node|nodejs|ruby|perl|php)\b[^"']*["']\s*,\s*["'][^"']*-[ceEr][^"']*["']/)
-        if (argV0Rce) return { kind: 'egress', signal: `${verb} shell/interpreter argv[0] RCE (${argV0Rce[1]})` }
-        // f-round-4 B-N1-b: an exec-family call that is not a direct literal
-        // `require/import("child_process").execX("binary",[literal argv])`
-        // cannot be proven safe (alias chains, .call/.apply, computed/template
-        // keys, variable module ids, createRequire/getBuiltinModule/
-        // require.resolve indirections) — fail closed. The literal shape keeps
-        // the B2 contract (`spawnSync("ls")`, `spawnSync("ls",["-la"])`).
-        const hasExecFamily =
-          /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*(?:\.\s*(?:call|apply)\s*)?\(/.test(literalCode) ||
-          /\[["'][^"']*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)[^"']*["']\s*(?:\+\s*["'][^"']*["']\s*)*\]\s*\(/.test(literalCode)
-        if (hasExecFamily) {
-          const literalExec =
-            /(?:require\s*\(\s*["'](?:node:)?child_process["']\s*\)|import\s*\(\s*["'](?:node:)?child_process["']\s*\))\s*\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*\(\s*["'][^"']*["']\s*(?:,\s*\[?\s*["'][^"']*["']\s*(?:,\s*["'][^"']*["'])*\]?\s*)?\)/
-          if (!literalExec.test(literalCode)) {
-            return { kind: 'egress', signal: `${verb} unverifiable child_process exec family` }
+        // f-round-6 B-F5-2/B-N1-b: replace the narrow argV0Rce + hasExecFamily
+        // regexes with an exec-family fail-closed adjudication. Any
+        // child_process marker (require/import or an exec-family verb) whose
+        // call sites are not a direct literal `require("child_process").execX(
+        // "read-only-bin",[literal argv])` is unverifiable — template keys,
+        // computed destructuring, comma-operator bindings, method binding
+        // across lines, argv0 relays (env/find/xargs/busybox), flag
+        // reordering (`bash --norc -c`), merged flags (`sh -xc`) and
+        // non-literal argv0 all fail closed.
+        const cpMarker =
+          /child_process/.test(literalCode) ||
+          /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/.test(literalCode)
+        if (cpMarker) {
+          const directSafe =
+            /require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*\(\s*["'][^"']*["']\s*(?:,\s*\[?\s*["'][^"']*["']\s*(?:,\s*["'][^"']*["'])*\]?\s*)?\)/.test(literalCode) &&
+            f6ExecThreat(literalCode) === null
+          if (!directSafe) {
+            const t = f6ExecThreat(literalCode)
+            return { kind: 'egress', signal: `${verb} unverifiable child_process exec family${t ? `: ${t}` : ''}` }
           }
         }
+        // f-round-6 B-F5-3: python subprocess/os shell-out gaps (shell=
+        // truthy, getattr dispatch, bare from-imports, argv0 relays).
+        const pyT = f6PyThreat(literalCode)
+        if (pyT) return { kind: 'egress', signal: `${verb} python ${pyT}` }
         if (!/^python/.test(verb)) {
           // H2/H3b/F1: ruby/perl/php launchers are opaque — any process
           // primitive fails closed; a benign literal is NOT statically trusted
@@ -4957,6 +5187,22 @@ export function classifyBashCommand(
   // a heredoc body.
   const catastrophic = matchCatastrophic(command)
   if (catastrophic) return catastrophic
+
+  // f-round-6 B-F5-1: heredoc bodies are opaque code hidden by the collapse
+  // below — adjudicate them (exec family / python shell-out / destructive /
+  // network) before the body text is lost.
+  const heredocDanger = heredocBodyDanger(command)
+  if (heredocDanger) {
+    return {
+      category: 'unknown',
+      reason:
+        heredocDanger.kind === 'delete'
+          ? `heredoc body runs inline code that deletes files; target cannot be resolved statically (${heredocDanger.signal})`
+          : `heredoc body reaches the network or executes unverifiable code (${heredocDanger.signal}); cannot prove offline`,
+      targetPaths: [],
+      mutates: heredocDanger.kind === 'delete',
+    }
+  }
 
   // Heredoc bodies are local script code — collapse them into one marker so
   // the ; / | / && inside them don't create false unknown segments.
