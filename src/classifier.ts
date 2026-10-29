@@ -2383,8 +2383,7 @@ function taintedPathEnv(assignTok: string): string | null {
     if (
       seg.startsWith('/') ||
       seg.includes('~') ||
-      seg.includes('..') ||
-      /^\.{1,2}$/.test(seg)
+      seg.includes('..')
     ) {
       return `${m[1]} points outside cwd (${seg.slice(0, 40)})`
     }
@@ -2902,6 +2901,21 @@ function stripUvRunFlags(s: string): string {
     return {
       category: 'process',
       reason: `Process/system management command: ${fullCmd}`,
+      targetPaths: [],
+    }
+  }
+
+  // f-round-3 N3: `<interp> -` reads code from STDIN (`nohup python3 -`,
+  // `bash - 2>/dev/null`) — the body is not statically visible, exactly like
+  // bare-shell stdin (B6). Fail closed for every interpreter and shell; a
+  // script file argument (`python3 x.py`, `bash script.sh`) or an inline
+  // `-c/-e` code flag keeps the historical classification.
+  if ((LOCAL_EXEC_COMMANDS.has(firstWord) || PY_INTERPRETER_RE.test(firstWord) ||
+       ['bash', 'sh', 'zsh', 'dash'].includes(firstWord)) &&
+      /^-(\s|$)/.test(rest)) {
+    return {
+      category: 'unknown',
+      reason: `interpreter reads stdin code (unverifiable): ${fullCmd.slice(0, 60)}`,
       targetPaths: [],
     }
   }
@@ -3480,7 +3494,16 @@ function stripUvRunFlags(s: string): string {
   if (READ_COMMANDS.has(firstWord) || READ_COMMANDS.has(fullCmd)) {
     // Any read-family command with output redirection to a real file
     // becomes a file write (echo >, sed >, sort >, etc.)
-    if (hasOutputRedirect(trimmed)) {
+    // f-round-3 N3: `find -exec sh -c '… > /abs/path'` also has a redirect,
+    // but the redirect lives INSIDE the -exec body — the top-level
+    // extractWritePaths cannot see it, so this branch would return file_write
+    // with an empty target list and the find-action adjudicator (which DOES
+    // resolve the wrapped body) never runs. Let find/fd with an exec action
+    // fall through to detectDestructiveRead; a plain `find … > out.txt`
+    // (no action) keeps this file_write path.
+    if (hasOutputRedirect(trimmed) &&
+        !((firstWord === 'find' || firstWord === 'fd') &&
+          /-(?:exec(?:dir)?|ok|x)\b/.test(trimmed))) {
       return {
         category: 'file_write',
         reason: `${firstWord} with output redirection`,
@@ -4462,8 +4485,20 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
           let o3Hit = false
           if (/\bOpen3\b/.test(code)) {
             const o3recv = ['Open3']
-            for (const m2 of code.matchAll(/(\w+)\s*=\s*Open3\b/g)) {
-              if (m2[1] !== 'Open3' && !o3recv.includes(m2[1])) o3recv.push(m2[1])
+            // f-round-3 N2: alias tracking must be a transitive closure
+            // (`y=z; z=Open3; y.capture3(…)`) — one pass collects only the
+            // first level. Repeat assignment scans until fixpoint.
+            for (let pass = 0; pass < 6; pass++) {
+              const recvAltNow = o3recv.join('|')
+              const reAlias = new RegExp(
+                `(\\w+)\\s*=\\s*(?:${recvAltNow})\\b`, 'g')
+              let grew = false
+              for (const m2 of code.matchAll(reAlias)) {
+                if (m2[1] !== 'Open3' && !o3recv.includes(m2[1])) {
+                  o3recv.push(m2[1]); grew = true
+                }
+              }
+              if (!grew) break
             }
             const recvAlt = o3recv.join('|')
             const o3Method = '(?:capture2e?|capture3|popen[23]?|pipeline[_a-z]*)'
@@ -4474,9 +4509,25 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
               // dynamic dispatch: symbol, string literal, OR a variable name
               // (`m="capture2";Open3.send(m,…)`) — a variable receiver of a
               // dispatch whose name we cannot verify fails closed too.
-              new RegExp(`(?:${recvAlt})\\s*\\.\\s*(?:send|public_send|__send__)\\s*\\(\\s*(?::|["']|${'[A-Za-z_]\\w*'})[^"')]*(?:${o3Method})`, 'i').test(code) ||
-              new RegExp(`(?:${recvAlt})\\s*\\.\\s*(?:send|public_send|__send__)\\s*\\(\\s*[A-Za-z_]\\w*\\s*(?:[,)]|\\s*,\\s)`).test(code) ||
-              new RegExp(`(?:${recvAlt})\\s*\\.\\s*method\\s*\\(\\s*["'][^"')]*(?:${o3Method})`, 'i').test(code)
+              // f-round-3 N2: `::send` is the same family (`Open3::send`),
+              // and ruby allows paren-less dispatch `Open3.send :cap, arg`
+              // / `Open3.public_send m, arg` — cover both separators and
+              // both paren / whitespace call forms.
+              new RegExp(`(?:${recvAlt})\\s*(?:\\.|::)\\s*(?:send|public_send|__send__)\\s*(?:\\(\\s*|\\(?\\s+)(?::|["']|${'[A-Za-z_]\\w*'})[^"')]*(?:${o3Method})`, 'i').test(code) ||
+              new RegExp(`(?:${recvAlt})\\s*(?:\\.|::)\\s*(?:send|public_send|__send__)\\s*\\(\\s*[A-Za-z_]\\w*\\s*(?:[,)]|\\s*,\\s)`).test(code) ||
+              new RegExp(`(?:${recvAlt})\\s*(?:\\.|::)\\s*(?:send|public_send|__send__)\\s+[A-Za-z_]\\w*\\s*[,;\\n]`).test(code) ||
+              // method(…).call with ANY argument is an opaque dispatch —
+              // a literal method name, a variable name, an interpolated
+              // string, all fail closed.
+              new RegExp(`(?:${recvAlt})\\s*\\.\\s*method\\s*\\(\\s*(?::|["']|[A-Za-z_]\\w*)[^)]*\\)\\s*\\.\\s*call\\s*\\(`).test(code) ||
+              // const_get/const_missing with an Open3 receiver argument
+              // reaches the module through dynamic constant resolution.
+              /(?:const_get|const_missing)\s*\([^)]*["']Open3["']/.test(code) ||
+              // eval/instance_eval/binding.eval in the same body as Open3:
+              // the code string may name any method on it (`eval "Open3"+…`).
+              // f-round-3 N2: ruby eval may be paren-less (`eval "…"`), so
+              // both `(` and a bare space are accepted.
+              (/\beval\s*[(\s]\s*["']?[^;\n)]*Open3|Open3\s*\.\s*instance_eval\b|instance_eval\s*\{[^}]*Open3/.test(code) && /\bOpen3\b/.test(code))
           }
           if (NONPY_LAUNCH_WORD.test(masked) ||
               // F1-a: Open3 family (capture2/capture2e/capture3/popen2/
@@ -4537,8 +4588,15 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
     }
 
     // Wrapped shell body: delete surface + inline egress APIs, one nested layer.
+    // f-round-3 N3 fix: only a SHELL wrapper (sh/bash/dash/zsh -c) enters the
+    // wrapped-body adjudication. The `-[a-z]*c` extractor would otherwise
+    // match ANY command's `-c` flag — `python3 -c "print(1)"` yields a bogus
+    // body `print(1)`, which the recursion then classifies as an unknown bare
+    // word and over-denies a benign read-only contract. Interpreter verbs are
+    // already adjudicated by the interp block above.
+    const wrapVerb = action.trim().split(/\s+/)[0]?.toLowerCase().split('/').pop() ?? ''
     const cm = action.match(/(?:-[a-z]*c\s+)(?:\$?'([^']*)'|"((?:[^"\\]|\\.)*)")/)
-    if (cm) {
+    if (cm && ['sh', 'bash', 'dash', 'zsh'].includes(wrapVerb)) {
       // Keep the extracted body ESCAPED (`\"` stays `\"`): the recursion below
       // re-reads it through findInlineCode, whose escape-aware quote branch
       // handles `\"`; unescaping here first collapsed the inner quotes and
@@ -4565,6 +4623,60 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
       const innerThreat = findActionInlineThreat(`-exec ${body} {} ;`, 1)
       if (innerThreat) {
         return { kind: innerThreat.kind, signal: `wrapped ${innerThreat.signal}` }
+      }
+      // f-round-3 N3: the wrapped body is arbitrary shell — the finite regex
+      // list + one inline-interpreter recursion above still miss indirect
+      // forms (eval-wrapped network, piped/no… stdin interpreters,
+      // nested sh chains beyond one layer). Recurse the FULL
+      // classifyBashCommand on the body and upgrade ONLY dangerous outcomes;
+      // read/local_exec/allowed writes stay untouched, so benign read-only
+      // bodies (`sh -c 'python3 -c "print(1)"'`, `sh -c 'git log'`,
+      // `sh -c 'echo X'`) are not over-denied (the round-2 revert reason).
+      // findActionInlineThreat has no denyReadPaths context — the recursion
+      // runs with the classifier's default (empty) read-deny set, which is
+      // fine: body danger comes from network/unknown/delete/denied-write
+      // categories, not from which paths reads are denied.
+      // f-round-3: a direct interpreter -c/-e inline body (node -e, python3
+      // -c, ruby -e, perl -e, php -r …) is ALREADY adjudicated by the
+      // inline-interpreter recursion above (FIND network/delete/shell-out
+      // nets) and the R5 wrapped-argv path; recursing the FULL classifier
+      // here additionally runs the N2 hasUnverifiableDanger net, whose
+      // coarse call-site table flags benign literals like
+      // `spawnSync("ls")` — over-denying the B2 literal-argv contract.
+      // The recursion exists for INDIRECT forms (eval-wrapped network,
+      // command substitution, stdin interpreters, nested sh chains,
+      // write-redirect escapes), which never start with an interpreter
+      // -c/-e/-E/--eval flag.
+      const interpInlineRE =
+        /^(?:node|nodejs|python3?|python|ruby|perl|php)\s+(?:-[A-Za-z]+\s+)*(?:-c|-e|-E|--eval|-r)\b/
+      let innerCls: ReturnType<typeof classifyBashCommand> | null = null
+      if (!interpInlineRE.test(body)) {
+        innerCls = classifyBashCommand(body)
+      }
+      // Upgrade ONLY dangerous outcomes. mixed = eval/exec dynamic execution
+      // (unverifiable code string). file_write is upgraded when a write
+      // target escapes the session cwd (absolute path or `..` traversal) —
+      // the classifier's file_write does not carry an allow flag (decide()
+      // decides by target path), so the recursion checks the paths itself.
+      // Relative / `{}` / variable targets stay allowed (decide() handles
+      // them). read/local_exec outcomes stay untouched, so benign read-only
+      // bodies (`sh -c 'python3 -c "print(1)"'`, `sh -c 'git log'`,
+      // `sh -c 'echo X'`) are not over-denied (the round-2 revert reason).
+      // innerCls stays null for interpreter-inline bodies (skipped above),
+      // so those keep the inline-interpreter adjudication only.
+      const innerPaths = innerCls?.targetPaths ?? []
+      const writeEscapesCwd = innerPaths.some(
+        (p) => p.startsWith('/') || p.includes('..') || p === '~')
+      if (
+        innerCls &&
+        (innerCls.forceDeny ||
+          innerCls.category === 'network' ||
+          innerCls.category === 'unknown' ||
+          innerCls.category === 'mixed' ||
+          innerCls.category === 'delete' ||
+          (innerCls.category === 'file_write' && writeEscapesCwd))
+      ) {
+        return { kind: 'egress', signal: `wrapped dangerous shell body (${innerCls.category})` }
       }
       const nm = body.match(/(?:sh|bash|dash|zsh)\s+-[a-z]*c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/)
       if (nm) {

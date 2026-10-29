@@ -543,6 +543,21 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
   // s("m","/tmp/none.py")` aliases the function away from the risky literal
   // regex. Track the alias per line so a later bare call site is detected.
   let specAlias: string | null = null
+  // f-round-3 N1: node `child_process` references can be named through
+  // aliases, destructured imports, require aliases, createRequire or dynamic
+  // import — the risky literal regex anchors on `require("child_process").`
+  // and misses every renamed form. Track module references and bare exec
+  // names (cross-line: a heredoc body may bind on line 1, call on line 3).
+  const nodeCpRefs = new Set<string>()
+  const nodeRequireAliases = new Set<string>()
+  const nodeBareExec = new Set<string>()
+  // f-round-3 F2: python sys.path can also be reached through an object
+  // alias (`p=sys.path;p.insert(0,"./lib")`) or a method alias
+  // (`ins=sys.path.insert;ins(0,"./lib")`) or getattr dispatch — the
+  // relative-literal exemption must cover those too (or they over-deny).
+  const pySysPathObj = new Set<string>()
+  const pySysPathMethodAlias = new Set<string>()
+  const reEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   // Reused by dyn and risky loops: relative-literal call sites of the spec
   // family (spec_from_file_location/module_from_spec/its alias) load a module
   // inside the session cwd and are verifiable; absolute / non-literal args
@@ -561,9 +576,12 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
     const re = specCallRE(l)
     if (!re) return false
     const strs = [...l.matchAll(/["']([^"']*)["']/g)].map((x) => x[1])
+    // f-round-3 F3: `..` traversal escapes the session cwd — reject it here
+    // too, matching the B4 taintedPathEnv posture (absolute args were already
+    // excluded by the startsWith('/') test).
     return strs.length > 0 && strs.every((s) =>
       !s.startsWith('/') && !s.includes(':') && !s.includes('$') &&
-      !s.includes('`') && !s.includes('"'))
+      !s.includes('`') && !s.includes('"') && !s.includes('..'))
   }
 
   for (let i = 0; i < lines.length && out.length < MAX_HITS; i++) {
@@ -582,6 +600,49 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
     if (language === 'python') {
       const am = line.match(/\b(?:spec_from_file_location|module_from_spec)\s+as\s+(\w+)\b/)
       if (am) specAlias = am[1]
+      // f-round-3 F2: sys.path object / method aliases for the relative-literal
+      // exemption below.
+      for (const m of line.matchAll(/\b(\w+)\s*=\s*sys\s*\.\s*path\b/g)) {
+        if (!pySysPathObj.has(m[1])) pySysPathObj.add(m[1])
+      }
+      for (const m of line.matchAll(/\b(\w+)\s*=\s*sys\s*\.\s*path\s*\.\s*(?:insert|append|extend|__setitem__)\b/g)) {
+        if (!pySysPathMethodAlias.has(m[1])) pySysPathMethodAlias.add(m[1])
+      }
+    }
+    // f-round-3 N1: collect every way `child_process` (or its exec/execSync
+    // members) can be named on this line — later lines resolve through the
+    // sets, so renamed forms cannot escape the fail-closed posture.
+    if (language === 'node') {
+      for (const m of line.matchAll(/\b(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*["'](?:node:)?child_process["']\s*\)/g)) {
+        nodeCpRefs.add(m[1])
+      }
+      for (const m of line.matchAll(/\b(?:const|let|var)\s+(\w+)\s*=\s*require\b/g)) {
+        nodeRequireAliases.add(m[1])
+      }
+      for (const m of line.matchAll(/\b(?:const|let|var)\s+(\w+)\s*=\s*(\w+)\s*\(\s*["'](?:node:)?child_process["']\s*\)/g)) {
+        if (nodeRequireAliases.has(m[2])) nodeCpRefs.add(m[1])
+      }
+      for (const m of line.matchAll(/\bimport\s+(?:\*\s+as\s+(\w+)|(\w+))\s+from\s+["'](?:node:)?child_process["']/g)) {
+        if (m[1]) nodeCpRefs.add(m[1])
+        if (m[2]) nodeCpRefs.add(m[2])
+      }
+      for (const m of line.matchAll(/\bimport\s*\{([^}]*)\}\s*from\s+["'](?:node:)?child_process["']/g)) {
+        for (const nm of m[1].split(',')) {
+          const mm = nm.trim().match(/^(\w+)(?:\s+as\s+(\w+))?$/)
+          if (mm && /^(exec|execSync)$/.test(mm[1])) nodeBareExec.add(mm[2] ?? mm[1])
+        }
+      }
+      for (const m of line.matchAll(/\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\s*\(\s*["'](?:node:)?child_process["']\s*\)/g)) {
+        for (const nm of m[1].split(',')) {
+          const mm = nm.trim().match(/^(\w+)(?:\s*:\s*(\w+))?$/)
+          if (mm && /^(exec|execSync)$/.test(mm[1])) nodeBareExec.add(mm[2] ?? mm[1])
+        }
+      }
+      // method binding: `const e = require("child_process").execSync` /
+      // `const e = cp.execSync` — later `e(...)` is an exec call.
+      for (const m of line.matchAll(/\b(?:const|let|var)\s+(\w+)\s*=\s*[^;]+?\.\s*(?:exec|execSync)\b/g)) {
+        nodeBareExec.add(m[1])
+      }
     }
 
     // Shell-out hits are always hard (no loopback downgrade for `curl ...`
@@ -672,17 +733,56 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
         // non-literal args stay denied.
         if (language === 'python' &&
             (/\bsys\s*\.\s*path\s*\.\s*(?:insert|append|extend|__setitem__)\s*\(/.test(line) ||
+             /getattr\s*\(\s*sys\s*\.\s*path\s*,\s*["'](?:insert|append|extend|__setitem__)["']\s*\)\s*\(/.test(line) ||
+             (pySysPathObj.size > 0 &&
+              new RegExp(`\\b(?:${[...pySysPathObj].map(reEscape).join('|')})\\s*\\.\\s*(?:insert|append|extend|__setitem__)\\s*\\(`).test(line)) ||
+             (pySysPathMethodAlias.size > 0 &&
+              new RegExp(`\\b(?:${[...pySysPathMethodAlias].map(reEscape).join('|')})\\s*\\(`).test(line)) ||
              /\bsite\s*\.\s*addsitedir\s*\(/.test(line) ||
              specCallRE(line) !== null)) {
           const strs = [...line.matchAll(/["']([^"']*)["']/g)].map((x) => x[1])
+          // f-round-3 F3: `..` traversal escapes the session cwd — the
+          // relative-literal exemption must reject it (B4 posture), so an
+          // absolute/non-literal OR parent-traversing arg still fails closed.
           if (strs.length > 0 && strs.every((s) =>
             !s.startsWith('/') && !s.includes(':') && !s.includes('$') &&
-            !s.includes('`') && !s.includes('"'))) {
+            !s.includes('`') && !s.includes('"') && !s.includes('..'))) {
             continue
           }
         }
         unverifiable = true
       }
+    }
+
+    // f-round-3 N1: node exec/execSync executes a COMMAND STRING whose target
+    // cannot be proven innocent statically. The risky literal regex anchors on
+    // `require("child_process").`; this block closes every renamed form —
+    // module aliases, destructured/imported members, require aliases, bracket
+    // keys (literal or variable), method bindings, createRequire and dynamic
+    // import — via the cross-line sets collected above. spawn/spawnSync/
+    // execFile stay on the network-argv shellNet rule, so literal
+    // `spawnSync("ls",["-la"])` remains readable.
+    if (language === 'node') {
+      let execThreat = false
+      if (nodeCpRefs.size > 0) {
+        const alt = [...nodeCpRefs].map(reEscape).join('|')
+        execThreat =
+          new RegExp(`\\b(?:${alt})\\s*\\.\\s*(?:exec|execSync)\\s*\\(`).test(line) ||
+          new RegExp(`\\b(?:${alt})\\s*\\[\\s*(?:["'][^"']*(?:exec|execSync)[^"']*["']|\\w+)\\s*\\]\\s*\\(`).test(line)
+      }
+      // `require("child_process")["execSync"](…)` / `[var](…` (no alias).
+      execThreat = execThreat ||
+        /require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\[\s*(?:["'][^"']*(?:exec|execSync)[^"']*["']|\w+)\s*\]\s*\(/.test(line)
+      if (nodeBareExec.size > 0) {
+        const altB = [...nodeBareExec].map(reEscape).join('|')
+        execThreat = execThreat || new RegExp(`\\b(?:${altB})\\s*\\(`).test(line)
+      }
+      // createRequire("...")("child_process").execSync(…) / dynamic import.
+      execThreat = execThreat ||
+        /createRequire\s*\([^)]*\)\s*\([^)]*\)\s*\.\s*(?:exec|execSync)\s*\(/.test(line) ||
+        /import\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.\s*then\s*\([^)]*(?:exec|execSync)/.test(line) ||
+        /\bimport\s*\(\s*["'](?:node:)?child_process["']\s*\)[^;]*(?:exec|execSync)\s*\(/.test(line)
+      if (execThreat) unverifiable = true
     }
   }
 
