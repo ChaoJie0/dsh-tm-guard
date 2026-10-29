@@ -3685,7 +3685,96 @@ function heredocConsumer(command: string, at: number): string | null {
   return null
 }
 
-function heredocBodyDanger(command: string): { kind: 'delete' | 'egress'; signal: string } | null {
+/**
+ * B-F7-3: extract $(…) and backtick command substitutions from an unquoted
+ * heredoc body. Returns null when a substitution is malformed (unclosed) —
+ * the caller fails closed. Parenthesis nesting is balanced; a `$(` nested
+ * inside an extracted command simply recurses via classifyBashCommand.
+ */
+function extractCmdSubstitutions(body: string): string[] | null {
+  const out: string[] = []
+  const re = /\$\(|`/g
+  re.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(body)) !== null) {
+    if (m[0] === '$(') {
+      let depth = 1
+      let i = m.index + 2
+      for (; i < body.length; i++) {
+        if (body[i] === '(') depth++
+        else if (body[i] === ')') { depth--; if (depth === 0) break }
+      }
+      if (depth !== 0) return null
+      out.push(body.slice(m.index + 2, i))
+      re.lastIndex = i + 1
+    } else {
+      const end = body.indexOf('`', m.index + 1)
+      if (end < 0) return null
+      out.push(body.slice(m.index + 1, end))
+      re.lastIndex = end + 1
+    }
+  }
+  return out
+}
+
+/**
+ * B-F7-3/4: adjudicate a code string that the shell EXECUTES during heredoc
+ * expansion (`$(…)`/backtick substitution in an unquoted heredoc, or a
+ * `sh -s`/`bash -s` heredoc script body). The top-level classifyBashCommand
+ * treats a bare `node -e …` as a benign local_exec and defers rollback
+ * judgement to decide(), so we scan the real danger nets here and use the
+ * top-level classifier only as a category/target fallback. `allowRelativeWrite`
+ * permits cwd-relative file writes (find sh -c contract) and denies absolute
+ * writes; command substitutions fail closed on ANY write.
+ */
+function heredocCodeThreat(st: string, allowRelativeWrite: boolean): { kind: 'delete' | 'egress'; signal: string } | null {
+  const s = st.trim()
+  if (!s) return null
+  const cpT = f6ExecThreat(s)
+  if (cpT) return { kind: 'egress', signal: `child_process: ${cpT}` }
+  F6_CP_MODULE_RE.lastIndex = 0
+  if (F6_CP_MODULE_RE.test(s)) return { kind: 'egress', signal: 'child_process module' }
+  F6_CP_MODULE_RE.lastIndex = 0
+  const cpD = f6CpDispatchThreat(s)
+  if (cpD) return { kind: 'egress', signal: cpD }
+  const pyT = f6PyThreat(s)
+  if (pyT) return { kind: 'egress', signal: `python ${pyT}` }
+  const pr = protectedRegions(s)
+  if (hasOutside(s, FIND_FIND_DESTRUCTIVE_RE, pr)) return { kind: 'delete', signal: 'inline delete/spawn' }
+  if (hasOutside(s, FIND_INLINE_EGRESS_RE, pr)) return { kind: 'egress', signal: 'inline network' }
+  if (hasOutside(s, FIND_SHELLOUT_RE, pr)) return { kind: 'egress', signal: 'subprocess shell-out' }
+  if (hasOutside(s, NONPY_LAUNCH_WORD, pr)) return { kind: 'delete', signal: 'inline launcher' }
+  if (hasOutside(s, LUA_LAUNCH_RE, pr)) return { kind: 'egress', signal: 'lua shell-out' }
+  const luaDyn = luaDynamicIndexThreat(s, pr)
+  if (luaDyn) return { kind: 'egress', signal: luaDyn }
+  // recurse into nested substitutions only while the text still contains any —
+  // the top-level classifier re-enters heredocBodyDanger and would otherwise
+  // loop on the same $() text forever.
+  const nested = extractCmdSubstitutions(s)
+  if (nested === null) return { kind: 'egress', signal: 'unclosed nested command substitution' }
+  if (nested.length > 0) {
+    for (const n of nested) {
+      const t = heredocCodeThreat(n, allowRelativeWrite)
+      if (t) return { kind: t.kind, signal: `nested substitution ${t.signal}` }
+    }
+    return null
+  }
+  // no substitutions left — the top-level classifier is safe to run
+  const inner = classifyBashCommand(s)
+  const cwdPrefix = `${process.cwd()}/`
+  // file_write targets are resolved to absolute paths even when the command
+  // wrote a cwd-relative path (`echo x > out.txt` → cwd + out.txt); only a
+  // write OUTSIDE the cwd is a constraint violation.
+  const targetOutside = (inner.targetPaths ?? []).some((p) => p.startsWith('/') && !p.startsWith(cwdPrefix) && p !== process.cwd())
+  if (inner.category === 'delete' || inner.category === 'network' || inner.category === 'unknown' ||
+      inner.category === 'system' || inner.category === 'file_write' && (!allowRelativeWrite || targetOutside)) {
+    return { kind: inner.category === 'delete' ? 'delete' : 'egress', signal: `${inner.category}: ${(inner.reason ?? '').slice(0, 40)}` }
+  }
+  return null
+}
+
+function heredocBodyDanger(command: string, depth = 0): { kind: 'delete' | 'egress'; signal: string } | null {
+  if (depth > 2) return null
   const re = /<<-?\s*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z_][A-Za-z0-9_]*))/g
   re.lastIndex = 0
   let m: RegExpExecArray | null
@@ -3694,7 +3783,7 @@ function heredocBodyDanger(command: string): { kind: 'delete' | 'egress'; signal
     if (!delim) continue
     // B-F6-2: only adjudicate heredocs whose consumer executes the body.
     const consumer = heredocConsumer(command, m.index)
-    if (!consumer) continue
+    const quotedDelim = m[1] !== undefined || m[2] !== undefined
     const esc = delim.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const bodyStart = m.index + m[0].length
     const rest = command.slice(bodyStart)
@@ -3702,8 +3791,42 @@ function heredocBodyDanger(command: string): { kind: 'delete' | 'egress'; signal
     const tm = rest.match(termRe)
     if (!tm) continue
     const body = rest.slice(0, tm.index)
+    // B-F7-5: commands AFTER the terminator (on the next line) are still part
+    // of the same bash invocation — `head <<EOF … EOF\nnode -e '<RCE>'` must
+    // be adjudicated, not swallowed by the leading data heredoc. Runs for
+    // every heredoc (data or exec consumer).
+    const afterTerm = command.slice(bodyStart + tm.index + tm[0].length)
+    if (/^\s*\r?\n/.test(afterTerm)) {
+      const tail = afterTerm.replace(/^\s*\r?\n/, '')
+      if (tail.trim()) {
+        const t2 = heredocBodyDanger(tail, depth + 1)
+        if (t2) return t2
+        const inner = heredocCodeThreat(tail, false)
+        if (inner) return { kind: inner.kind, signal: `command after heredoc terminator ${inner.signal}` }
+      }
+    }
+    if (!consumer) {
+      // B-F7-3: an UNQUOTED delimiter lets the shell expand $(…)/backticks
+      // BEFORE the body reaches a data consumer — `cat <<EOF $(node -e RCE) EOF`
+      // executes the substitution even though `cat` only reads text. Extract
+      // and adjudicate every substitution; quoted delimiters (`<<'EOF'`) never
+      // expand, so plain text stays benign.
+      if (!quotedDelim) {
+        const subst = extractCmdSubstitutions(body)
+        if (subst === null) return { kind: 'egress', signal: 'heredoc body: unclosed command substitution' }
+        for (const s of subst) {
+          const t = heredocCodeThreat(s, false)
+          if (t) return { kind: t.kind, signal: `heredoc command substitution ${t.signal}` }
+        }
+      }
+      continue
+    }
     re.lastIndex = bodyStart + tm.index + tm[0].length
-    const lt = body.replace(/\\(["'\\])/g, '$1')
+    // keep the body verbatim — un-escaping `\"` here would break
+    // protectedRegions' string-region detection (a literal `\"` inside a
+    // python string becomes a fake string boundary, exposing the inner words
+    // and falsely tripping the nets: `s="getattr(os,\"system\")"`).
+    const lt = body
     const pr = protectedRegions(lt)
     if (hasOutside(lt, /child_process|\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/, pr) ||
         F6_MEMBER_SLOT_RE.test(lt) || F6_CP_MODULE_RE.test(lt)) {
@@ -3712,6 +3835,9 @@ function heredocBodyDanger(command: string): { kind: 'delete' | 'egress'; signal
       // no exec-family call shape → f6ExecThreat stays null → allowed.
       const t = f6ExecThreat(lt)
       if (t) return { kind: 'egress', signal: `heredoc body: unverifiable child_process exec family: ${t}` }
+      // B-F7-1: child_process dynamic dispatch / renamed-function closure.
+      const dt = f6CpDispatchThreat(lt)
+      if (dt) return { kind: 'egress', signal: `heredoc body: ${dt}` }
       // B-N1-b: computed-destructure binding of an exec-family member into a
       // variable that is later invoked — unverifiable statically.
       if (F6_COMPUTED_BIND_RE.test(lt)) {
@@ -3720,6 +3846,22 @@ function heredocBodyDanger(command: string): { kind: 'delete' | 'egress'; signal
     }
     const pyT = f6PyThreat(lt)
     if (pyT) return { kind: 'egress', signal: `heredoc body: python ${pyT}` }
+    // B-F7-4: a shell receiving the heredoc as a SCRIPT (find -exec sh -s {} \;
+    // <<'SH', or any `sh <<'SH'` / `bash <<'SH'`) runs the body as shell code —
+    // adjudicate it like the sh -c path (cwd-prefix write constraint, nested
+    // interpreter calls). Data commands (cat/tee/sed/grep/head/sort) never
+    // arrive here (consumer would be null); interpreters go through their own
+    // nets above.
+    if (consumer === 'sh' || consumer === 'bash' || consumer === 'dash' || consumer === 'zsh' ||
+        consumer === 'ksh' || consumer === 'tcsh' || consumer === 'csh') {
+      // B-F7-4: a shell receiving the heredoc as a SCRIPT (find -exec sh -s {} \;
+      // <<'SH', or any `sh <<'SH'` / `bash <<'SH'`) runs the body as shell code —
+      // adjudicate it like the sh -c path: cwd-relative writes stay benign,
+      // absolute writes / deletes / network / nested interpreter calls fail closed.
+      const inner = heredocCodeThreat(lt, true)
+      if (inner) return { kind: inner.kind, signal: `heredoc shell script ${inner.signal}` }
+      continue
+    }
     if (hasOutside(lt, FIND_FIND_DESTRUCTIVE_RE, pr)) {
       return { kind: 'delete', signal: 'heredoc body: inline delete/spawn' }
     }
@@ -3735,6 +3877,10 @@ function heredocBodyDanger(command: string): { kind: 'delete' | 'egress'; signal
     if (hasOutside(lt, LUA_LAUNCH_RE, pr)) {
       return { kind: 'egress', signal: 'heredoc body: lua shell-out' }
     }
+    // B-F7-2: lua dynamic index dispatch (`os[f]`, `os["exec".."ute"]`) and
+    // rawget global-table access — the member cannot be statically resolved.
+    const luaDyn = luaDynamicIndexThreat(lt, pr)
+    if (luaDyn) return { kind: 'egress', signal: `heredoc body: ${luaDyn}` }
   }
   return null
 }
@@ -4619,6 +4765,101 @@ function f6ExecThreat(code: string): string | null {
 }
 
 /**
+ * B-F7-1: node child_process dynamic dispatch / renamed-function closure.
+ * Tracks bindings FROM `require("child_process")` (or an alias of it) and
+ * fails closed on shapes a literal call-site net cannot adjudicate:
+ *   - `cp[m](…)` / `cp["spawn"+"Sync"](…)` / `` cp[`spawn${k}`](…) `` —
+ *     square-bracket member dispatch with a non-literal key
+ *   - `require("child_process")[<non-literal key>](…)` — direct slot dispatch
+ *   - renamed destructure `const {spawnSync:ss}=…;ss(…)` / `{execFile:ef}`
+ *     and plain `const {spawnSync}=…` — the renamed variable is adjudicated
+ *     like a direct exec-family call (read-only argv stays ALLOW)
+ *   - `const f=cp["spawnSync"]; f(…)` / `const f=cp.execSync; f(…)` —
+ *     function-taken-to-variable, later invoked
+ * These shapes are code-only constructs (prose cannot contain them), so no
+ * region filter (fail-closed), matching F6_CP_MODULE_RE.
+ */
+function f6CpDispatchThreat(code: string): string | null {
+  const cpAliases = new Set<string>()
+  const fvars = new Set<string>()
+  // direct module receiver: `const cp = require("child_process")`
+  const bindRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*["'`]child_process["'`]\s*\)/g
+  let m: RegExpExecArray | null
+  while ((m = bindRe.exec(code)) !== null) cpAliases.add(m[1])
+  F6_CP_MODULE_RE.lastIndex = 0
+  const hasModule = F6_CP_MODULE_RE.test(code)
+  F6_CP_MODULE_RE.lastIndex = 0
+  // destructure from the module or from an alias: `{spawnSync:ss, execFile:ef}` / `{spawnSync}`
+  const destrRe = /\b(?:const|let|var)\s*\{\s*([^}]+?)\s*\}\s*=\s*(?:require\s*\(\s*["'`]child_process["'`]\s*\)|([A-Za-z_$][\w$]*))/g
+  while ((m = destrRe.exec(code)) !== null) {
+    const src = m[2] ?? ''
+    if (!hasModule && !(src && cpAliases.has(src))) continue
+    for (const item of m[1].split(',')) {
+      const kv = item.trim()
+      if (!kv) continue
+      let key = kv
+      let val = kv
+      const colon = kv.indexOf(':')
+      if (colon >= 0) { key = kv.slice(0, colon).trim(); val = kv.slice(colon + 1).trim() }
+      key = key.replace(/^["'`]|["'`]$/g, '').replace(/\[\s*["'`]|["'`]\s*\]/g, '')
+      if (!/^[A-Za-z_$][\w$]*$/.test(val)) continue
+      if (/^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(key)) fvars.add(val)
+      else if (/^[A-Za-z_$][\w$]*$/.test(key) && key === val) fvars.add(val)
+    }
+  }
+  // function-taken-to-variable: `const f = cp.execSync` / `const f = cp["spawnSync"]`
+  const fbindRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([A-Za-z_$][\w$]*?)["'`]\s*\])/g
+  while ((m = fbindRe.exec(code)) !== null) {
+    const src = m[2]
+    if (!cpAliases.has(src)) continue
+    const verb = m[3] ?? m[4] ?? ''
+    if (/^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(verb)) fvars.add(m[1])
+  }
+  // renamed/plain function variables invoked later: `ss(…)` — adjudicate like
+  // a direct exec-family call (read-only binaries stay ALLOW).
+  if (fvars.size > 0) {
+    const callRe = new RegExp(`\\b(?:${[...fvars].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*\\(`, 'g')
+    let cm: RegExpExecArray | null
+    while ((cm = callRe.exec(code)) !== null) {
+      const openIdx = cm.index + cm[0].length - 1
+      const t = f6AdjudicateCall(code, openIdx)
+      if (t) return `renamed child_process function invoked: ${t}`
+    }
+  }
+  // square-bracket dispatch on an alias: `cp[m](…)` / `cp["spawn"+"Sync"](…)` / `` cp[`spawn${k}`](…) `` —
+  // any non-literal-verb key fails closed; a literal exec-family key is adjudicated.
+  if (cpAliases.size > 0) {
+    const dynRe = new RegExp(`\\b(?:${[...cpAliases].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*\\[\\s*([^\\]]+)\\s*\\]\\s*\\(`, 'g')
+    let dm: RegExpExecArray | null
+    while ((dm = dynRe.exec(code)) !== null) {
+      const key = dm[1].trim()
+      const litKey = key.match(/^(?:`|'|")([^`'"]+)(?:`|'|")$/)
+      if (litKey && /^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(litKey[1])) {
+        const openIdx = code.indexOf('(', dm.index + dm[0].length - 1)
+        const t = f6AdjudicateCall(code, openIdx)
+        if (t) return `child_process alias dispatch: ${t}`
+        continue
+      }
+      return `child_process alias dynamic dispatch via non-literal key (${key.slice(0, 20)})`
+    }
+  }
+  // direct module slot dispatch: `require("child_process")[key](…)` with a non-literal key
+  const modSlotRe = /require\s*\(\s*["'`]child_process["'`]\s*\)\s*\[\s*([^\]]+)\s*\]\s*\(/g
+  while ((m = modSlotRe.exec(code)) !== null) {
+    const key = m[1].trim()
+    const litKey = key.match(/^(?:`|'|")([^`'"]+)(?:`|'|")$/)
+    if (litKey && /^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(litKey[1])) {
+      const openIdx = code.indexOf('(', m.index + m[0].length - 1)
+      const t = f6AdjudicateCall(code, openIdx)
+      if (t) return `child_process slot dispatch: ${t}`
+      continue
+    }
+    return `child_process slot dispatch via non-literal key (${key.slice(0, 20)})`
+  }
+  return null
+}
+
+/**
  * f-round-6 B-F5-3: python subprocess/os shell-out adjudication — `shell=`
  * truthy (non-False/0), getattr dispatch, bare from-imports, and argv0
  * relays are all fail-closed; only read-only binary argv stays benign.
@@ -4665,6 +4906,31 @@ function f6PyThreat(code: string): string | null {
   }
   for (const m of code.matchAll(/getattr\s*\(\s*(?:os|subprocess)\b\s*,\s*["'](?:system|popen|run|call|Popen|check_output|check_call|exec[a-z]*|spawn[a-z]*|posix_spawn)["']/g)) {
     if (!outside(m.index)) return 'getattr os/subprocess dispatch'
+  }
+  // B-F7-2: getattr with a dynamic/non-literal member name —
+  // `getattr(os,m)`, `getattr(os,"sys"+"tem")`, `getattr(alias,…)` —
+  // the member cannot be statically adjudicated, fail closed. Also covers
+  // function-taken-to-variable (`r=getattr(s,"run"); r(…)`): a LITERAL
+  // dangerous member name on os/subprocess/alias fails closed even without a
+  // call suffix (the result may be bound and invoked later). A plain literal
+  // harmless member (`getattr(os,"getcwd")`) stays benign.
+  const dynGetattrRe = /getattr\s*\(\s*([A-Za-z_$][\w$]*)\s*,\s*([^)]+)\)/g
+  for (const m of code.matchAll(dynGetattrRe)) {
+    if (outside(m.index)) continue
+    const obj = m[1]
+    if (obj !== 'os' && obj !== 'subprocess' && !osAliases.has(obj) && !spAliases.has(obj)) continue
+    const name = m[2].trim()
+    const lit = name.match(/^["']([^"']*)["']$/)
+    if (lit && /^(?:getcwd|getpid|listdir|path|environ|name|sep|stat|access|exists|isfile|isdir|walk|join|basename|dirname|getenv|getlogin|getuid|getgid|geteuid|getegid)$/.test(lit[1])) continue
+    return `getattr dynamic member on ${obj} (${name.slice(0, 20)})`
+  }
+  // B-F7-2: `os.__dict__[f](…)` / `subprocess.__dict__[x](…)` dynamic index dispatch.
+  const dictRe = /\b(?:os|subprocess|[A-Za-z_$][\w$]*)\s*\.\s*__dict__\s*\[\s*[^\]]+\s*\]\s*\(/g
+  for (const m of code.matchAll(dictRe)) {
+    const obj = m[0].split('.')[0]
+    if (obj === 'os' || obj === 'subprocess' || osAliases.has(obj) || spAliases.has(obj)) {
+      if (!outside(m.index)) return `__dict__ dynamic index dispatch on ${obj}`
+    }
   }
   for (const m of code.matchAll(/from\s+os\s+import\s+[^;\n]*(?:system|popen|spawn|execl|execv|posix_spawn)/g)) {
     if (!outside(m.index)) return 'from os import shell-out name'
@@ -4858,7 +5124,25 @@ const NONPY_LAUNCH_WORD =
 // io.popen are this language's shell-out primitives and are not covered by
 // the node/python/Open3 nets.
 const LUA_LAUNCH_RE =
-  /\b(?:os\.(?:execute|exit|remove|rename)|io\.(?:popen|open|write|lines)|load(?:string)?\s*\(|dofile|package\.loadlib)\b/
+  /\b(?:os\.(?:execute|exit|remove|rename)|io\.(?:popen|open|write|lines)|load(?:string)?\s*\(|dofile|package\.loadlib|rawget\s*\(|getfenv\s*\(|setfenv\s*\()/
+
+/** B-F7-2: lua dynamic member dispatch — `os[f](…)`, `os["exec".."ute"](…)`,
+ * `io[var](…)`. A literal harmless key (clock/time/date/difftime/getenv;
+ * io read/close/type/seek/tmpfile) stays benign; any variable/concatenation
+ * key or a dangerous literal key fails closed. */
+function luaDynamicIndexThreat(code: string, pr: { regions: [number, number][]; unterminated: boolean }): string | null {
+  const outside = (idx: number) => !pr.unterminated && pr.regions.some(([s, e]) => idx >= s && idx < e)
+  const re = /\b(?:os|io)\s*\[\s*([^\]]+)\s*\]\s*\(/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(code)) !== null) {
+    if (outside(m.index)) continue
+    const key = m[1].trim()
+    const lit = key.match(/^["']([^"']*)["']$/)
+    if (lit && /^(?:clock|time|date|difftime|getenv|getlocal|setlocal|read|close|type|seek|tmpfile|lines|write)$/.test(lit[1])) continue
+    return `lua dynamic index dispatch on ${m[0].slice(0, 4)}[...](${key.slice(0, 20)})`
+  }
+  return null
+}
 
 const PY_FIND_LAUNCH_RE =
   /\b(?:os\.(?:popen|exec[a-z]*|posix_spawn)|subprocess\.(?:run|Popen|call|check_call|check_output|getoutput|getstatusoutput))\s*\(/g
@@ -4953,6 +5237,9 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
         if (cpMarker) {
           const t = f6ExecThreat(literalCode)
           if (t) return { kind: 'egress', signal: `${verb} unverifiable child_process exec family: ${t}` }
+          // B-F7-1: child_process dynamic dispatch / renamed-function closure.
+          const dt = f6CpDispatchThreat(literalCode)
+          if (dt) return { kind: 'egress', signal: `${verb} ${dt}` }
           // B-N1-b: computed-destructure exec-family binding invoked via a
           // variable — no call site to adjudicate, fail closed.
           if (F6_COMPUTED_BIND_RE.test(literalCode)) {
@@ -4963,6 +5250,9 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
         if (hasOutside(literalCode, LUA_LAUNCH_RE, literalPr)) {
           return { kind: 'egress', signal: `${verb} lua shell-out` }
         }
+        // B-F7-2: lua dynamic index dispatch / rawget global-table access.
+        const luaDyn = luaDynamicIndexThreat(literalCode, literalPr)
+        if (luaDyn) return { kind: 'egress', signal: `${verb} ${luaDyn}` }
         // f-round-6 B-F5-3: python subprocess/os shell-out gaps (shell=
         // truthy, getattr dispatch, bare from-imports, argv0 relays).
         const pyT = f6PyThreat(literalCode)

@@ -139,3 +139,117 @@ test('f-round-6 benign contract: read-only binaries + pure prints stay allowed',
     assert.equal(r.deny, false, `${name} must stay ALLOW (got ${r.cat})`)
   }
 })
+
+test('f-round-7 B-F7-1: child_process rename/dynamic-key/bind dispatch denied (heredoc + find inline)', async () => {
+  const cases: Array<[string, string]> = [
+    [HH.replace('CODE', 'const {spawnSync:ss}=require("child_process");ss("sh",["-c","echo X > /tmp/x"])'), 'heredoc rename spawnSync:ss'],
+    [H.replace('CODE', 'const {execFile:ef}=require("child_process");ef("sh",["-c","echo X > /tmp/x"])'), 'find -e rename execFile:ef'],
+    [H.replace('CODE', 'var m="spawnSync";require("child_process")[m]("sh",["-c","echo X > /tmp/x"])'), 'find -e var key'],
+    [H.replace('CODE', 'require("child_process")["spawn"+"Sync"]("sh",["-c","echo X > /tmp/x"])'), 'find -e concat key'],
+    [HH.replace('CODE', 'const k="Sync";const cp=require("child_process");cp[`spawn${k}`]("sh",["-c","echo X > /tmp/x"])'), 'heredoc template expr key'],
+    [H.replace('CODE', 'const cp=require("child_process");const f=cp["spawnSync"];f("sh",["-c","echo X > /tmp/x"])'), 'find -e bind f=cp[key]'],
+    [HH.replace('CODE', 'const cp=require("child_process");const f=cp.execSync;f("sh",["-c","echo X > /tmp/x"])'), 'heredoc bind f=cp.execSync'],
+    [H.replace('CODE', 'const {spawnSync}=require("child_process");spawnSync("sh",["-c","echo X > /tmp/x"])'), 'find -e plain destructure'],
+    [H.replace('CODE', 'const cp=require("child_process"),r=cp.spawnSync;r("sh",["-c","echo X > /tmp/x"])'), 'find -e comma bind member'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F7-1 ${name} must DENY (got ${r.cat})`)
+  }
+})
+
+test('f-round-7 B-F7-2: python getattr/__dict__ dynamic + bound dispatch denied', async () => {
+  const cases: Array<[string, string]> = [
+    [PH.replace('CODE', 'import os\nm="system";getattr(os,m)("echo X > /tmp/x")'), 'heredoc getattr var'],
+    [PH.replace('CODE', 'import os\ngetattr(os,"sys"+"tem")("echo X > /tmp/x")'), 'heredoc getattr concat'],
+    [PH.replace('CODE', 'import os\nf="system";os.__dict__[f]("echo X > /tmp/x")'), 'heredoc __dict__[f]'],
+    [PH.replace('CODE', 'import subprocess as s\nr=getattr(s,"run");r("echo X > /tmp/x",shell=True)'), 'heredoc subprocess alias getattr bind'],
+    [PH.replace('CODE', 'import subprocess as s\nm="run";getattr(s,m)("echo X > /tmp/x",shell=True)'), 'heredoc alias getattr var'],
+    [P.replace('CODE', 'import os\nm="system";getattr(os,m)("echo X > /tmp/x")'), 'find -c getattr var'],
+    [P.replace('CODE', 'import os\nf="system";os.__dict__[f]("echo X > /tmp/x")'), 'find -c __dict__[f]'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F7-2 ${name} must DENY (got ${r.cat})`)
+  }
+})
+
+test('f-round-7 B-F7-3: unquoted-delimiter command substitutions in data heredocs denied', async () => {
+  const cases: Array<[string, string]> = [
+    ["cat <<EOF\n$(node -e 'require(\"child_process\").spawnSync(\"sh\",[\"-c\",\"echo X > /tmp/x\"])')\nEOF", 'cat unquoted $(node RCE)'],
+    ["cat <<EOF\n`node -e 'require(\"child_process\").spawnSync(\"sh\",[\"-c\",\"echo X > /tmp/x\"])'`\nEOF", 'cat unquoted backtick node RCE'],
+    ["sort <<EOF\n$(node -e 'require(\"child_process\").spawnSync(\"sh\",[\"-c\",\"echo X > /tmp/x\"])')\nEOF", 'sort unquoted $(node RCE)'],
+    ["cat <<EOF\n$(rm -rf /tmp/evil)\nEOF", 'cat unquoted $(rm -rf)'],
+    ["cat <<EOF\n$(curl http://169.254.169.254/)\nEOF", 'cat unquoted $(curl)'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F7-3 ${name} must DENY (got ${r.cat})`)
+  }
+  const benign: Array<[string, string]> = [
+    ["cat <<'EOF'\n$(node -e 'require(\"child_process\").spawnSync(\"sh\",[\"-c\",\"echo X > /tmp/x\"])')\nEOF", 'quoted delim not expanded'],
+    ["cat <<EOF\n$(date)\nEOF", 'unquoted $(date) benign'],
+    ["cat <<EOF\n$(pwd)\nEOF", 'unquoted $(pwd) benign'],
+    ["cat <<EOF\nspawn exec fork child_process words\nEOF", 'text heredoc spawn words'],
+    ["cat <<EOF\npython getattr os system\nEOF", 'text heredoc getattr words'],
+  ]
+  for (const [c, name] of benign) {
+    const r = await gate(c)
+    assert.equal(r.deny, false, `B-F7-3 ${name} must stay ALLOW (got ${r.cat})`)
+  }
+})
+
+test('f-round-7 B-F7-4: shell-script heredoc bodies adjudicated (cwd writes benign, escapes denied)', async () => {
+  const cases: Array<[string, string]> = [
+    ["find . -exec sh -s {} \\; <<'SH'\necho x > /tmp/abs-escape.txt\nSH", 'sh -s absolute write'],
+    ["find . -exec sh -s {} \\; <<'SH'\necho x > ../esc.txt\nSH", 'sh -s parent write'],
+    ["find . -exec sh -s {} \\; <<'SH'\nrm -rf /tmp/target\nSH", 'sh -s rm -rf'],
+    ["find . -exec sh -s {} \\; <<'SH'\nnode -e 'require(\"child_process\").spawnSync(\"sh\",[\"-c\",\"echo X > /tmp/x\"])'\nSH", 'sh -s nested node RCE'],
+    ["find . -exec bash -s {} \\; <<'BS'\npython3 -c 'import os; os.system(\"echo X > /tmp/x\")'\nBS", 'bash -s nested python'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F7-4 ${name} must DENY (got ${r.cat})`)
+  }
+  const benign: Array<[string, string]> = [
+    ["find . -exec sh -s {} \\; <<'SH'\necho x > out.txt\nSH", 'sh -s cwd-relative write'],
+    ["find . -exec sh -s {} \\; <<'SH'\nid\nSH", 'sh -s benign id'],
+  ]
+  for (const [c, name] of benign) {
+    const r = await gate(c)
+    assert.equal(r.deny, false, `B-F7-4 ${name} must stay ALLOW (got ${r.cat})`)
+  }
+})
+
+test('f-round-7 B-F7-5: commands after heredoc terminator adjudicated', async () => {
+  const cases: Array<[string, string]> = [
+    ["head <<EOF\nx\nEOF\nnode -e 'require(\"child_process\").spawnSync(\"sh\",[\"-c\",\"echo X > /tmp/x\"])'", 'after-HD newline node RCE'],
+    ["cat <<EOF\nx\nEOF\npython3 -c 'import os; os.system(\"echo X > /tmp/x\")'", 'after-HD newline python RCE'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F7-5 ${name} must DENY (got ${r.cat})`)
+  }
+  const benign: Array<[string, string]> = [
+    ["head <<EOF\nx\nEOF\necho done", 'after-HD benign echo'],
+  ]
+  for (const [c, name] of benign) {
+    const r = await gate(c)
+    assert.equal(r.deny, false, `B-F7-5 ${name} must stay ALLOW (got ${r.cat})`)
+  }
+})
+
+test('f-round-7 benign contract: string/comment mentions stay allowed', async () => {
+  const cases: Array<[string, string]> = [
+    ["node - <<'JS'\n// spawn exec fork are words in a comment\nconsole.log('hi')\nJS", 'node comment mention'],
+    ["node - <<'JS'\nconst s = \"spawn exec child_process\";\nconsole.log(s)\nJS", 'node string mention'],
+    ["find . -exec node -e 'const s=\"spawn exec\";console.log(s)' {} \\;", 'find -e string mention'],
+    ["python3 - <<'PY'\ns=\"getattr(os,\\\"system\\\")\"\nprint(s)\nPY", 'python string getattr escaped'],
+    ["node - <<'JS'\nconsole.log('hi')\nJS", 'node benign ls'],
+    ["python3 - <<'PY'\nprint(1)\nPY", 'python benign print'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, false, `${name} must stay ALLOW (got ${r.cat})`)
+  }
+})
