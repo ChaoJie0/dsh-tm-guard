@@ -3741,7 +3741,7 @@ function heredocCodeThreat(st: string, allowRelativeWrite: boolean): { kind: 'de
   const cpT = f6ExecThreat(s)
   if (cpT) return { kind: 'egress', signal: `child_process: ${cpT}` }
   F6_CP_MODULE_RE.lastIndex = 0
-  if (F6_CP_MODULE_RE.test(s)) return { kind: 'egress', signal: 'child_process module' }
+  if (F6_CP_MODULE_RE.test(s)) { F6_CP_MODULE_RE.lastIndex = 0; return { kind: 'egress', signal: 'child_process module' } }
   F6_CP_MODULE_RE.lastIndex = 0
   const cpD = f6CpDispatchThreat(s)
   if (cpD) return { kind: 'egress', signal: cpD }
@@ -3856,8 +3856,12 @@ function heredocBodyDanger(command: string, depth = 0): { kind: 'delete' | 'egre
     // precondition. Region-filtered, so string/comment mentions stay benign.
     const f8 = f8JsDynExecThreat(lt, pr)
     if (f8) return { kind: 'egress', signal: `heredoc body: ${f8}` }
-    if (hasOutside(lt, /child_process|\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/, pr) ||
-        F6_MEMBER_SLOT_RE.test(lt) || F6_CP_MODULE_RE.test(lt)) {
+    F6_MEMBER_SLOT_RE.lastIndex = 0
+    F6_CP_MODULE_RE.lastIndex = 0
+    const hbMarker = F6_MEMBER_SLOT_RE.test(lt) || F6_CP_MODULE_RE.test(lt) || CR_DYN_MEMBER_RE.test(lt)
+    F6_MEMBER_SLOT_RE.lastIndex = 0
+    F6_CP_MODULE_RE.lastIndex = 0
+    if (hasOutside(lt, /child_process|\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/, pr) || hbMarker) {
       // B-F6-2: gate on code OUTSIDE strings/comments, then adjudicate the
       // actual call sites. A prose/comment/string mention of these words has
       // no exec-family call shape → f6ExecThreat stays null → allowed.
@@ -4716,6 +4720,13 @@ const F6_MEMBER_SLOT_RE =
 const F6_COMPUTED_BIND_RE =
   /\{\s*\[\s*(?:`|'|")(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)(?:(?:`|'|")\s*\+\s*(?:`|'|")[^`'"]*(?:`|'|"))?(?:\s*)\]\s*:\s*[A-Za-z_$][\w$]*\s*\}/g
 
+// B-F11-2 (dsh review 309cfe7 W19/W20): a createRequire/getBuiltinModule
+// chain resolving child_process then taking a NON-literal member — the member
+// cannot be proven benign, so it is a marker for the f6 net even though the
+// child_process string lives inside a string literal (the hasOutside marker
+// gate would miss it). Code-shaped only, never prose.
+const CR_DYN_MEMBER_RE = /(?:require\s*\(\s*["'`]module["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]module["'`]\s*\))\s*\.\s*createRequire\s*\([^)]*\)\s*\(\s*["'`]child_process["'`]\s*\)\s*\[\s*[^\]]+\s*\]/
+
 // B-N1-b / B-F5-3: `require("child_process")` / `from "child_process"` — the
 // module name lives inside a string literal, so region filtering would hide a
 // REAL code marker. Require/import-of-child_process is too specific to be
@@ -4915,6 +4926,79 @@ function f8JsDynExecThreat(code: string, pr: { regions: Array<[number, number]>;
   for (const m of code.matchAll(refCtorRe)) {
     if (!outside(m.index)) return `dynamic code execution: Reflect.get prototype constructor`
   }
+  // B-F11-3 (dsh review 309cfe7): HD-net parity with FE. These nets are
+  // read-site fail-closed — the dynamic-exec source stored in an object
+  // member, a bracket constructor chain, a globalThis alias, a nested
+  // Reflect.get/apply/construct over the global object, a getPrototypeOf
+  // alias and a vm method alias all deny where they are READ, without
+  // waiting for (or tracking) the invocation site.
+  // 1) object-member dynamic-exec sources: `var o={e:eval}` / `{x:{e:eval}}` —
+  //    a member initialized directly to a dynamic-exec source cannot be proven
+  //    uncalled, so it fails closed at the object literal.
+  const objMemberSeedRe = /\{\s*(?:[A-Za-z_$][\w$]*|["'`][^"'`]+["'`])\s*:\s*(?:eval\b|Function\b|globalThis\s*\[\s*[^\]]+\s*\]|Reflect\.\s*get\s*\([^)]+\)|(?:[A-Za-z_$][\w$]*)\s*\.\s*constructor(?:\s*\.\s*constructor)?|(?:[A-Za-z_$][\w$]*)\s*\[\s*["'`]constructor["'`]\s*\])\s*[},]/g
+  for (const m of code.matchAll(objMemberSeedRe)) {
+    if (!outside(m.index)) return `dynamic code execution: object-stored eval/Function source`
+  }
+  // 2) bracket constructor chain: `[].constructor["constructor"]`
+  const bracketCtorRe = /\.\s*constructor\s*\[\s*["'`]constructor["'`]\s*\]/g
+  for (const m of code.matchAll(bracketCtorRe)) {
+    if (!outside(m.index)) return `dynamic code execution: bracket constructor chain`
+  }
+  // 3) globalThis aliases: `var g=globalThis` then `g["ev"+"al"](…)` /
+  //    `g[k](…)` — a non-literal global bracket call fails closed.
+  const gAliases = new Set<string>()
+  const gBindRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*globalThis\b/g
+  for (const m of code.matchAll(gBindRe)) {
+    if (!outside(m.index)) gAliases.add(m[1])
+  }
+  if (gAliases.size > 0) {
+    const ga = [...gAliases].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+    const gDynCallRe = new RegExp(`\\b(?:${ga})\\s*\\[\\s*([^\\]]+)\\s*\\]\\s*\\(`, 'g')
+    for (const m of code.matchAll(gDynCallRe)) {
+      const key = m[1].trim()
+      if (/^["'`][^"'`]+["'`]$/.test(key)) continue
+      if (!outside(m.index)) return `dynamic code execution: global alias bracket call with non-literal key`
+    }
+  }
+  // 4) nested Reflect over the global object: `Reflect.get(globalThis,"eva"+"l")`,
+  //    `Reflect.get(g,k)`, and Reflect.apply/construct forwarding a Reflect.get
+  //    of the global — a non-literal global Reflect.get denies at the read site.
+  const gRefRe = new RegExp(`Reflect\\.\\s*get\\s*\\(\\s*(?:globalThis|${gAliases.size > 0 ? [...gAliases].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') : '(?!x)x'})\\s*,\\s*([^)]+)\\)`, 'g')
+  for (const m of code.matchAll(gRefRe)) {
+    const key = m[1].trim()
+    if (/^["'`][^"'`]+["'`]$/.test(key)) continue
+    if (!outside(m.index)) return `dynamic code execution: Reflect.get over global with non-literal key`
+  }
+  // 5) getPrototypeOf aliases: `var p=Reflect.getPrototypeOf` then
+  //    `Reflect.get(p(fn),"constructor")(…)` — the alias makes the proto ctor
+  //    net miss, so the alias chain fails closed on constructor lookup.
+  const pAliases = new Set<string>()
+  const pBindRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*Reflect\.\s*getPrototypeOf\b/g
+  for (const m of code.matchAll(pBindRe)) {
+    if (!outside(m.index)) pAliases.add(m[1])
+  }
+  if (pAliases.size > 0) {
+    const pa = [...pAliases].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+    const pCtorRe = new RegExp(`Reflect\\.\\s*get\\s*\\(\\s*(?:${pa})\\s*\\([^)]*\\)\\s*,\\s*["']constructor["']\\s*\\)\\s*\\(`, 'g')
+    for (const m of code.matchAll(pCtorRe)) {
+      if (!outside(m.index)) return `dynamic code execution: getPrototypeOf alias constructor`
+    }
+  }
+  // 6) vm method aliases: `var cf=v.compileFunction` / `var S=v.Script` then
+  //    `cf(…)` / `new S(…)` — method extraction cannot be tracked, so the
+  //    alias fails closed when invoked.
+  const vmFnAliases = new Set<string>()
+  const vmFnBindRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*\.\s*(compileFunction|Script)\b/g
+  for (const m of code.matchAll(vmFnBindRe)) {
+    if (!outside(m.index) && /^(?:vm|node:vm|[A-Za-z_$][\w$]*)$/.test(m[2])) vmFnAliases.add(m[1])
+  }
+  if (vmFnAliases.size > 0) {
+    const vfa = [...vmFnAliases].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+    const vmFnCallRe = new RegExp(`(?:\\bnew\\s+)?(?:${vfa})\\s*\\(`, 'g')
+    for (const m of code.matchAll(vmFnCallRe)) {
+      if (!outside(m.index)) return `dynamic code execution: vm method alias invoked`
+    }
+  }
   // vm entry points: direct member, require().method, alias-bound receiver,
   // paren Script (`new (require("vm").Script)(…)` and bare `require("vm").Script(…)` — the
   // latter throws on Node 26 but is covered as defense-in-depth).
@@ -5006,7 +5090,131 @@ function f8JsDynExecThreat(code: string, pr: { regions: Array<[number, number]>;
  */
 function f6CpDispatchThreat(code: string): string | null {
   const cpAliases = new Set<string>()
+  const reqAliases = new Set<string>()
   const fvars = new Set<string>()
+  const esc = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const execVerbs = 'exec|execSync|spawn|spawnSync|execFile|execFileSync|fork'
+  const isExecLit = (s: string): boolean => {
+    const m = s.trim().match(/^(?:`|'|")([^`'"]+)(?:`|'|")$/)
+    return m ? new RegExp(`^(?:${execVerbs})$`).test(m[1]) : false
+  }
+  // B-F11-1/2 (dsh review 309cfe7): child_process sourcing is fail-closed by
+  // construction. Sources are collected with a multi-hop fixpoint:
+  // require("child_process") aliases, process.getBuiltinModule results,
+  // createRequire() results applied to child_process, and any alias chain
+  // thereof. A NON-LITERAL member read from ANY source denies
+  // unconditionally — regardless of where the value flows (variable, array,
+  // object, argument, return, optional call, multi-hop binding). Only literal
+  // exec verbs keep the adjudicated read-only ALLOW paths below.
+  const bindAllRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\n]+)/g
+  let changed = true
+  let guard = 0
+  while (changed && guard++ < 10) {
+    changed = false
+    for (const b of code.matchAll(bindAllRe)) {
+      const name = b[1]
+      const rhs = b[2].trim()
+      if (cpAliases.has(name) || reqAliases.has(name)) continue
+      if (/^require\s*\(\s*["'`]child_process["'`]\s*\)$/.test(rhs) ||
+          /^process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\)$/.test(rhs) ||
+          [...cpAliases].some((a) => new RegExp(`^${esc(a)}$`).test(rhs)) ||
+          /^(?:require\s*\(\s*["'`]module["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]module["'`]\s*\))\s*\.\s*createRequire\s*\([^)]*\)\s*\(\s*["'`]child_process["'`]\s*\)$/.test(rhs)) {
+        cpAliases.add(name); changed = true; continue
+      }
+      if (/^(?:require\s*\(\s*["'`]module["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]module["'`]\s*\))\s*\.\s*createRequire\s*\([^)]*\)$/.test(rhs) ||
+          [...reqAliases].some((a) => new RegExp(`^${esc(a)}$`).test(rhs))) {
+        reqAliases.add(name); changed = true; continue
+      }
+    }
+  }
+  const srcParts: string[] = [...cpAliases].map(esc)
+  srcParts.push('require\\s*\\(\\s*["\'`]child_process["\'`]\\s*\\)')
+  srcParts.push('process\\.\\s*getBuiltinModule\\s*\\(\\s*["\'`]child_process["\'`]\\s*\\)')
+  srcParts.push('(?:require\\s*\\(\\s*["\'`]module["\'`]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*["\'`]module["\'`]\\s*\\))\\s*\\.\\s*createRequire\\s*\\([^)]*\\)\\s*\\(\\s*["\'`]child_process["\'`]\\s*\\)')
+  for (const r of reqAliases) srcParts.push(esc(r) + '\\s*\\(\\s*["\'`]child_process["\'`]\\s*\\)')
+  const srcAlt = srcParts.join('|')
+  // F1: any non-literal member read from a source — deny. Covers dynamic and
+  // concatenated keys wherever they appear (direct call, array/object/argument/
+  // return wrappers, optional calls, multi-hop bindings) without needing value
+  // tracking.
+  const dynKeyRe = new RegExp(`(?:${srcAlt})\\s*\\[\\s*([^\\]]+)\\s*\\]`, 'g')
+  let dk: RegExpExecArray | null
+  while ((dk = dynKeyRe.exec(code)) !== null) {
+    if (isExecLit(dk[1])) continue
+    return `child_process source dynamic member read (${dk[0].slice(0, 24)})`
+  }
+  // F5 (B-F11-1/2, dsh review 309cfe7 W1/W2/W16/W17): Reflect.get with a
+  // NON-LITERAL key — the result cannot be proven to be a benign property
+  // read, so it fails closed regardless of the receiver (nested receivers
+  // like `Reflect.get(c,"c")` included; a regex cannot parse those, so this
+  // is a bracket-balanced scan). Literal keys keep the adjudicated paths.
+  {
+    const rg = 'Reflect.get('
+    let i = 0
+    while ((i = code.indexOf(rg, i)) !== -1) {
+      let depth = 0
+      let j = i + rg.length
+      let inStr: string | null = null
+      for (; j < code.length; j++) {
+        const ch = code[j]
+        if (inStr) {
+          if (ch === '\\') { j++; continue }
+          if (ch === inStr) inStr = null
+          continue
+        }
+        if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; continue }
+        if (ch === '(') depth++
+        else if (ch === ')') { if (depth === 0) break; depth-- }
+      }
+      let d2 = 0
+      let comma = -1
+      let s2: string | null = null
+      for (let k = i + rg.length; k < j; k++) {
+        const ch = code[k]
+        if (s2) {
+          if (ch === '\\') { k++; continue }
+          if (ch === s2) s2 = null
+          continue
+        }
+        if (ch === '"' || ch === "'" || ch === '`') { s2 = ch; continue }
+        if (ch === '(') d2++
+        else if (ch === ')') d2--
+        else if (ch === ',' && d2 === 0) { comma = k; break }
+      }
+      if (comma !== -1) {
+        const key = code.slice(comma + 1, j).trim()
+        if (!/^(?:`|'|")(?:[^`'"]|\\[\s\S])*(?:`|'|")$/.test(key)) {
+          return `Reflect.get non-literal key (${key.slice(0, 24)})`
+        }
+      }
+      i = j
+    }
+  }
+  // F2: computed-key destructure `var {[k]:f}=cp` — same fail-closed stance.
+  const compDestrRe = new RegExp(`\\{\\s*\\[\\s*[^\\]]+\\s*\\]\\s*:[^}]*\\}\\s*=\\s*(?:${srcAlt})`, 'g')
+  let cd: RegExpExecArray | null
+  while ((cd = compDestrRe.exec(code)) !== null) {
+    return 'child_process computed-key destructure'
+  }
+  // F3: createRequire applied to a NON-literal module name then member access —
+  // the module cannot be proven to be something other than child_process, so a
+  // following `[member]` / `.verb(` fails closed.
+  const crNonLitRe = /(?:require\s*\(\s*["'`]module["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]module["'`]\s*\))\s*\.\s*createRequire\s*\([^)]*\)\s*\(\s*([^)]+?)\s*\)(?:\s*\[\s*[^\]]+\s*\]|\s*\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*\()/g
+  let cn: RegExpExecArray | null
+  while ((cn = crNonLitRe.exec(code)) !== null) {
+    const mod = cn[1].trim()
+    if (/^(?:`|'|")child_process(?:`|'|")$/.test(mod)) continue
+    return `createRequire non-literal module source (${mod.slice(0, 16)})`
+  }
+  // F4: literal exec verb from a source stored in a CONTAINER (object value /
+  // array element / argument / return / paren-wrap / comma sequence) without an
+  // immediate call — the invocation site cannot be tracked. Direct variable
+  // bindings (`const f=cp.x`) stay in fvars below and keep the read-only ALLOW.
+  const contRe = new RegExp(`(?:[\\{\\[(,]|\\breturn|:)\\s*(?:[A-Za-z_$][\\w$]*\\s*:\\s*)?(?:${srcAlt})\\s*\\.\\s*(?:${execVerbs})\\b(?!\\s*\\()`, 'g')
+  let ct: RegExpExecArray | null
+  while ((ct = contRe.exec(code)) !== null) {
+    return `child_process exec verb stored in container (${ct[0].slice(-24)})`
+  }
   // direct module receiver: `const cp = require("child_process")`
   const bindRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*["'`]child_process["'`]\s*\)/g
   let m: RegExpExecArray | null
@@ -5048,44 +5256,13 @@ function f6CpDispatchThreat(code: string): string | null {
     const verb = m[2] ?? m[3] ?? ''
     if (/^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(verb)) fvars.add(m[1])
   }
-  // B-F10-1 (dsh review cba2a07): data-flow closure for DYNAMIC member reads —
-  // `var f=cp["sp"+"awnSync"]` / `var f=cp[k]` / `var f=Reflect.get(cp,<dynamic>)`
-  // / `var f=Reflect.get(require("child_process"),<dynamic>)` / any require()
-  // literal receiver slot. The key cannot be statically resolved, so ANY later
-  // invocation (direct, .apply/.call, Reflect.apply, bind) fails closed — no
-  // argv adjudication is attempted for these.
-  const isCpReceiver = (expr: string): boolean =>
-    cpAliases.has(expr.trim()) || /^require\s*\(\s*["'`]child_process["'`]\s*\)$/.test(expr.trim())
-  const dynFVars = new Set<string>()
-  const dynBindRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*((?:[A-Za-z_$][\w$]*|require\s*\(\s*["'`]child_process["'`]\s*\))\s*\[\s*[^\]]+\s*\]|Reflect\.\s*get\s*\(\s*[^)]+\))/g
-  while ((m = dynBindRe.exec(code)) !== null) {
-    const rhs = m[2].trim()
-    const memberRe = /^([A-Za-z_$][\w$]*|require\s*\(\s*["'`]child_process["'`]\s*\))\s*\[\s*([^\]]+)\s*\]$/.exec(rhs)
-    if (memberRe) {
-      const recv = memberRe[1].trim()
-      if (!isCpReceiver(recv)) continue
-      const key = memberRe[2].trim()
-      const litKey = key.match(/^(?:`|'|")([^`'"]+)(?:`|'|")$/)
-      if (litKey && /^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(litKey[1])) continue
-      dynFVars.add(m[1])
-      continue
-    }
-    const refRe = /^Reflect\.\s*get\s*\(\s*([^,]+?)\s*,\s*([^)]+)\)$/.exec(rhs)
-    if (refRe) {
-      const recv = refRe[1].trim()
-      if (!isCpReceiver(recv)) continue
-      const key = refRe[2].trim()
-      const litKey = key.match(/^(?:`|'|")([^`'"]+)(?:`|'|")$/)
-      if (litKey && /^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(litKey[1])) continue
-      dynFVars.add(m[1])
-    }
-  }
-  if (dynFVars.size > 0) {
-    const dfv = [...dynFVars].map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
-    const dynFCallRe = new RegExp(`\\b(?:${dfv})(?:\\.\\s*(?:apply|call|bind)\\s*)?\\(|Reflect\\.\\s*apply\\s*\\(\\s*(?:${dfv})\\b`, 'g')
-    for (const c of code.matchAll(dynFCallRe)) {
-      return `child_process dynamic member binding invoked (${c[0].slice(0, 20)})`
-    }
+  // B-F10-1/B-F11-1 (dsh review 309cfe7): superseded by F1-F4 above — dynamic
+  // member reads from child_process sources deny at the READ site, so binding
+  // tracking and the old 3-spelling invocation net are no longer needed.
+  const isCpReceiver = (expr: string): boolean => {
+    const t = expr.trim()
+    if (cpAliases.has(t)) return true
+    return /require\s*\(\s*["'`]child_process["'`]\s*\)|getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\)|createRequire|Reflect\.\s*get/.test(t)
   }
   // renamed/plain function variables invoked later: `ss(…)` — adjudicate like
   // a direct exec-family call (read-only binaries stay ALLOW). B-F9-1: the
@@ -5604,8 +5781,12 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
           const jsDyn = f8JsDynExecThreat(literalCode, literalPr)
           if (jsDyn) return { kind: 'egress', signal: `${verb} ${jsDyn}` }
         }
+        F6_MEMBER_SLOT_RE.lastIndex = 0
+        F6_CP_MODULE_RE.lastIndex = 0
         const cpMarker = hasOutside(literalCode, /child_process|\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/, literalPr) ||
-          F6_MEMBER_SLOT_RE.test(literalCode) || F6_CP_MODULE_RE.test(literalCode)
+          F6_MEMBER_SLOT_RE.test(literalCode) || F6_CP_MODULE_RE.test(literalCode) || CR_DYN_MEMBER_RE.test(literalCode)
+        F6_MEMBER_SLOT_RE.lastIndex = 0
+        F6_CP_MODULE_RE.lastIndex = 0
         if (cpMarker) {
           const t = f6ExecThreat(literalCode)
           if (t) return { kind: 'egress', signal: `${verb} unverifiable child_process exec family: ${t}` }
