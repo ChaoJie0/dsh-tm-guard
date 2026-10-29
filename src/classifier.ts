@@ -2910,9 +2910,14 @@ function stripUvRunFlags(s: string): string {
   // bare-shell stdin (B6). Fail closed for every interpreter and shell; a
   // script file argument (`python3 x.py`, `bash script.sh`) or an inline
   // `-c/-e` code flag keeps the historical classification.
+  // f-round-6 B-F6-2: a heredoc marker (`node - <<'JS'`, folded to
+  // `<<heredoc`) means the body IS visible on the command line and was
+  // pre-scanned by heredocBodyDanger — exempt it exactly like the H3b/F4
+  // branch does, so benign heredoc scripts are not collateral-blocked.
   if ((LOCAL_EXEC_COMMANDS.has(firstWord) || PY_INTERPRETER_RE.test(firstWord) ||
        ['bash', 'sh', 'zsh', 'dash'].includes(firstWord)) &&
-      /^-(\s|$)/.test(rest)) {
+      /^-(\s|$)/.test(rest) &&
+      !/<<-?/.test(rest)) {
     return {
       category: 'unknown',
       reason: `interpreter reads stdin code (unverifiable): ${fullCmd.slice(0, 60)}`,
@@ -3632,6 +3637,54 @@ function stripUvRunFlags(s: string): string {
  * body (`print(1)`, `subprocess.run(["ls","-la"])`) keeps its historical
  * allow. Returns a ClassifyResult when dangerous, null otherwise.
  */
+/** Interpreter/shell verbs that EXECUTE a heredoc body (or forward stdin to
+ *  an interpreter action). Data-consumers (`cat`, `sed`, `awk`, `tee`,
+ *  `python` reading DATA, …) are deliberately absent — their heredoc body is
+ *  text, not code, and must not be adjudicated (B-F6-2). */
+const HEREDOC_EXEC_CONSUMERS = new Set([
+  'sh', 'bash', 'dash', 'zsh', 'ksh', 'tcsh', 'csh',
+  'node', 'nodejs', 'python', 'python2', 'python3', 'python3.12', 'pypy',
+  'ruby', 'perl', 'perl5', 'php', 'php-cli', 'lua', 'luajit',
+  'find', 'fd', 'xargs',
+])
+
+/**
+ * Return the verb of the command that receives `<<` at `at` (scanning the
+ * segment left of the heredoc opener), or null when the consumer is not an
+ * interpreter/shell — in which case the body is plain data and must not be
+ * code-adjudicated.
+ */
+function heredocConsumer(command: string, at: number): string | null {
+  const head = command.slice(0, at)
+  let segStart = -1
+  for (let i = head.length - 1; i >= 0; i--) {
+    const ch = head[i]
+    // `\;` `\(` `\|` `\&` are escaped (non-boundary) characters — find
+    // action terminators and path conditions contain `\;` / `\(` and must not
+    // split the command into an empty consumer segment.
+    if ((ch === ';' || ch === '|' || ch === '&' || ch === '\n' || ch === '(') && head[i - 1] === '\\') {
+      continue
+    }
+    if (ch === ';' || ch === '|' || ch === '&' || ch === '\n' || ch === '(') { segStart = i; break }
+  }
+  const seg = head.slice(segStart + 1)
+  const toks = seg.split(/\s+/).filter(Boolean)
+  for (let i = toks.length - 1; i >= 0; i--) {
+    const t = toks[i]
+    if (/^(?:[12]?>>?|<<|<>)$/.test(t) || t === '<') break
+    // find action syntax (`\;`, `{}`, `+`) is not the consumer and must not
+    // terminate the scan — `find . -exec node - {} \; <<'JS'` feeds the
+    // heredoc body to `node -` via inherited stdin, so the executor verb is
+    // one token earlier.
+    if (t === '\\;' || t === '{}' || t === '+') continue
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue
+    if (t.startsWith('-')) continue
+    const b = t.replace(/^["']|["']$/g, '').split('/').pop()?.toLowerCase() ?? ''
+    return HEREDOC_EXEC_CONSUMERS.has(b) ? b : null
+  }
+  return null
+}
+
 function heredocBodyDanger(command: string): { kind: 'delete' | 'egress'; signal: string } | null {
   const re = /<<-?\s*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z_][A-Za-z0-9_]*))/g
   re.lastIndex = 0
@@ -3639,6 +3692,9 @@ function heredocBodyDanger(command: string): { kind: 'delete' | 'egress'; signal
   while ((m = re.exec(command)) !== null) {
     const delim = m[1] ?? m[2] ?? m[3]
     if (!delim) continue
+    // B-F6-2: only adjudicate heredocs whose consumer executes the body.
+    const consumer = heredocConsumer(command, m.index)
+    if (!consumer) continue
     const esc = delim.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const bodyStart = m.index + m[0].length
     const rest = command.slice(bodyStart)
@@ -3648,28 +3704,36 @@ function heredocBodyDanger(command: string): { kind: 'delete' | 'egress'; signal
     const body = rest.slice(0, tm.index)
     re.lastIndex = bodyStart + tm.index + tm[0].length
     const lt = body.replace(/\\(["'\\])/g, '$1')
-    if (/child_process/.test(lt) || /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/.test(lt)) {
-      const directSafe =
-        /require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*\(\s*["'][^"']*["']\s*(?:,\s*\[?\s*["'][^"']*["']\s*(?:,\s*["'][^"']*["'])*\]?\s*)?\)/.test(lt) &&
-        f6ExecThreat(lt) === null
-      if (!directSafe) {
-        const t = f6ExecThreat(lt)
-        return { kind: 'egress', signal: `heredoc body: unverifiable child_process exec family${t ? `: ${t}` : ''}` }
+    const pr = protectedRegions(lt)
+    if (hasOutside(lt, /child_process|\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/, pr) ||
+        F6_MEMBER_SLOT_RE.test(lt) || F6_CP_MODULE_RE.test(lt)) {
+      // B-F6-2: gate on code OUTSIDE strings/comments, then adjudicate the
+      // actual call sites. A prose/comment/string mention of these words has
+      // no exec-family call shape → f6ExecThreat stays null → allowed.
+      const t = f6ExecThreat(lt)
+      if (t) return { kind: 'egress', signal: `heredoc body: unverifiable child_process exec family: ${t}` }
+      // B-N1-b: computed-destructure binding of an exec-family member into a
+      // variable that is later invoked — unverifiable statically.
+      if (F6_COMPUTED_BIND_RE.test(lt)) {
+        return { kind: 'egress', signal: 'heredoc body: computed-destructure exec-family binding' }
       }
     }
     const pyT = f6PyThreat(lt)
     if (pyT) return { kind: 'egress', signal: `heredoc body: python ${pyT}` }
-    if (FIND_FIND_DESTRUCTIVE_RE.test(lt)) {
+    if (hasOutside(lt, FIND_FIND_DESTRUCTIVE_RE, pr)) {
       return { kind: 'delete', signal: 'heredoc body: inline delete/spawn' }
     }
-    if (FIND_INLINE_EGRESS_RE.test(lt)) {
+    if (hasOutside(lt, FIND_INLINE_EGRESS_RE, pr)) {
       return { kind: 'egress', signal: 'heredoc body: inline network' }
     }
-    if (FIND_SHELLOUT_RE.test(lt)) {
+    if (hasOutside(lt, FIND_SHELLOUT_RE, pr)) {
       return { kind: 'egress', signal: 'heredoc body: subprocess shell-out' }
     }
-    if (NONPY_LAUNCH_WORD.test(maskStringLiterals(lt))) {
+    if (hasOutside(lt, NONPY_LAUNCH_WORD, pr)) {
       return { kind: 'delete', signal: 'heredoc body: inline launcher' }
+    }
+    if (hasOutside(lt, LUA_LAUNCH_RE, pr)) {
+      return { kind: 'egress', signal: 'heredoc body: lua shell-out' }
     }
   }
   return null
@@ -4304,7 +4368,7 @@ function wrappedEgressSignal(trimmed: string): string | null {
 /** Interpreters that may appear directly as a find/fd action verb (no sh wrapper). */
 const FIND_INLINE_INTERP = new Set([
   'perl', 'perl5', 'ruby', 'python', 'python3', 'python3.12', 'node', 'nodejs',
-  'php', 'php-cli',
+  'php', 'php-cli', 'lua', 'luajit',
 ])
 
 /**
@@ -4462,39 +4526,94 @@ function f6SplitArgs(args: string): string[] {
  * f-round-6 B-F5-2: adjudicate every exec-family call in a node code string.
  * Returns a threat signal, or null when every call site is a read-only binary.
  */
+// B-N1-b / B-F5-3: member-slot call shape — `require("child_process")[\`execSync\`](…)`,
+// `cp["execSync"](…)` / `cp['spawnSync'](…)` — the verb is wrapped in quotes or
+// backticks inside a computed member slot and is a REAL call site (template
+// keys, string keys), not prose. Adjudicated by f6ExecThreat below; not
+// region-filtered because the slot shape is too specific to appear in prose
+// and `(?=\s*\()` requires an actual call.
+const F6_MEMBER_SLOT_RE =
+  /\[(?:`|'|")(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)(?:`|'|")\](?=\s*\()/g
+
+// B-N1-b: computed-destructure binding — `const {["exec"+"Sync"]:e}=require("child_process")`
+// binds an exec-family member built from string concatenation into a variable;
+// the variable is later called, which no call-site net can statically follow.
+// The shape is far too specific for prose, so no region filter (fail-closed).
+const F6_COMPUTED_BIND_RE =
+  /\{\s*\[\s*(?:`|'|")(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)(?:(?:`|'|")\s*\+\s*(?:`|'|")[^`'"]*(?:`|'|"))?(?:\s*)\]\s*:\s*[A-Za-z_$][\w$]*\s*\}/g
+
+// B-N1-b / B-F5-3: `require("child_process")` / `from "child_process"` — the
+// module name lives inside a string literal, so region filtering would hide a
+// REAL code marker. Require/import-of-child_process is too specific to be
+// prose; treat its presence as a marker (fail-closed).
+const F6_CP_MODULE_RE = /(?:require\s*\(\s*|from\s+)(?:["'`])child_process(?:["'`])/g
+
+function f6AdjudicateCall(code: string, openIdx: number): string | null {
+  const ca = f6CallArgs(code, openIdx)
+  if (!ca) return null
+  const parts = f6SplitArgs(ca.args)
+  if (parts.length === 0) return 'exec-family call with no argv'
+  const first = parts[0].trim()
+  const lit0 = first.match(/^["']([^"']*)["']$/)
+  if (!lit0) return `non-literal argv[0] (${first.slice(0, 24)})`
+  const bin = (lit0[1].split('/').pop() ?? '').toLowerCase()
+  const rest = parts.slice(1).map((p) => p.trim().replace(/^["']|["']$/g, ''))
+  // flags may be a bare token, a quoted token, or elements inside a literal
+  // argv array (`['-c','id']`) — extract every quoted string first.
+  const hasFlag = rest.some((t) => {
+    const strings = [...t.matchAll(/["']([^"']*)["']/g)].map((x) => x[1])
+    if (strings.length === 0) return F6_CODE_EXEC_FLAG.test(t)
+    return strings.some((s) => F6_CODE_EXEC_FLAG.test(s))
+  })
+  if (F6_SHELLS.has(bin)) {
+    if (hasFlag) return `shell ${bin} with code-exec flag`
+    return null
+  }
+  if (F6_RELAYS.has(bin)) return `exec-family relay ${bin}`
+  if (F6_INTERPS.has(bin)) {
+    if (hasFlag) return `interpreter ${bin} with code-exec flag`
+    return null
+  }
+  if (F6_READ_BINARIES.has(bin)) return null
+  return `unverifiable binary ${bin}`
+}
+
 function f6ExecThreat(code: string): string | null {
+  const pr = protectedRegions(code)
   const re = /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*(?:\[[^\]]*\])?\s*\(/g
   re.lastIndex = 0
   let m: RegExpExecArray | null
   while ((m = re.exec(code)) !== null) {
+    const inRegion = pr.regions.some(([s, e]) => m!.index >= s && m!.index < e)
+    if (!pr.unterminated && inRegion) continue
     const openIdx = m.index + m[0].length - 1
-    const ca = f6CallArgs(code, openIdx)
-    if (!ca) continue
-    const parts = f6SplitArgs(ca.args)
-    if (parts.length === 0) return 'exec-family call with no argv'
-    const first = parts[0].trim()
-    const lit0 = first.match(/^["']([^"']*)["']$/)
-    if (!lit0) return `non-literal argv[0] (${first.slice(0, 24)})`
-    const bin = (lit0[1].split('/').pop() ?? '').toLowerCase()
-    const rest = parts.slice(1).map((p) => p.trim().replace(/^["']|["']$/g, ''))
-    // flags may be a bare token, a quoted token, or elements inside a literal
-    // argv array (`['-c','id']`) — extract every quoted string first.
-    const hasFlag = rest.some((t) => {
-      const strings = [...t.matchAll(/["']([^"']*)["']/g)].map((x) => x[1])
-      if (strings.length === 0) return F6_CODE_EXEC_FLAG.test(t)
-      return strings.some((s) => F6_CODE_EXEC_FLAG.test(s))
-    })
-    if (F6_SHELLS.has(bin)) {
-      if (hasFlag) return `shell ${bin} with code-exec flag`
-      continue
-    }
-    if (F6_RELAYS.has(bin)) return `exec-family relay ${bin}`
-    if (F6_INTERPS.has(bin)) {
-      if (hasFlag) return `interpreter ${bin} with code-exec flag`
-      continue
-    }
-    if (F6_READ_BINARIES.has(bin)) continue
-    return `unverifiable binary ${bin}`
+    const t = f6AdjudicateCall(code, openIdx)
+    if (t) return t
+  }
+  // member-slot call shape (template/string keys): not region-filtered — the
+  // verb inside `[…]` is a real computed member access, adjudicate it like a
+  // direct call; `(?=\s*\()` already rules out prose mentions.
+  F6_MEMBER_SLOT_RE.lastIndex = 0
+  let sm: RegExpExecArray | null
+  while ((sm = F6_MEMBER_SLOT_RE.exec(code)) !== null) {
+    const openIdx = code.indexOf('(', sm.index + sm[0].length)
+    if (openIdx < 0) continue
+    const t = f6AdjudicateCall(code, openIdx)
+    if (t) return t
+  }
+  // B-N1-b: exec-family verb bound to a variable WITHOUT a direct call —
+  // `const r=require("child_process").execSync;r(…)` / comma-operator
+  // bindings — the variable is invoked later, which cannot be statically
+  // adjudicated. Only the no-call binding shape triggers (a direct
+  // `execSync(…)` is already handled above); prose mentions are excluded by
+  // the region check.
+  const bindRe = /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)(?!\s*\()(?=\s*(?:[,;]|$))/g
+  bindRe.lastIndex = 0
+  let bm: RegExpExecArray | null
+  while ((bm = bindRe.exec(code)) !== null) {
+    const inRegion = pr.regions.some(([s, e]) => bm!.index >= s && bm!.index < e)
+    if (!pr.unterminated && inRegion) continue
+    return 'exec-family binding (variable invoked later, unverifiable)'
   }
   return null
 }
@@ -4508,42 +4627,56 @@ function f6PyThreat(code: string): string | null {
   // f-round-6 B-F5-3: same-line alias tracking — `import subprocess as s;
   // s.run(…)` / `o=os; o.system(…)` hide the literal `subprocess.`/`os.`
   // regexes on the find-inline python face.
+  const pr = protectedRegions(code)
+  const outside = (idx: number) => !pr.unterminated && pr.regions.some(([s, e]) => idx >= s && idx < e)
   const spAliases = new Set<string>()
   for (const m of code.matchAll(/(?:import\s+subprocess\s+as\s+(\w+)|(\w+)\s*=\s*subprocess\b)/g)) {
+    if (outside(m.index)) continue
     if (m[1]) spAliases.add(m[1])
     if (m[2]) spAliases.add(m[2])
   }
   for (const m of code.matchAll(/from\s+subprocess\s+import\s+(?:(\w+)(?:\s+as\s+(\w+))?)/g)) {
+    if (outside(m.index)) continue
     if (m[2]) spAliases.add(m[2])
     else if (m[1] && /^(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)$/.test(m[1])) spAliases.add(m[1])
   }
   const osAliases = new Set<string>()
   for (const m of code.matchAll(/(?:import\s+os\s+as\s+(\w+)|(\w+)\s*=\s*os\b)/g)) {
+    if (outside(m.index)) continue
     if (m[1]) osAliases.add(m[1])
     if (m[2]) osAliases.add(m[2])
   }
   for (const m of code.matchAll(/from\s+os\s+import\s+(?:(\w+)(?:\s+as\s+(\w+))?)/g)) {
+    if (outside(m.index)) continue
     if (m[2]) osAliases.add(m[2])
     else if (m[1] && /^(?:system|popen|spawn|execl|execv|posix_spawn)$/.test(m[1])) osAliases.add(m[1])
   }
   if (osAliases.size > 0) {
-    const rx = new RegExp(`\\b(?:${[...osAliases].map((a) => a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*\\.\\s*(?:system|popen|spawn|execl|execv|posix_spawn)\\s*\\(`)
-    if (rx.test(code)) return 'os alias shell-out call'
+    const rx = new RegExp(`\\b(?:${[...osAliases].map((a) => a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*\\.\\s*(?:system|popen|spawn|execl|execv|posix_spawn)\\s*\\(`, 'g')
+    for (const m of code.matchAll(rx)) {
+      if (!outside(m.index)) return 'os alias shell-out call'
+    }
   }
   if (spAliases.size > 0) {
-    const rx = new RegExp(`\\b(?:${[...spAliases].map((a) => a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*\\.\\s*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)\\s*\\(`)
-    if (rx.test(code)) return 'subprocess alias shell-out call'
+    const rx = new RegExp(`\\b(?:${[...spAliases].map((a) => a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*\\.\\s*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)\\s*\\(`, 'g')
+    for (const m of code.matchAll(rx)) {
+      if (!outside(m.index)) return 'subprocess alias shell-out call'
+    }
   }
-  if (/getattr\s*\(\s*(?:os|subprocess)\b\s*,\s*["'](?:system|popen|run|call|Popen|check_output|check_call|exec[a-z]*|spawn[a-z]*|posix_spawn)["']/.test(code))
-    return 'getattr os/subprocess dispatch'
-  if (/from\s+os\s+import\s+[^;\n]*(?:system|popen|spawn|execl|execv|posix_spawn)/.test(code))
-    return 'from os import shell-out name'
-  if (/from\s+subprocess\s+import\s+[^;\n]*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)/.test(code))
-    return 'from subprocess import shell-out name'
+  for (const m of code.matchAll(/getattr\s*\(\s*(?:os|subprocess)\b\s*,\s*["'](?:system|popen|run|call|Popen|check_output|check_call|exec[a-z]*|spawn[a-z]*|posix_spawn)["']/g)) {
+    if (!outside(m.index)) return 'getattr os/subprocess dispatch'
+  }
+  for (const m of code.matchAll(/from\s+os\s+import\s+[^;\n]*(?:system|popen|spawn|execl|execv|posix_spawn)/g)) {
+    if (!outside(m.index)) return 'from os import shell-out name'
+  }
+  for (const m of code.matchAll(/from\s+subprocess\s+import\s+[^;\n]*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)/g)) {
+    if (!outside(m.index)) return 'from subprocess import shell-out name'
+  }
   const re = /\bsubprocess\s*\.\s*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)\s*\(/g
   re.lastIndex = 0
   let m: RegExpExecArray | null
   while ((m = re.exec(code)) !== null) {
+    if (!pr.unterminated && pr.regions.some(([s, e]) => m!.index >= s && m!.index < e)) continue
     const openIdx = m.index + m[0].length - 1
     const ca = f6CallArgs(code, openIdx)
     if (!ca) continue
@@ -4650,8 +4783,82 @@ function maskStringLiterals(code: string): string {
     .replace(/"(?:[^"\\\n]|\\.)*"/g, '""')
 }
 
+/**
+ * f-round-6 B-F6-2: return the regions of `code` that live inside string
+ * literals ('…', "…", `…`) or line comments (//, #). Threat nets must ignore
+ * matches inside these regions — a benign heredoc/inline body that merely
+ * *mentions* spawn/exec/child_process/getattr in prose, a comment or a
+ * string must not be hard-denied. An unterminated string makes the rest of
+ * the body unclassifiable → callers treat it as unprotected (fail closed).
+ */
+function protectedRegions(code: string): { regions: Array<[number, number]>; unterminated: boolean } {
+  const regions: Array<[number, number]> = []
+  let unterminated = false
+  let i = 0
+  const n = code.length
+  while (i < n) {
+    const ch = code[i]
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const q = ch
+      let j = i + 1
+      let closed = false
+      while (j < n) {
+        if (code[j] === '\\') { j += 2; continue }
+        if (code[j] === q) { closed = true; break }
+        j++
+      }
+      if (!closed) { regions.push([i, n]); unterminated = true; break }
+      regions.push([i, j + 1])
+      i = j + 1
+      continue
+    }
+    if (ch === '/' && code[i + 1] === '/') {
+      let j = i
+      while (j < n && code[j] !== '\n') j++
+      regions.push([i, j])
+      i = j
+      continue
+    }
+    if (ch === '#') {
+      const prev = i === 0 ? '' : code[i - 1]
+      if (prev === '' || /\s/.test(prev) || prev === ';') {
+        let j = i
+        while (j < n && code[j] !== '\n') j++
+        regions.push([i, j])
+        i = j
+        continue
+      }
+    }
+    i++
+  }
+  return { regions, unterminated }
+}
+
+/** True when `rx` has a match whose index lies outside every protected region. */
+function hasOutside(code: string, rx: RegExp, pr: { regions: Array<[number, number]>; unterminated: boolean }): boolean {
+  if (pr.unterminated) return true
+  // B-F6-2 hang fix: callers pass many non-global regexes; a non-global
+  // RegExp#exec always matches from index 0 and never advances lastIndex,
+  // so when every hit lands inside a protected region the loop never
+  // terminates. Clone with the `g` flag so exec advances and the loop ends.
+  if (!rx.global) rx = new RegExp(rx.source, rx.flags + 'g')
+  rx.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = rx.exec(code)) !== null) {
+    const inRegion = pr.regions.some(([s, e]) => m!.index >= s && m!.index < e)
+    if (!inRegion) return true
+  }
+  return false
+}
+
 const NONPY_LAUNCH_WORD =
   /\b(?:system|spawn|popen|passthru|proc_open|pcntl_exec|shell_exec|exec|fork)\b/
+
+// f-round-6 N-F6-3: lua/luajit inline (-e) and heredoc bodies — os.execute /
+// io.popen are this language's shell-out primitives and are not covered by
+// the node/python/Open3 nets.
+const LUA_LAUNCH_RE =
+  /\b(?:os\.(?:execute|exit|remove|rename)|io\.(?:popen|open|write|lines)|load(?:string)?\s*\(|dofile|package\.loadlib)\b/
 
 const PY_FIND_LAUNCH_RE =
   /\b(?:os\.(?:popen|exec[a-z]*|posix_spawn)|subprocess\.(?:run|Popen|call|check_call|check_output|getoutput|getstatusoutput))\s*\(/g
@@ -4736,18 +4943,25 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
         // computed destructuring, comma-operator bindings, method binding
         // across lines, argv0 relays (env/find/xargs/busybox), flag
         // reordering (`bash --norc -c`), merged flags (`sh -xc`) and
-        // non-literal argv0 all fail closed.
-        const cpMarker =
-          /child_process/.test(literalCode) ||
-          /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/.test(literalCode)
+        // non-literal argv0 all fail closed. B-F6-2: the marker gate and the
+        // call-site net both ignore string-literal / comment regions, so a
+        // benign body merely *mentioning* spawn/exec/child_process stays
+        // allowed; an unterminated string keeps everything fail-closed.
+        const literalPr = protectedRegions(literalCode)
+        const cpMarker = hasOutside(literalCode, /child_process|\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\b/, literalPr) ||
+          F6_MEMBER_SLOT_RE.test(literalCode) || F6_CP_MODULE_RE.test(literalCode)
         if (cpMarker) {
-          const directSafe =
-            /require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*\(\s*["'][^"']*["']\s*(?:,\s*\[?\s*["'][^"']*["']\s*(?:,\s*["'][^"']*["'])*\]?\s*)?\)/.test(literalCode) &&
-            f6ExecThreat(literalCode) === null
-          if (!directSafe) {
-            const t = f6ExecThreat(literalCode)
-            return { kind: 'egress', signal: `${verb} unverifiable child_process exec family${t ? `: ${t}` : ''}` }
+          const t = f6ExecThreat(literalCode)
+          if (t) return { kind: 'egress', signal: `${verb} unverifiable child_process exec family: ${t}` }
+          // B-N1-b: computed-destructure exec-family binding invoked via a
+          // variable — no call site to adjudicate, fail closed.
+          if (F6_COMPUTED_BIND_RE.test(literalCode)) {
+            return { kind: 'egress', signal: `${verb} computed-destructure exec-family binding` }
           }
+        }
+        // f-round-6 N-F6-3: lua/luajit shell-out primitives.
+        if (hasOutside(literalCode, LUA_LAUNCH_RE, literalPr)) {
+          return { kind: 'egress', signal: `${verb} lua shell-out` }
         }
         // f-round-6 B-F5-3: python subprocess/os shell-out gaps (shell=
         // truthy, getattr dispatch, bare from-imports, argv0 relays).
