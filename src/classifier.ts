@@ -5511,15 +5511,35 @@ function f6JsDanger(code: string): string | null {
       if (am) { rhsMap.set(am[1], am[2].trim()); continue }
     }
   }
-  for (const m of stripped.matchAll(/\b([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+?)(?=[;,]\s*$|;|$)/g)) {
+  // f-round-13 B-F13-1: accept assignments terminated by `)` / `]` (if-head I4,
+  // return-in-assignment K16) in addition to `;`/`,`/EOL. RHS is re-extracted
+  // with paren/bracket balancing so an opening paren in the RHS is never cut at
+  // the first `)` — `(0,eval)` stays whole (K11 family).
+  const fullRhs = (start: number): string => {
+    let bal = 0, inStr: string | null = null, i = start
+    for (; i < stripped.length; i++) {
+      const ch = stripped[i]
+      if (inStr) { if (ch === '\\') { i++; continue } if (ch === inStr) inStr = null; continue }
+      if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; continue }
+      if (ch === '(' || ch === '[' || ch === '{') bal++
+      else if (ch === ')' || ch === ']' || ch === '}') { bal--; if (bal < 0) break }
+      else if ((ch === ';' || ch === ',') && bal === 0) break
+      else if (ch === '\n' && bal === 0) break
+    }
+    return stripped.slice(start, i).trim()
+  }
+  for (const m of stripped.matchAll(/\b([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+?)(?=[;,)\]]|$)/g)) {
     if (/^(?:const|let|var|return|new|typeof|instanceof|in|of|delete|void)$/.test(m[1])) continue
+    const rhs = fullRhs(m.index + m[0].length - m[2].length)
+    if (!rhs) continue
     // skip chain-assignment shapes: a=b=expr — handled by the chain net below
-    if (/^\s*[A-Za-z_$][\w$]*\s*=/.test(m[2])) continue
-    rhsMap.set(m[1], m[2].trim())
+    if (/^\s*[A-Za-z_$][\w$]*\s*=/.test(rhs)) continue
+    rhsMap.set(m[1], rhs)
   }
   // chain assignment a=b=expr — runs AFTER plain assignment so it wins
-  for (const m of stripped.matchAll(/\b([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+?)(?=[;,]\s*(?:$|[A-Za-z_$])|$)/g)) {
-    const expr = m[3].trim()
+  for (const m of stripped.matchAll(/\b([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+?)(?=[;,)\]]|$)/g)) {
+    const expr = fullRhs(m.index + m[0].length - m[3].length)
+    if (!expr) continue
     rhsMap.set(m[1], expr)
     rhsMap.set(m[2], expr)
   }
@@ -5561,7 +5581,10 @@ function f6JsDanger(code: string): string | null {
         new RegExp(`^${namesOf(reqLike)}\\s*\\(`).test(t) ||
         new RegExp(`^${namesOf(reqF)}\\s*\\(`).test(t) ||
         /["'`]child["'`]\s*\+\s*["'`]_process["'`]/.test(t) ||
-        (/^require\s*\(\s*([A-Za-z_$][\w$]*)\s*\)$/.test(t) && modNames.has(t.match(/^require\s*\(\s*([A-Za-z_$][\w$]*)\s*\)$/)![1]))) {
+        (/^require\s*\(\s*([A-Za-z_$][\w$]*)\s*\)$/.test(t) && modNames.has(t.match(/^require\s*\(\s*([A-Za-z_$][\w$]*)\s*\)$/)![1])) ||
+        // f-round-13: ternary / short-circuit / if-head sources — `c=true?require(..):0`
+        /\?\s*[^:;,]{0,40}?(?:require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\)|(?:require|createRequire)\b)/.test(t) ||
+        /(?:&&|\|\|)\s*(?:require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\))/.test(t)) {
       res.add('cp')
     }
     if (/^require\s*\(\s*["'`]module["'`]\s*\)$/.test(t) ||
@@ -5590,13 +5613,22 @@ function f6JsDanger(code: string): string | null {
         /^globalThis\s*\[\s*["'`](?:eval|Function|eva["'`]\s*\+\s*["'`]l|Func["'`]\s*\+\s*["'`]tion)["'`]\s*\]$/.test(t) ||
         /^\[\]\s*\.\s*constructor(?:\s*\.\s*constructor)?$/.test(t) ||
         /^\(\[\]\)\s*\.\s*constructor(?:\s*\.\s*constructor)?$/.test(t) ||
-        new RegExp(`^${namesOf(dyn)}$`).test(t)) {
+        new RegExp(`^${namesOf(dyn)}$`).test(t) ||
+        // f-round-13 B-F13-2: standard indirect eval `(0,eval)`, ternary RHS,
+        // short-circuit RHS, arrow-returning eval `()=>eval`, yield-arg eval
+        /^\(\s*(?:0|false|null|void\s*0|undefined|[A-Za-z_$][\w$]*)\s*,\s*(?:eval|Function)\s*\)$/.test(t) ||
+        /\?\s*[^:;,]{0,40}?\beval\b/.test(t) ||
+        /(?:&&|\|\|)\s*eval\b/.test(t) ||
+        /^\(\)\s*=>\s*(?:eval|Function)\b/.test(t)) {
       res.add('dyn')
     }
     if (/^(?:\[[\s\S]*\]|\{[\s\S]*\})$/.test(t) && new RegExp(`(?:${CP_MOD})|(?:${namesOf(cp)})\\b|\\.\\.\\.(?:${namesOf(cp)})\\b`).test(t)) res.add('container')
     if (new RegExp(`^Reflect\\.\\s*get\\s*\\(\\s*(?:${namesOf(cp)}|${namesOf(container)}|${namesOf(derived)})\\b`).test(t) ||
         /^Object\.\s*getOwnPropertyDescriptor\s*\(\s*(?:require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\)|(?:[A-Za-z_$][\w$]*))\b/.test(t) && new RegExp(`^(?:require\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\)|${namesOf(cp)})`).test(t) ||
-        new RegExp(`^(?:${namesOf(cp)}|${namesOf(container)})\\s*(?:\\.\\s*[A-Za-z_$][\w$]*|\\[\\s*["'\x60][^"'\x60]+["'\x60]\\s*\\])\\s*$`).test(t)) {
+        new RegExp(`^(?:${namesOf(cp)}|${namesOf(container)})\\s*(?:\\.\\s*[A-Za-z_$][\w$]*|\\[\\s*["'\x60][^"'\x60]+["'\x60]\\s*\\])\\s*$`).test(t) ||
+        // f-round-13 B-F13-1: source-prefixed member extraction incl. optional
+        // chain — `require("child_process")?.["sp"+"awnSync"]` (P12 family)
+        /^(?:require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\))\s*(?:\?\.\s*)?(?:\.\s*[A-Za-z_$][\w$]*|\[\s*[^\]]+\s*\])/.test(t)) {
       res.add('derived')
     }
     if (new RegExp(`^${namesOf(dynC)}$`).test(t)) res.add('dynC')
@@ -5757,8 +5789,9 @@ function f6JsDanger(code: string): string | null {
   // ---- binding nets ----
   const alt = (set: Set<string>) => namesOf(set)
   // N1: non-literal member read/call on cp / derived / container
+  // (f-round-13: optional-chain member read `cp?.[...]` — K12/P12 family)
   if (cp.size + derived.size + container.size > 0) {
-    const n1 = new RegExp(`\\b(?:${alt(cp)}|${alt(derived)}|${alt(container)})\\s*\\[\\s*([^\\]]+)\\s*\\]`, 'g')
+    const n1 = new RegExp(`\\b(?:${alt(cp)}|${alt(derived)}|${alt(container)})\\s*(?:\\?\\.\\s*)?\\[\\s*([^\\]]+)\\s*\\]`, 'g')
     for (const m of stripped.matchAll(n1)) {
       const key = m[1].trim()
       const litKey = key.match(/^(?:`|'|")([^`'"]+)(?:`|'|")$/)
@@ -5773,7 +5806,8 @@ function f6JsDanger(code: string): string | null {
       return `child_process exec verb from container (${m[0].slice(0, 24)})`
     }
     // N6: a cp/container name invoked directly (module value treated as callable — abnormal, deny)
-    const n6 = new RegExp(`\\b(?:${alt(cp)}|${alt(container)})\\s*\\(`, 'g')
+    // (f-round-13: optional-call variant `cp?.(…)`)
+    const n6 = new RegExp(`\\b(?:${alt(cp)}|${alt(container)})\\s*(?:\\?\\.\\s*)?\\(`, 'g')
     for (const m of stripped.matchAll(n6)) {
       return `child_process source invoked directly (${m[0].slice(0, 24)})`
     }
@@ -5789,6 +5823,12 @@ function f6JsDanger(code: string): string | null {
     const n9a = new RegExp(`\\b(?:${alt(crF)})(?:\\.\\s*(?:call|apply|bind)\\s*)?\\(`, 'g')
     for (const m of stripped.matchAll(n9a)) {
       return `createRequire alias invoked (${m[0].slice(0, 24)})`
+    }
+    // B-F13-1 Q6C family: a createRequire/module-require alias used through a
+    // bracket member (`x["sp"+"awnSync"]`) is unverifiable statically — deny.
+    const n9d = new RegExp(`\\b(?:${alt(crF)}|${alt(modReq)}|${alt(reqLike)})\\s*(?:\\?\\.\\s*)?\\[\\s*[^\\]]+\\s*\\]`, 'g')
+    for (const m of stripped.matchAll(n9d)) {
+      return `module-source alias member access (${m[0].slice(0, 24)})`
     }
   }
   if (modReq.size > 0) {
@@ -5806,9 +5846,10 @@ function f6JsDanger(code: string): string | null {
       return `require alias module fetch (${m[0].slice(0, 24)})`
     }
   }
-  // N2: dynamic-exec source invoked (incl. .call/.apply/.bind forwarding)
+  // N2: dynamic-exec source invoked (incl. .call/.apply/.bind forwarding and
+  // optional-call `e?.(…)` — Q3 family)
   if (dyn.size + dynC.size > 0) {
-    const n2 = new RegExp(`\\b(?:${alt(dyn)}|${alt(dynC)})(?:\\.\\s*(?:call|apply|bind)\\s*)?\\(|Reflect\\.\\s*(?:apply|construct)\\s*\\(\\s*(?:${alt(dyn)}|${alt(dynC)})\\b|\\bnew\\s+(?:${alt(dyn)})`, 'g')
+    const n2 = new RegExp(`\\b(?:${alt(dyn)}|${alt(dynC)})(?:\\?\\.\\s*)?(?:\\.\\s*(?:call|apply|bind)\\s*)?\\(|Reflect\\.\\s*(?:apply|construct)\\s*\\(\\s*(?:${alt(dyn)}|${alt(dynC)})\\b|\\bnew\\s+(?:${alt(dyn)})`, 'g')
     for (const m of stripped.matchAll(n2)) {
       if (!outside(m.index)) return `dynamic code execution source invoked (${m[0].slice(0, 24)})`
     }
@@ -5839,11 +5880,11 @@ function f6JsDanger(code: string): string | null {
   // read/call that cannot be proven literal-benign. A derived name invoked
   // directly (bare call) is a member value exec — deny.
   if (derived.size > 0) {
-    const n8 = new RegExp(`\\b(?:${alt(derived)})\\s*\\[\\s*[^\\]]+\\s*\\]`, 'g')
+    const n8 = new RegExp(`\\b(?:${alt(derived)})\\s*(?:\\?\\.\\s*)?\\[\\s*[^\\]]+\\s*\\]`, 'g')
     for (const m of stripped.matchAll(n8)) {
       return `derived child_process member (${m[0].slice(0, 24)})`
     }
-    const n8b = new RegExp(`\\b(?:${alt(derived)})\\s*\\(`, 'g')
+    const n8b = new RegExp(`\\b(?:${alt(derived)})\\s*(?:\\?\\.\\s*)?\\(`, 'g')
     for (const m of stripped.matchAll(n8b)) {
       // derive the invocation parens and test the args for provable read-only-ness
       const open = stripped.indexOf('(', m.index + m[0].lastIndexOf('('))
@@ -5864,6 +5905,211 @@ function f6JsDanger(code: string): string | null {
         if (readOnlyArgs) continue
       }
       return `child_process member value invoked (${m[0].slice(0, 24)})`
+    }
+  }
+  // ---- f-round-13 B-F13-1/B-F13-2: value-passing fail-closed ----
+  // The binding nets above only see declaration/assignment names. Sources that
+  // travel through function parameters / callbacks / extractors / default
+  // params / proxies / generators / maps stay invisible to the fixpoint.
+  // Whitelist = pure functions that never invoke their argument.
+  const allSrc = new Set<string>([...cp, ...reqF, ...crF, ...modReq, ...gbmF, ...reqLike, ...dyn, ...dynC, ...gAlias, ...container, ...derived])
+  const allSrcRe = allSrc.size ? `(?:${namesOf(allSrc)})` : '(?!x)x'
+  const hasSrcTok = (s: string): boolean => {
+    const a = s.trim()
+    if (new RegExp(`\\b${allSrcRe}\\b`).test(a)) return true
+    // dynamic-exec function refs passed as values are dangerous on any callee.
+    if (/(?:^|[^A-Za-z_$])(?:eval|Function|globalThis|createRequire)\b/.test(a)) return true
+    // module OBJECT pass-through is benign (adjudicated at the exec call site);
+    // an exec-MEMBER reference taken off the module is not.
+    if (/require\s*\(\s*["'`](?:node:)?child_process["'`]\s*\)\s*(?:\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)|\[\s*["'`][^"'`]*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)[^"'`]*["'`]\s*\])/.test(a)) return true
+    if (/process\.\s*getBuiltinModule\s*\(\s*["'`](?:node:)?child_process["'`]\s*\)\s*(?:\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)|\[\s*["'`][^"'`]*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)[^"'`]*["'`]\s*\])/.test(a)) return true
+    if (/require\s*\(\s*["'`]module["'`]\s*\)/.test(a)) return true
+    if (/\.\s*createRequire\b/.test(a)) return true
+    return false
+  }
+  // call-site scan: every '(' with its paren-matched arg slice and head
+  for (let i = 0; i < stripped.length; i++) {
+    if (stripped[i] !== '(' || outside(i)) continue
+    let depth = 0, end = -1, inStr: string | null = null
+    for (let k = i; k < stripped.length; k++) {
+      const ch = stripped[k]
+      if (inStr) { if (ch === '\\') { k++; continue } if (ch === inStr) inStr = null; continue }
+      if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; continue }
+      if (ch === '(') depth++
+      else if (ch === ')') { depth--; if (depth === 0) { end = k; break } }
+    }
+    if (end === -1) continue
+    const args = stripped.slice(i + 1, end)
+    // B-F13-1: head extraction that walks back over optional calls (`?.(`),
+    // bracket members (`cp?.["sp"+…]?.(`) and paren groups, so the receiver
+    // root is recovered for the source-token check.
+    let j = i - 1
+    while (j >= 0 && /\s/.test(stripped[j])) j--
+    if (j >= 1 && stripped[j] === '.' && stripped[j - 1] === '?') j -= 2 // `?.(` optional call
+    while (j >= 0 && /\s/.test(stripped[j])) j--
+    let head = ''
+    if (j >= 0 && (stripped[j] === ']' || stripped[j] === '}')) {
+      // walk backward over chained index groups so the receiver root (module
+      // source) stays in the head: `[require(..)][0]["sp"+"awnSync"](`
+      let k = j
+      for (;;) {
+        const closer = stripped[k]
+        const opener = closer === ']' ? '[' : '{'
+        let depth = 0, kk = k
+        for (; kk >= 0; kk--) {
+          if (stripped[kk] === closer) depth++
+          else if (stripped[kk] === opener) { depth--; if (depth === 0) break }
+        }
+        k = kk
+        let h = k - 1
+        while (h >= 0 && /\s/.test(stripped[h])) h--
+        if (h >= 0 && (stripped[h] === ']' || stripped[h] === '}')) { k = h; continue }
+        break
+      }
+      head = stripped.slice(k, i)
+    } else if (j >= 0 && stripped[j] === ')') {
+      let depth = 0, k = j
+      for (; k >= 0; k--) {
+        if (stripped[k] === ')') depth++
+        else if (stripped[k] === '(') { depth--; if (depth === 0) break }
+      }
+      // extend to the callee name chain before the matching '(' so the
+      // receiver root (e.g. Reflect.get) is part of the head
+      let h2 = k - 1
+      while (h2 >= 0 && /\s/.test(stripped[h2])) h2--
+      if (h2 >= 0 && /[A-Za-z_$]/.test(stripped[h2])) {
+        let k2 = h2
+        while (k2 >= 0) {
+          if (/[A-Za-z0-9_$]/.test(stripped[k2])) { k2--; continue }
+          if (stripped[k2] === '.' && k2 - 1 >= 0 && /[A-Za-z0-9_$]/.test(stripped[k2 - 1])) { k2 -= 2; continue }
+          break
+        }
+        head = stripped.slice(k2 + 1, i)
+      } else {
+        head = stripped.slice(k, i)
+      }
+    } else if (j >= 0 && /[A-Za-z_$]/.test(stripped[j])) {
+      let k = j
+      while (k >= 0) {
+        if (/[A-Za-z0-9_$]/.test(stripped[k])) { k--; continue }
+        if (stripped[k] === '.' && k - 1 >= 0 && /[A-Za-z0-9_$]/.test(stripped[k - 1])) { k -= 2; continue }
+        if (stripped[k] === '?' && k - 1 >= 0 && stripped[k - 1] === '.') { k -= 2; continue }
+        break
+      }
+      head = stripped.slice(k + 1, i)
+    }
+    if (!head) continue
+    const headClean = head.replace(/\s+/g, '')
+    const srcHeadRe = new RegExp(`\\b${allSrcRe}\\b`)
+    if (/^(?:Object\.keys|JSON\.stringify|JSON\.parse|String|Number|Boolean|Array\.isArray|console\.(?:log|info|warn|error|debug))$/.test(headClean)) continue
+    const isReadOnlyArg = (t: string) =>
+      /^(?:null|undefined|this|true|false|-?\d+(?:\.\d+)?)$/.test(t) ||
+      /^["'`][^"'`]*["'`]$/.test(t) ||
+      (/^\[[\s\S]*\]$/.test(t) && !/[\>\|;&]|\$\(|`/.test(t) && !/\+\s*["'`]/.test(t))
+    // RO3: Reflect.get(module-source, literal-key) — benign descriptor read
+    if (/^Reflect\.\s*get$/.test(headClean)) {
+      const g = args.match(new RegExp(`^(?:${allSrcRe}|require\\s*\\(\\s*["'\\x60]child_process["'\\x60]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*["'\\x60]child_process["'\\x60]\\s*\\))\\s*,\\s*["'\\x60][^"'\\x60]+["'\\x60]$`))
+      if (g) continue
+      if (hasSrcTok(args)) return `module source through Reflect.get (${args.slice(0, 20)})`
+      continue
+    }
+    // RO4: Reflect.apply/call/construct of a literal exec member (or a derived
+    // exec-member value) — benign with read-only args; otherwise fail closed.
+    if (/^Reflect\.\s*(?:apply|call|construct)$/.test(headClean)) {
+      const elems = splitTopLevel(args, ',')
+      const first = elems[0]?.trim() ?? ''
+      const memberFirst = new RegExp(`^(?:${allSrcRe})\\s*(?:\\.\\s*[A-Za-z_$][\\w$]*|\\[\\s*["'\\x60][^"'\\x60]+["'\\x60]\\s*\\])$`).test(first)
+      const derivedFirst = new RegExp(`^(?:${alt(derived)}|${alt(refGetMem)})$`).test(first)
+      const thisArg = elems[1]?.trim() ?? ''
+      const argsArray = elems[2]?.trim() ?? ''
+      const thisOk = thisArg === '' || new RegExp(`^(?:${allSrcRe})$`).test(thisArg) || isReadOnlyArg(thisArg)
+      const restReadOnly = thisOk && isReadOnlyArg(argsArray)
+      if ((memberFirst || derivedFirst) && restReadOnly) continue
+      if (hasSrcTok(args)) return `module source through Reflect forward (${first.slice(0, 20)})`
+      continue
+    }
+    // any other Reflect.* form in the head — adjudicated by the reflect nets
+    // (refGet/refApply); here only fail closed when a source rides in the args
+    // or the result of a Reflect.get/apply dispatch is invoked with
+    // non-read-only args.
+    if (/^Reflect\./.test(headClean)) {
+      if (hasSrcTok(args)) return `module source through Reflect (${headClean.slice(0, 20)})`
+      if (/^Reflect\.\s*(?:get|apply|call|construct)\s*\(/.test(headClean)) {
+        const elems = splitTopLevel(args, ',')
+        const readOnly = elems.length > 0 && elems.every(isReadOnlyArg)
+        if (!readOnly) return `Reflect dispatch result invoked with non-readonly args (${headClean.slice(0, 20)})`
+      }
+      continue
+    }
+    // read-only exemptions (RO5/RO9 + RO1/RO2): literal exec-family member off a
+    // module source / derived member-value, called with literal-only args.
+    const memHead = head.match(new RegExp(`^(?:${allSrcRe})\\s*(?:\\?\\.\\s*)?(?:\\.\\s*([A-Za-z_$][\\w$]*)|\\[\\s*["'\\x60]([^"'\\x60]+)["'\\x60]\\s*\\])$`))
+    if (memHead && /^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(memHead[1] ?? memHead[2] ?? '')) {
+      const elems = splitTopLevel(args, ',')
+      const readOnlyArgs = elems.length > 0 && elems.every(isReadOnlyArg)
+      if (readOnlyArgs) continue
+    }
+    // RO1/RO2: derived member-value forwarded through apply/call/bind with
+    // literal-only args — provably read-only.
+    if (new RegExp(`^(?:${alt(derived)}|${alt(refGetMem)})\\s*\\.\\s*(?:apply|call|bind)$`).test(headClean)) {
+      const elems = splitTopLevel(args, ',')
+      const readOnlyArgs = elems.length > 0 && elems.every(isReadOnlyArg)
+      if (readOnlyArgs) continue
+    }
+    // B-F8-1 parity: a LITERAL object-destructured exec-member value called
+    // directly with read-only args stays benign
+    // (`{spawnSync:ss}=require("child_process");ss("ls",["-la"])`). Dynamic-key
+    // derived names are NOT in objDestr and still fail closed.
+    if (new RegExp(`^(?:${alt(objDestr)})$`).test(headClean)) {
+      const elems = splitTopLevel(args, ',')
+      const readOnlyArgs = elems.length > 0 && elems.every(isReadOnlyArg)
+      if (readOnlyArgs) continue
+    }
+    // B-F13-3 parity: ANY receiver with a literal exec-family member —
+    // read-only args are provably benign, anything else fails closed
+    // (`x.spawnSync("ls",["-la"])` after parameter/proxy/then forwarding).
+    if (/\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)\s*(?:\?\.\s*)?$/.test(headClean)) {
+      const elems = splitTopLevel(args, ',')
+      const readOnlyArgs = elems.length > 0 && elems.every(isReadOnlyArg)
+      if (readOnlyArgs) continue
+      return `exec-family member invoked with non-readonly args (${headClean.slice(0, 20)})`
+    }
+    // computed/bracket-dynamic member call — NOT provably read-only, fail
+    // closed regardless of args (a pure literal `["spawnSync"]` key or plain
+    // numeric index is handled by the RO nets above; splice keys like
+    // `["sp"+"awnSync"]` and variable keys like `[k]` are not provable).
+    if (/\]\s*$/.test(headClean) && !/\[\s*["'`][^"'`+]*["'`]\s*\]\s*$/.test(headClean) && !/\[\s*-?\d+\s*\]\s*$/.test(headClean)) {
+      return `computed member call (${headClean.slice(0, 20)})`
+    }
+    // B2 parity: direct literal require("child_process")["spawnSync"](...) —
+    // adjudicated by the direct nets; fail closed only on source-tainted args.
+    if (/^require\s*\(\s*["'\x60](?:node:)?child_process["'\x60]\s*\)\s*(?:\?\.\s*)?\s*(?:\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)|\[\s*["'\x60](?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)["'\x60]\s*\])\s*\(/.test(headClean)) {
+      if (hasSrcTok(args)) return `module source through literal exec member (${headClean.slice(0, 20)})`
+      continue
+    }
+    if (hasSrcTok(args) || srcHeadRe.test(head) || /require\s*\(\s*["'\x60](?:node:)?child_process["'\x60]\s*\)/.test(head)) return `module source passed as call argument (${headClean.slice(0, 20)})`
+  }
+  // extractor/pass-through family whose receiver expression carries a source
+  const extractorRe = /\.\s*(?:then|catch|finally|forEach|map|filter|reduce|flatMap|find|every|some|pop|shift|flat|get|next|values|entries)\s*\(/g
+  for (const m of stripped.matchAll(extractorRe)) {
+    const s = stripped.lastIndexOf(';', m.index)
+    const prefix = stripped.slice(s === -1 ? 0 : s + 1, m.index)
+    const dot = prefix.lastIndexOf('.')
+    const left = (dot === -1 ? prefix : prefix.slice(0, dot)).trim()
+    if (left && hasSrcTok(left)) return `source container through extractor/pass (${m[0].slice(0, 24)})`
+  }
+  // yield-of-source (O3/Q7 family)
+  r = hit(/\byield\s+(?:eval\b|Function\b|require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\)|require\b|createRequire\b)/, 'yield of module source', true)
+  if (r) return r
+  // return-assignment of source → function-result member/call (K16 family)
+  const retFn = new Set<string>()
+  for (const m of stripped.matchAll(new RegExp(`\\bfunction\\s*([A-Za-z_$][\\w$]*)\\s*\\([^)]*\\)\\s*\\{[^}]*?\\breturn\\s+[A-Za-z_$][\\w$]*\\s*=\\s*(?:require\\s*\\(\\s*["'\\x60]child_process["'\\x60]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*["'\\x60]child_process["'\\x60]\\s*\\)|eval\\b|Function\\b|require\\b|createRequire\\b|(?:${allSrcRe})\\b)`, 'g'))) {
+    retFn.add(m[1])
+  }
+  if (retFn.size > 0) {
+    const rfn = new RegExp(`\\b(?:${[...retFn].map(esc).join('|')})\\s*\\(\\s*\\)\\s*(?:\\?\\.\\s*)?\\[`, 'g')
+    for (const m of stripped.matchAll(rfn)) {
+      return `function-returned source member access (${m[0].slice(0, 24)})`
     }
   }
   return null

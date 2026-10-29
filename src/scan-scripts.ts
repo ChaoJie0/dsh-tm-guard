@@ -181,8 +181,8 @@ const RULES: Record<Lang, LangRules> = {
       /\b(exec|execSync|spawn|spawnSync|execFile)\s*\(\s*["'`][^"'`]*\b(curl|wget|n?cat|ssh|scp|git\s+(push|pull|clone|fetch))\b/,
     ],
     dyn: [
-      /\beval\s*\(/,
-      /\bnew\s+Function\s*\(/,
+      /(?<!["'\x60])eval\s*\(/,
+      /(?<!["'\x60])new\s+Function\s*\(/,
     ],
     risky: [
       /\bprocess\.(kill|spawn)\b/,
@@ -223,7 +223,7 @@ const RULES: Record<Lang, LangRules> = {
       /\bNet::HTTP\.|Faraday\.|URI\.open\s*\(|open\s*\(\s*['"]https?:/,
     ],
     shellNet: [],
-    dyn: [/\beval\s*\(/],
+    dyn: [/(?<!["'\x60])eval\s*\(/],
     risky: [
       // file write / truncate / permission / link / rename primitives
       /\bFile\.(write|binwrite|truncate|chmod|chown|rename|move|symlink|hardlink|link|delete|unlink)\b/,
@@ -285,7 +285,7 @@ const RULES: Record<Lang, LangRules> = {
     ],
     callNet: [],
     shellNet: [],
-    dyn: [/\beval\s*(["'{(]|\s*\{)/],
+    dyn: [/(?<!["'\x60])eval\s*(["'{(]|\s*\{)/],
     risky: [
       // open with write/pipe modes
       /\bopen\s*\([^)]*['"](?:>|>>|>\||\|)/,
@@ -310,7 +310,7 @@ const RULES: Record<Lang, LangRules> = {
     importNet: [],
     callNet: [],
     shellNet: [],
-    dyn: [/\beval\b/],
+    dyn: [/(?<!["'\x60])eval\b/],
     risky: [
       /\b(exec|socket|open|source)\b/,
       /\bfile\s+(delete|rename|mkdir|link)\b/,
@@ -858,7 +858,23 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
         /\[["'][^"']*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)[^"']*["']\s*(?:\+\s*["'][^"']*["']\s*)*\]\s*\(/.test(line))) {
         const literalExec =
           /(?:require\s*\(\s*["'](?:node:)?child_process["']\s*\)|import\s*\(\s*["'](?:node:)?child_process["']\s*\))\s*\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*\(\s*["'][^"']*["']\s*(?:,\s*\[?\s*["'][^"']*["']\s*(?:,\s*["'][^"']*["'])*\]?\s*)?\)/
-        if (!literalExec.test(line)) execThreat = true
+        if (!literalExec.test(line)) {
+          // f-round-13 parity: ANY receiver with a literal exec-family member
+          // and literal-only args is benign (classifier f6JsDanger exempts the
+          // same shape; parameter/proxy/then forwarding included). Anything
+          // else fails closed as unverifiable.
+          const roCall = line.match(/(?:\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)|\[\s*["'][^"']*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)[^"']*["']\s*\])(?:\s*\.\s*(?:apply|call|bind)\s*)?\(([^;)]*)\)/)
+          if (!roCall) {
+            execThreat = true
+          } else {
+            const a = roCall[1].trim()
+            const readOnly =
+              /^["'][^"']*["']$/.test(a) ||
+              /^\[[\s\S]*\]$/.test(a) && !/[\>\|;&]|\$\(|`/.test(a) && !/\+\s*["']/.test(a) ||
+              /^["'][^"']*["']\s*,\s*\[[\s\S]*\]$/.test(a) && !/[\>\|;&]|\$\(|`/.test(a) && !/\+\s*["']/.test(a)
+            if (!readOnly) execThreat = true
+          }
+        }
       }
       if (execThreat) unverifiable = true
     }
