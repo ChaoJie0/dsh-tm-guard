@@ -4669,6 +4669,20 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
   while ((am = actionRe.exec(trimmed))) {
     const action = trimmed.slice(am.index + am[0].length)
 
+    // f-round-6 dsh live-find: a shell/interpreter in the action reading
+    // script code from stdin (here-string `<<<`, bare `-`/`-s` script mode,
+    // `/dev/stdin`, `/dev/fd/N`) without a scanned `<<heredoc` marker is
+    // unverifiable — the body rides in on a pipe/redirect/here-string and is
+    // never visible here. Fail closed on the destructive side for any shell
+    // OR interpreter token, not just FIND_INLINE_INTERP members (`bash -s`).
+    if (!/<<heredoc/.test(action)) {
+      const hasShellInterp =
+        /\b(?:sh|bash|dash|zsh|ksh|tcsh|csh|python|python3(?:\.\d+)?|node|nodejs|ruby|perl|perl5|php|php-cli|awk|gawk|sed)\b/.test(action)
+      if (hasShellInterp && /(?:^|[\s;])-(?:[\s;]|$)|<<<|\/dev\/(?:stdin|fd\/\d+)/.test(action)) {
+        return { kind: 'delete', signal: 'shell/interpreter reads script code from stdin (here-string/redirect/pipe — unverifiable)' }
+      }
+    }
+
     // Direct interpreter verb: skip wrapper prefixes (f-round-6: the whole
     // wrapper set, not just env — `nice node`, `env env python3`, `time node`,
     // `command -v`), options, NAME=value, then read the token.
@@ -4686,6 +4700,17 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
       break
     }
     if (FIND_INLINE_INTERP.has(verb)) {
+      // f-round-6 dsh live-find: `find … -exec node - {}` reads script code
+      // from stdin — here-string (`<<<`), pipe (`echo x | find … node -`) or
+      // file redirect (`< code.js`) — and the body is never visible to the
+      // classifier. Only the collapsed `<<heredoc` marker is trustworthy
+      // (heredocBodyDanger scanned the body pre-collapse); every other
+      // stdin posture is unverifiable → fail closed on the destructive side.
+      if (/<<heredoc/.test(action)) {
+        // heredoc body passed the pre-scan; continue to inline code scan.
+      } else if (/(?:^|[\s;])-(?:[\s;]|$)|<<<|\/dev\/(?:stdin|fd\/\d+)/.test(action)) {
+        return { kind: 'delete', signal: `${verb} reads script code from stdin (here-string/redirect/pipe — unverifiable)` }
+      }
       const code = findInlineCode(action)
       if (code) {
         // H2: find bodies are opaque and never egress-scanned downstream —

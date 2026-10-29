@@ -98,6 +98,31 @@ test('f-round-6 B-N1-b residue: template keys / computed destructure / comma / m
   }
 })
 
+test('f-round-6 stdin-delivery family: here-string / pipe / file-redirect feeding find interp denied, scanned heredoc stays allowed', async () => {
+  const cases: Array<[string, string]> = [
+    [`find . -exec node - {} \\; <<< 'require("child_process").spawnSync("sh",["-c","id"])'`, 'here-string node -'],
+    [`find . -exec bash -s {} \\; <<< 'id'`, 'bash -s here-string'],
+    [`find . -exec sh -s {} \\; <<< 'id'`, 'sh -s here-string'],
+    [`find . -exec python3 - {} \\; <<< 'code'`, 'python - here-string'],
+    [`printf 'require("child_process").spawnSync("sh",["-c","id"])' | find . -maxdepth 1 -exec node - {} \\;`, 'pipe into find node -'],
+    [`find . -maxdepth 1 -exec node - {} \\; < code.js`, 'file redirect into find node -'],
+    [`find . -exec node - {} \\; </dev/stdin`, 'dev/stdin into find node -'],
+  ]
+  for (const [c, name] of cases) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `stdin-family ${name} must DENY (got ${r.cat})`)
+  }
+  const benign: Array<[string, string]> = [
+    [`find . -exec node - {} \\; <<'JS'\nrequire("child_process").spawnSync("ls",["-la"])\nJS`, 'scanned benign heredoc node'],
+    [`find . -exec python3 - {} \\; <<'PY'\nprint(1)\nPY`, 'scanned benign heredoc python'],
+    [`find . -exec sh -c 'ls -la' {} \\;`, 'sh -c ls'],
+  ]
+  for (const [c, name] of benign) {
+    const r = await gate(c)
+    assert.equal(r.deny, false, `${name} must stay ALLOW (got ${r.cat})`)
+  }
+})
+
 test('f-round-6 benign contract: read-only binaries + pure prints stay allowed', async () => {
   const cases: Array<[string, string]> = [
     [H.replace('CODE', 'require("child_process").spawnSync("ls",["-la"])'), 'node spawnSync ls'],
