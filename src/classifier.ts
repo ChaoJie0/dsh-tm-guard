@@ -3856,6 +3856,12 @@ function heredocBodyDanger(command: string, depth = 0): { kind: 'delete' | 'egre
     // precondition. Region-filtered, so string/comment mentions stay benign.
     const f8 = f8JsDynExecThreat(lt, pr)
     if (f8) return { kind: 'egress', signal: `heredoc body: ${f8}` }
+    // B-F12 (dsh review 185986c): semantic-level JS danger scan — binding-level
+    // aliases/containers/derived values, module-source closure, dynamic-exec
+    // closure. Runs unconditionally after f8 so alias/comma/return-forward
+    // shapes that defeat the regex nets still fail closed.
+    const jsD = f6JsDanger(lt)
+    if (jsD) return { kind: 'egress', signal: `heredoc body: ${jsD}` }
     F6_MEMBER_SLOT_RE.lastIndex = 0
     F6_CP_MODULE_RE.lastIndex = 0
     const hbMarker = F6_MEMBER_SLOT_RE.test(lt) || F6_CP_MODULE_RE.test(lt) || CR_DYN_MEMBER_RE.test(lt)
@@ -5398,6 +5404,472 @@ function f6CpDispatchThreat(code: string): string | null {
 }
 
 /**
+ * B-F12 (dsh review 185986c): semantic-level JS danger scan. The regex-enum
+ * nets (F1-F5, f8) were bypassed by lexical variants (whitespace, aliases,
+ * member objects, forwarding) and binding shapes (comma multi-hop, chain
+ * assignment, destructure, spread, descriptor extraction). This scanner
+ * strips comments index-preserving, collects bindings with a fixpoint over
+ * source/alias/container/derived classes, and denies:
+ *   - non-literal member reads/calls on any child_process source, alias,
+ *     container or derived value
+ *   - module-source closure: createRequire invocation, require.resolve,
+ *     require aliases, variable/concatenated module names, getBuiltinModule
+ *     forwarding
+ *   - dynamic-exec closure: any invocation of eval/Function/globalThis-bracket
+ *     /proto-alias/constructor sources, incl. forwarding, containers,
+ *     return-forward and comment-separated calls
+ * Literal exec-family keys with immediate read-only argv keep the adjudicated
+ * ALLOW paths (delegated to the existing call-site nets).
+ */
+function stripJsComments(code: string): string {
+  let out = ''
+  let i = 0
+  const n = code.length
+  let inStr: string | null = null
+  while (i < n) {
+    const ch = code[i]
+    if (inStr) {
+      out += ch
+      if (ch === '\\' && i + 1 < n) { out += code[i + 1]; i += 2; continue }
+      if (ch === inStr) inStr = null
+      i++
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; out += ch; i++; continue }
+    if (ch === '/' && code[i + 1] === '/') {
+      while (i < n && code[i] !== '\n') { out += ' '; i++ }
+      continue
+    }
+    if (ch === '/' && code[i + 1] === '*') {
+      i += 2
+      while (i + 1 < n && !(code[i] === '*' && code[i + 1] === '/')) { out += ' '; i++ }
+      if (i + 1 < n) { out += '  '; i += 2 } else { out += ' '; i++ }
+      continue
+    }
+    out += ch
+    i++
+  }
+  return out
+}
+
+function splitTopLevel(s: string, sep: string): string[] {
+  const out: string[] = []
+  let cur = ''
+  let depth = 0
+  let inStr: string | null = null
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (inStr) {
+      cur += ch
+      if (ch === '\\' && i + 1 < s.length) { cur += s[i + 1]; i++; continue }
+      if (ch === inStr) inStr = null
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; cur += ch; continue }
+    if (ch === '(' || ch === '[' || ch === '{') { depth++; cur += ch; continue }
+    if (ch === ')' || ch === ']' || ch === '}') { depth--; cur += ch; continue }
+    if (ch === sep && depth === 0) { out.push(cur); cur = ''; continue }
+    cur += ch
+  }
+  if (cur.trim()) out.push(cur)
+  return out
+}
+
+function f6JsDanger(code: string): string | null {
+  const stripped = stripJsComments(code)
+  const pr = protectedRegions(stripped)
+  const outside = (idx: number) => !pr.unterminated && pr.regions.some(([s, e]) => idx >= s && idx < e)
+  const esc = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const CP_MOD = "require\\s*\\(\\s*['\"\\x60]child_process['\"\\x60]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*['\"\\x60]child_process['\"\\x60]\\s*\\)"
+  const isPureLit = (k: string) => /^["'`][^"'`${]+["'`]$/.test(k)
+  const isExecLit = (k: string) => {
+    const m = k.trim().match(/^(?:`|'|")([^`'"]+)(?:`|'|")$/)
+    return m ? /^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(m[1]) : false
+  }
+  const isEvalKey = (k: string) => {
+    const t = k.trim().replace(/^["'`]|["'`]$/g, '')
+    return t === 'eval' || t === 'Function'
+  }
+  const isCpExpr = (t: string) =>
+    new RegExp(`(?:${CP_MOD})`).test(t) ||
+    /createRequire|require\.\s*resolve|getBuiltinModule|Reflect\.\s*get/.test(t)
+
+  // ---- binding collection (declarations + chain assignment + no-decl destructure + plain assignment) ----
+  const rhsMap = new Map<string, string>()
+  // names extracted from OBJECT destructuring of a child_process source become
+  // member VALUES (derived), not the module itself — `{spawnSync:ss}=require(..)`
+  const objDestr = new Set<string>()
+  const declRe = /\b(?:const|let|var)\s+([^;]+)/g
+  for (const m of stripped.matchAll(declRe)) {
+    const parts = splitTopLevel(m[1], ',')
+    for (const part of parts) {
+      const dm = part.match(/^\s*\[\s*([A-Za-z_$][\w$]*)\s*\]\s*=\s*([\s\S]+)$/)
+      if (dm) { rhsMap.set(dm[1], dm[2].trim()); continue }
+      const om = part.match(/^\s*\{\s*["'`]?([A-Za-z_$][\w$]*)["'`]?(?:\s*:\s*([A-Za-z_$][\w$]*))?\}\s*=\s*([\s\S]+)$/)
+      if (om) { rhsMap.set(om[2] ?? om[1], om[3].trim()); objDestr.add(om[2] ?? om[1]); continue }
+      const am = part.match(/^\s*([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+)$/)
+      if (am) { rhsMap.set(am[1], am[2].trim()); continue }
+    }
+  }
+  for (const m of stripped.matchAll(/\b([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+?)(?=[;,]\s*$|;|$)/g)) {
+    if (/^(?:const|let|var|return|new|typeof|instanceof|in|of|delete|void)$/.test(m[1])) continue
+    // skip chain-assignment shapes: a=b=expr — handled by the chain net below
+    if (/^\s*[A-Za-z_$][\w$]*\s*=/.test(m[2])) continue
+    rhsMap.set(m[1], m[2].trim())
+  }
+  // chain assignment a=b=expr — runs AFTER plain assignment so it wins
+  for (const m of stripped.matchAll(/\b([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+?)(?=[;,]\s*(?:$|[A-Za-z_$])|$)/g)) {
+    const expr = m[3].trim()
+    rhsMap.set(m[1], expr)
+    rhsMap.set(m[2], expr)
+  }
+  for (const m of stripped.matchAll(/\(\s*\{\s*["'`]?([A-Za-z_$][\w$]*)["'`]?\s*:\s*([A-Za-z_$][\w$]*)\s*\}\s*=\s*([\s\S]+?)(?=\)|;|$)/g)) {
+    rhsMap.set(m[2], m[3].trim())
+    objDestr.add(m[2])
+  }
+  // module-name variables: var n = "child_process" / "child" + "_process"
+  const modNames = new Set<string>()
+  for (const m of stripped.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:["'`]child_process["'`]|["'`]child["'`]\s*\+\s*["'`]_process["'`])\b/g)) {
+    modNames.add(m[1])
+  }
+
+  // ---- fixpoint classification ----
+  const cp = new Set<string>()
+  const derived = new Set<string>()
+  const container = new Set<string>()
+  const crF = new Set<string>()
+  const reqLike = new Set<string>()
+  const reqF = new Set<string>()
+  const modReq = new Set<string>()
+  const gbmF = new Set<string>()
+  const dyn = new Set<string>()
+  const dynC = new Set<string>()
+  const gAlias = new Set<string>()
+  const refGet = new Set<string>()
+  const refApply = new Set<string>()
+  const refGetMem = new Set<string>()
+  const protoF = new Set<string>()
+  const marks = new Map<string, Set<string>>()
+
+  const namesOf = (set: Set<string>) => [...set].map(esc).join('|') || '(?!x)x'
+  const classify = (rhs: string): Set<string> => {
+    const t = rhs.trim()
+    const res = new Set<string>()
+    if (/^require\s*\(\s*["'`]child_process["'`]\s*\)$/.test(t) ||
+        /^process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\)$/.test(t) ||
+        new RegExp(`^${namesOf(cp)}$`).test(t) ||
+        new RegExp(`^${namesOf(reqLike)}\\s*\\(`).test(t) ||
+        new RegExp(`^${namesOf(reqF)}\\s*\\(`).test(t) ||
+        /["'`]child["'`]\s*\+\s*["'`]_process["'`]/.test(t) ||
+        (/^require\s*\(\s*([A-Za-z_$][\w$]*)\s*\)$/.test(t) && modNames.has(t.match(/^require\s*\(\s*([A-Za-z_$][\w$]*)\s*\)$/)![1]))) {
+      res.add('cp')
+    }
+    if (/^require\s*\(\s*["'`]module["'`]\s*\)$/.test(t) ||
+        /^process\.\s*getBuiltinModule\s*\(\s*["'`]module["'`]\s*\)$/.test(t) ||
+        new RegExp(`^${namesOf(modReq)}$`).test(t) ||
+        new RegExp(`^${namesOf(gbmF)}\\s*\\(\\s*["'\x60]module["'\x60]\\s*\\)$`).test(t)) {
+      res.add('modReq')
+    }
+    if (/^require$/.test(t) || new RegExp(`^${namesOf(reqF)}$`).test(t)) res.add('reqF')
+    if (/^process\.\s*getBuiltinModule$/.test(t) || new RegExp(`^${namesOf(gbmF)}$`).test(t)) res.add('gbmF')
+    if (new RegExp(`^${namesOf(crF)}\\s*\\(`).test(t) ||
+        new RegExp(`^${namesOf(modReq)}(?:\\s*\\.\\s*createRequire|\\s*\\[\\s*["'\x60]createRequire["'\x60]\\s*\\])\\s*\\(`).test(t) ||
+        /\.\s*createRequire\s*\(/.test(t) || /\[\s*["'`]createRequire["'`]\s*\]\s*\(/.test(t) ||
+        /^require\s*\(\s*["'`]module["'`]\s*\)\.\s*createRequire$/.test(t) ||
+        /\.\s*createRequire$/.test(t)) {
+      res.add('crF')
+    }
+    if (new RegExp(`^${namesOf(crF)}$`).test(t) || new RegExp(`^${namesOf(reqLike)}$`).test(t)) res.add('reqLike')
+    if (/^Reflect$/.test(t)) res.add('refBase')
+    if (/^Reflect\.\s*get$/.test(t) || new RegExp(`^${namesOf(refGet)}$`).test(t)) res.add('refGet')
+    if (/^Reflect\.\s*(?:apply|construct)$/.test(t) || new RegExp(`^${namesOf(refApply)}$`).test(t)) res.add('refApply')
+    if (/^Reflect\.\s*getPrototypeOf$/.test(t) || new RegExp(`^${namesOf(protoF)}$`).test(t)) res.add('protoF')
+    if (/^\{\s*[A-Za-z_$][\w$]*\s*:\s*Reflect\.\s*get\s*\}$/.test(t) || new RegExp(`^${namesOf(refGetMem)}$`).test(t)) res.add('refGetMem')
+    if (/^globalThis$/.test(t) || new RegExp(`^${namesOf(gAlias)}$`).test(t)) res.add('gAlias')
+    if (/^eval$/.test(t) || /^Function$/.test(t) ||
+        /^globalThis\s*\[\s*["'`](?:eval|Function|eva["'`]\s*\+\s*["'`]l|Func["'`]\s*\+\s*["'`]tion)["'`]\s*\]$/.test(t) ||
+        /^\[\]\s*\.\s*constructor(?:\s*\.\s*constructor)?$/.test(t) ||
+        /^\(\[\]\)\s*\.\s*constructor(?:\s*\.\s*constructor)?$/.test(t) ||
+        new RegExp(`^${namesOf(dyn)}$`).test(t)) {
+      res.add('dyn')
+    }
+    if (/^(?:\[[\s\S]*\]|\{[\s\S]*\})$/.test(t) && new RegExp(`(?:${CP_MOD})|(?:${namesOf(cp)})\\b|\\.\\.\\.(?:${namesOf(cp)})\\b`).test(t)) res.add('container')
+    if (new RegExp(`^Reflect\\.\\s*get\\s*\\(\\s*(?:${namesOf(cp)}|${namesOf(container)}|${namesOf(derived)})\\b`).test(t) ||
+        /^Object\.\s*getOwnPropertyDescriptor\s*\(\s*(?:require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\)|(?:[A-Za-z_$][\w$]*))\b/.test(t) && new RegExp(`^(?:require\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\)|${namesOf(cp)})`).test(t) ||
+        new RegExp(`^(?:${namesOf(cp)}|${namesOf(container)})\\s*(?:\\.\\s*[A-Za-z_$][\w$]*|\\[\\s*["'\x60][^"'\x60]+["'\x60]\\s*\\])\\s*$`).test(t)) {
+      res.add('derived')
+    }
+    if (new RegExp(`^${namesOf(dynC)}$`).test(t)) res.add('dynC')
+    return res
+  }
+  let changed = true
+  let guard = 0
+  while (changed && guard++ < 12) {
+    changed = false
+    for (const [name, rhs] of rhsMap) {
+      const fresh = classify(rhs)
+      // object-destructured names are member VALUES of the source, not the module
+      if (objDestr.has(name) && fresh.has('cp')) { fresh.delete('cp'); fresh.add('derived') }
+      if (fresh.size === 0) continue
+      const old = marks.get(name) ?? new Set<string>()
+      let grew = false
+      for (const mk of fresh) {
+        if (mk === 'cp') { if (!cp.has(name)) { cp.add(name); grew = true } }
+        else if (mk === 'derived') { if (!derived.has(name)) { derived.add(name); grew = true } }
+        else if (mk === 'container') { if (!container.has(name)) { container.add(name); grew = true } }
+        else if (mk === 'crF') { if (!crF.has(name)) { crF.add(name); grew = true } }
+        else if (mk === 'reqLike') { if (!reqLike.has(name)) { reqLike.add(name); grew = true } }
+        else if (mk === 'reqF') { if (!reqF.has(name)) { reqF.add(name); grew = true } }
+        else if (mk === 'modReq') { if (!modReq.has(name)) { modReq.add(name); grew = true } }
+        else if (mk === 'gbmF') { if (!gbmF.has(name)) { gbmF.add(name); grew = true } }
+        else if (mk === 'dyn') { if (!dyn.has(name)) { dyn.add(name); grew = true } }
+        else if (mk === 'dynC') { if (!dynC.has(name)) { dynC.add(name); grew = true } }
+        else if (mk === 'gAlias') { if (!gAlias.has(name)) { gAlias.add(name); grew = true } }
+        else if (mk === 'refGet') { if (!refGet.has(name)) { refGet.add(name); grew = true } }
+        else if (mk === 'refApply') { if (!refApply.has(name)) { refApply.add(name); grew = true } }
+        else if (mk === 'refGetMem') { if (!refGetMem.has(name)) { refGetMem.add(name); grew = true } }
+        else if (mk === 'protoF') { if (!protoF.has(name)) { protoF.add(name); grew = true } }
+        old.add(mk)
+      }
+      marks.set(name, old)
+      if (grew) changed = true
+    }
+  }
+
+  // ---- direct nets (no binding required) ----
+  const hit = (re: RegExp, label: string, regionSafe = true): string | null => {
+    const rx = re.flags.includes('g') ? re : new RegExp(re.source, re.flags + 'g')
+    for (const m of stripped.matchAll(rx)) {
+      if (regionSafe && outside(m.index)) continue
+      return label
+    }
+    return null
+  }
+  // D1: require.resolve indirect module path
+  let r = hit(/require\.\s*resolve\s*\(/, 'require.resolve indirect module path', false)
+  if (r) return r
+  // D2: createRequire invocation (module-source closure, incl. aliases)
+  r = hit(/\bcreateRequire\s*\(/, 'createRequire invocation (module source)', false)
+  if (r) return r
+  // D3: require(variable-module)[member] / require(concat-module)[member]
+  r = hit(/require\s*\(\s*[^"']+?\s*\)\s*\[\s*[^\]]+\s*\]/, 'require dynamic-module member access', false)
+  if (r) return r
+  // D5: Reflect forwarding of require / createRequire / getBuiltinModule
+  r = hit(/Reflect\.\s*(?:apply|construct)\s*\(\s*[^,]*?(?:require\b|createRequire|getBuiltinModule\s*\([^)]*\)\s*\.\s*createRequire)/, 'Reflect forwarding of module source', false)
+  if (r) return r
+  // D6: descriptor extraction from a literal child_process source
+  r = hit(/getOwnPropertyDescriptor\s*\(\s*(?:require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\))\b/, 'descriptor extraction from child_process', false)
+  if (r) return r
+  // D8: bare `return eval` (source handed out of a function)
+  r = hit(/return\s+eval\b(?!\s*\()/, 'function returns eval source', true)
+  if (r) return r
+  // D9: IIFE returning eval invoked
+  r = hit(/\(function\s*\([^)]*\)\s*\{\s*[^}]*?\breturn\s+eval\b[^}]*?\}\s*\)\s*\(\s*\)\s*\(/, 'IIFE returning eval invoked', true)
+  if (r) return r
+  // D10: Function.prototype.call.call chain
+  r = hit(/\.\s*call\s*\.\s*call\s*\(/, 'call.call forwarding chain', true)
+  if (r) return r
+  // D12: `.constructor` with a concatenated bracket key
+  r = hit(/\.\s*constructor\s*\[\s*[^\]]*?\+\s*[^\]]*?\]/, 'constructor concatenated key', true)
+  if (r) return r
+  // D13: require stored as an object value
+  r = hit(/\{\s*[^}]*?:\s*require\b[^}]*\}/, 'require stored in object literal', false)
+  if (r) return r
+  // D14: array container of eval/Function invoked by index
+  r = hit(/\[\s*(?:eval\b|Function\b|globalThis\s*\[\s*[^\]]+\s*\])\s*\]\s*\[\s*\d+\s*\]\s*\(/, 'array-stored dynamic source invoked', true)
+  if (r) return r
+
+  // ---- globalThis non-literal bracket call (nested arrays / joins included) ----
+  {
+    const gRe = /globalThis\s*\[/g
+    for (const m of stripped.matchAll(gRe)) {
+      let depth = 0
+      let j = m.index + m[0].length
+      let inStr: string | null = null
+      for (; j < stripped.length; j++) {
+        const ch = stripped[j]
+        if (inStr) {
+          if (ch === '\\') { j++; continue }
+          if (ch === inStr) inStr = null
+          continue
+        }
+        if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; continue }
+        if (ch === '[') depth++
+        else if (ch === ']') { if (depth === 0) break; depth-- }
+      }
+      const key = stripped.slice(m.index + m[0].length, j).trim()
+      const after = stripped.slice(j + 1).replace(/^\s*/, '')
+      if (after.startsWith('(')) {
+        if (!isPureLit(key) || isEvalKey(key)) {
+          if (!outside(m.index)) return `globalThis bracket call (${key.slice(0, 20)})`
+        }
+      }
+    }
+  }
+
+  // ---- reflect-get non-literal key scan (whitespace/alias/member-object tolerant) ----
+  {
+    const refNames = new Set<string>(['Reflect', ...refGet])
+    const memNames = new Set<string>(refGetMem)
+    // direct: (Reflect|alias).get( ... )  and member-object: R.g( ... )
+    // NOTE: only `.get` and member-object members count — `Reflect.apply(…)` is
+    // handled by its own nets so a literal read-only argv stays ALLOW (RO4).
+    const headRe = new RegExp(`\\b(?:${namesOf(refNames)})\\.\\s*get\\s*\\(|\\b(?:${namesOf(memNames)})\\.\\s*[A-Za-z_$][\\w$]*\\s*\\(|Reflect\\.\\s*get\\s*\\(`, 'g')
+    for (const m of stripped.matchAll(headRe)) {
+      let depth = 0
+      let j = m.index + m[0].length
+      let inStr: string | null = null
+      for (; j < stripped.length; j++) {
+        const ch = stripped[j]
+        if (inStr) {
+          if (ch === '\\') { j++; continue }
+          if (ch === inStr) inStr = null
+          continue
+        }
+        if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; continue }
+        if (ch === '(') depth++
+        else if (ch === ')') { if (depth === 0) break; depth-- }
+      }
+      let d2 = 0
+      let comma = -1
+      let s2: string | null = null
+      for (let k = m.index + m[0].length; k < j; k++) {
+        const ch = stripped[k]
+        if (s2) {
+          if (ch === '\\') { k++; continue }
+          if (ch === s2) s2 = null
+          continue
+        }
+        if (ch === '"' || ch === "'" || ch === '`') { s2 = ch; continue }
+        if (ch === '(') d2++
+        else if (ch === ')') d2--
+        else if (ch === ',' && d2 === 0) { comma = k; break }
+      }
+      if (comma !== -1) {
+        const key = stripped.slice(comma + 1, j).trim()
+        if (!isPureLit(key)) {
+          if (!outside(m.index)) return `Reflect.get non-literal key (${key.slice(0, 20)})`
+        }
+      }
+    }
+  }
+
+  // ---- binding nets ----
+  const alt = (set: Set<string>) => namesOf(set)
+  // N1: non-literal member read/call on cp / derived / container
+  if (cp.size + derived.size + container.size > 0) {
+    const n1 = new RegExp(`\\b(?:${alt(cp)}|${alt(derived)}|${alt(container)})\\s*\\[\\s*([^\\]]+)\\s*\\]`, 'g')
+    for (const m of stripped.matchAll(n1)) {
+      const key = m[1].trim()
+      const litKey = key.match(/^(?:`|'|")([^`'"]+)(?:`|'|")$/)
+      const isExecKey = litKey ? /^(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)$/.test(litKey[1]) : false
+      // literal exec-family key: keep the adjudicated ALLOW path (existing nets)
+      if (isPureLit(key) && !isEvalKey(key) && isExecKey) continue
+      return `child_process source dynamic member (${m[0].slice(0, 24)})`
+    }
+    // N5: exec-family member call on a container value (containerized source, fail-closed)
+    const n5 = new RegExp(`\\b(?:${alt(container)})\\s*(?:\\.\\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)|\\[\\s*["'\x60](?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)["'\x60]\\s*\\])\\s*\\(`, 'g')
+    for (const m of stripped.matchAll(n5)) {
+      return `child_process exec verb from container (${m[0].slice(0, 24)})`
+    }
+    // N6: a cp/container name invoked directly (module value treated as callable — abnormal, deny)
+    const n6 = new RegExp(`\\b(?:${alt(cp)}|${alt(container)})\\s*\\(`, 'g')
+    for (const m of stripped.matchAll(n6)) {
+      return `child_process source invoked directly (${m[0].slice(0, 24)})`
+    }
+    // N10: descriptor extraction from a bound child_process source/alias/container
+    const n10 = new RegExp(`getOwnPropertyDescriptor\\s*\\(\\s*(?:${alt(cp)}|${alt(container)})\\b`, 'g')
+    for (const m of stripped.matchAll(n10)) {
+      return `descriptor extraction from child_process source (${m[0].slice(0, 24)})`
+    }
+  }
+  // N9: module-source closure nets — createRequire aliases/module-require
+  // members/require aliases invoked (any shape, incl. .call/.apply/.bind)
+  if (crF.size > 0) {
+    const n9a = new RegExp(`\\b(?:${alt(crF)})(?:\\.\\s*(?:call|apply|bind)\\s*)?\\(`, 'g')
+    for (const m of stripped.matchAll(n9a)) {
+      return `createRequire alias invoked (${m[0].slice(0, 24)})`
+    }
+  }
+  if (modReq.size > 0) {
+    const n9b = new RegExp(`\\b(?:${alt(modReq)})\\s*(?:\\.\\s*createRequire|\\[\\s*["'\x60]createRequire["'\x60]\\s*\\])\\s*\\(`, 'g')
+    for (const m of stripped.matchAll(n9b)) {
+      return `module-require createRequire invoked (${m[0].slice(0, 24)})`
+    }
+  }
+  if (reqF.size > 0) {
+    const n9c = new RegExp(`\\b(?:${alt(reqF)})\\s*\\(\\s*[^)]+\\s*\\)`, 'g')
+    for (const m of stripped.matchAll(n9c)) {
+      const args = m[0].slice(m[0].indexOf('(') + 1, -1).trim()
+      const lit = args.match(/^["'`]([^"'`]+)["'`]$/)
+      if (lit && lit[1] !== 'child_process') continue
+      return `require alias module fetch (${m[0].slice(0, 24)})`
+    }
+  }
+  // N2: dynamic-exec source invoked (incl. .call/.apply/.bind forwarding)
+  if (dyn.size + dynC.size > 0) {
+    const n2 = new RegExp(`\\b(?:${alt(dyn)}|${alt(dynC)})(?:\\.\\s*(?:call|apply|bind)\\s*)?\\(|Reflect\\.\\s*(?:apply|construct)\\s*\\(\\s*(?:${alt(dyn)}|${alt(dynC)})\\b|\\bnew\\s+(?:${alt(dyn)})`, 'g')
+    for (const m of stripped.matchAll(n2)) {
+      if (!outside(m.index)) return `dynamic code execution source invoked (${m[0].slice(0, 24)})`
+    }
+    // container-index invocation: arr[0]( ... )
+    const n2b = new RegExp(`\\b(?:${alt(dynC)})\\s*\\[\\s*[^\\]]+\\s*\\]\\s*\\(`, 'g')
+    for (const m of stripped.matchAll(n2b)) {
+      if (!outside(m.index)) return `array-stored dynamic source invoked (${m[0].slice(0, 24)})`
+    }
+  }
+  // N3: globalThis-alias non-literal bracket call
+  if (gAlias.size > 0) {
+    const n3 = new RegExp(`\\b(?:${alt(gAlias)})\\s*\\[\\s*([^\\]]+)\\s*\\]\\s*\\(`, 'g')
+    for (const m of stripped.matchAll(n3)) {
+      const key = m[1].trim()
+      if (isPureLit(key) && !isEvalKey(key)) continue
+      if (!outside(m.index)) return `global alias bracket call (${key.slice(0, 20)})`
+    }
+  }
+  // N7: proto-alias used as Reflect.get receiver (any argument shape)
+  if (protoF.size > 0) {
+    const n7 = new RegExp(`Reflect\\.\\s*get\\s*\\(\\s*(?:${alt(protoF)})\\s*\\(`, 'g')
+    for (const m of stripped.matchAll(n7)) {
+      if (!outside(m.index)) return `prototype alias constructor lookup`
+    }
+  }
+  // N8: module-source forwarding through Reflect.get of a container (X1/X3 boundary):
+  // a value read off a cp source/container with a literal key, then any member
+  // read/call that cannot be proven literal-benign. A derived name invoked
+  // directly (bare call) is a member value exec — deny.
+  if (derived.size > 0) {
+    const n8 = new RegExp(`\\b(?:${alt(derived)})\\s*\\[\\s*[^\\]]+\\s*\\]`, 'g')
+    for (const m of stripped.matchAll(n8)) {
+      return `derived child_process member (${m[0].slice(0, 24)})`
+    }
+    const n8b = new RegExp(`\\b(?:${alt(derived)})\\s*\\(`, 'g')
+    for (const m of stripped.matchAll(n8b)) {
+      // derive the invocation parens and test the args for provable read-only-ness
+      const open = stripped.indexOf('(', m.index + m[0].lastIndexOf('('))
+      let depth = 0, end = -1
+      for (let i = open; i < stripped.length; i++) {
+        const ch = stripped[i]
+        if (ch === '(') depth++
+        else if (ch === ')') { depth--; if (depth === 0) { end = i; break } }
+      }
+      if (end > open) {
+        const args = stripped.slice(open + 1, end)
+        const elems = splitTopLevel(args, ',')
+        const readOnlyArgs = elems.length > 0 && elems.every((e) => {
+          const t = e.trim()
+          return /^["'`][^"'`]*["'`]$/.test(t) ||
+            (/^\[[\s\S]*\]$/.test(t) && !/[\>\|;&]|\$\(|`/.test(t) && !/\+\s*["'`]/.test(t))
+        })
+        if (readOnlyArgs) continue
+      }
+      return `child_process member value invoked (${m[0].slice(0, 24)})`
+    }
+  }
+  return null
+}
+
+/**
  * f-round-6 B-F5-3: python subprocess/os shell-out adjudication — `shell=`
  * truthy (non-False/0), getattr dispatch, bare from-imports, and argv0
  * relays are all fail-closed; only read-only binary argv stays benign.
@@ -5780,6 +6252,10 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
           // vm alias, bracket-dynamic keys, Reflect.get(globalThis,…)).
           const jsDyn = f8JsDynExecThreat(literalCode, literalPr)
           if (jsDyn) return { kind: 'egress', signal: `${verb} ${jsDyn}` }
+          // B-F12 (dsh review 185986c): semantic-level JS danger scan on the
+          // find-inline face (same closure rules as the heredoc face).
+          const jsD = f6JsDanger(literalCode)
+          if (jsD) return { kind: 'egress', signal: `${verb} ${jsD}` }
         }
         F6_MEMBER_SLOT_RE.lastIndex = 0
         F6_CP_MODULE_RE.lastIndex = 0
