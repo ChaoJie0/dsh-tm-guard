@@ -382,3 +382,63 @@ test('f-round-9 B-F9-2: Reflect.apply/get dynamic-member dispatch denied, read-o
     assert.equal(r.deny, false, `B-F9-2 ${name} must stay ALLOW (got ${r.cat})`)
   }
 })
+
+test('f-round-10 B-F10-1/2/3: dsh review cba2a07 blockers closed — dynamic cp dispatch data-flow, alias closure, heredoc f8 net', async () => {
+  const SHC = `["sh",["-c","echo X > /tmp/x"]]`
+  const CP = `require("child_process").spawnSync("sh",["-c","echo X > /tmp/x"])`
+  const FS = `require("fs").writeFileSync("/tmp/f10-e","pwn")`
+  const deny: Array<[string, string]> = [
+    // B-F10-1: dynamic member read bound to a var, invoked via any shape (FE+HD)
+    [H.replace('CODE', `const cp=require("child_process");var f=Reflect.get(cp,"sp"+"awnSync");Reflect.apply(f,cp,${SHC})`), 'inline reflect.get concat -> var -> Reflect.apply'],
+    [HH.replace('CODE', `const cp=require("child_process");var f=Reflect.get(cp,"sp"+"awnSync");Reflect.apply(f,cp,${SHC})`), 'heredoc reflect.get concat -> var -> Reflect.apply'],
+    [H.replace('CODE', `const cp=require("child_process");Reflect.get(cp,"sp"+"awnSync").apply(cp,${SHC})`), 'inline reflect.get concat .apply'],
+    [HH.replace('CODE', `const cp=require("child_process");Reflect.get(cp,"sp"+"awnSync").apply(cp,${SHC})`), 'heredoc reflect.get concat .apply'],
+    [H.replace('CODE', `const cp=require("child_process");Reflect.get(cp,"sp"+"awnSync").call(cp,"sh",["-c","echo X > /tmp/x"])`), 'inline reflect.get concat .call'],
+    [HH.replace('CODE', `const cp=require("child_process");Reflect.get(cp,"sp"+"awnSync").call(cp,"sh",["-c","echo X > /tmp/x"])`), 'heredoc reflect.get concat .call'],
+    [H.replace('CODE', `const cp=require("child_process");var f=cp["sp"+"awnSync"];f("sh",["-c","echo X > /tmp/x"])`), 'inline bracket-concat key -> var -> call'],
+    [HH.replace('CODE', `const cp=require("child_process");var f=cp["sp"+"awnSync"];f("sh",["-c","echo X > /tmp/x"])`), 'heredoc bracket-concat key -> var -> call'],
+    [H.replace('CODE', `Reflect.apply(require("child_process")["sp"+"awnSync"],null,${SHC})`), 'inline Reflect.apply(require()[concat])'],
+    [HH.replace('CODE', `Reflect.apply(require("child_process")["sp"+"awnSync"],null,${SHC})`), 'heredoc Reflect.apply(require()[concat])'],
+    [H.replace('CODE', `const cp=require("child_process");var k="spawnSync";var f=cp[k];Reflect.apply(f,cp,${SHC})`), 'inline var k -> cp[k] -> Reflect.apply'],
+    [HH.replace('CODE', `const cp=require("child_process");var k="spawnSync";var f=cp[k];Reflect.apply(f,cp,${SHC})`), 'heredoc var k -> cp[k] -> Reflect.apply'],
+    // B-F10-2: alias closure + Reflect/ctor/proto/global-key forms (FE)
+    [H.replace('CODE', `var e1=eval;var e2=e1;e2("${CP}")`), 'inline eval two-hop alias'],
+    [H.replace('CODE', `var C=[].constructor.constructor;C("${CP}")()`), 'inline ctor-chain alias'],
+    [H.replace('CODE', `Reflect.construct(Function,["${CP}"])()`), 'inline Reflect.construct(Function)'],
+    [H.replace('CODE', `var k="eva";globalThis[k+"l"]("${CP}")`), 'inline variable bracket key'],
+    [H.replace('CODE', `Reflect.apply(eval,null,["${CP}"])`), 'inline Reflect.apply(eval)'],
+    [H.replace('CODE', `Reflect.apply(Function,null,["${CP}"])()`), 'inline Reflect.apply(Function)'],
+    [H.replace('CODE', `Reflect.get(Reflect.getPrototypeOf(()=>0),"constructor")("${CP}")()`), 'inline proto-chain ctor'],
+    [H.replace('CODE', `var F1=Function;var F2=F1;F2("${CP}")()`), 'inline Function two-hop alias'],
+    // B-F10-3: heredoc node body dynamic-exec strings, fs payload (no cp marker)
+    [HH.replace('CODE', `eval.call(null,"${FS}")`), 'heredoc eval.call fs'],
+    [HH.replace('CODE', `var e1=eval;var e2=e1;e2("${FS}")`), 'heredoc eval two-hop alias fs'],
+    [HH.replace('CODE', `var F1=Function;var F2=F1;F2("${FS}")()`), 'heredoc Function two-hop alias fs'],
+    [HH.replace('CODE', `var C=[].constructor.constructor;C("${FS}")()`), 'heredoc ctor alias fs'],
+    [HH.replace('CODE', `var v=require("vm");var s=new v.Script("${FS}");s.runInThisContext()`), 'heredoc vm Script alias member fs'],
+    [HH.replace('CODE', `var k="eva";globalThis[k+"l"]("${FS}")`), 'heredoc variable bracket key fs'],
+    [HH.replace('CODE', `Reflect.construct(Function,["${FS}"])()`), 'heredoc Reflect.construct fs'],
+  ]
+  for (const [c, name] of deny) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F10 ${name} must DENY (got ${r.cat})`)
+  }
+  // control: claimed-closed shapes must STILL deny (probe-sanity guard)
+  const denyCtrl: Array<[string, string]> = [
+    [H.replace('CODE', `eval("${CP}")`), 'direct eval denied-control'],
+    [H.replace('CODE', `var e=eval;e("${CP}")`), 'single-hop eval alias denied-control'],
+    [H.replace('CODE', `const cp=require("child_process");Reflect.apply(cp["sp"+"awnSync"],cp,${SHC})`), 'Reflect.apply(cp[concat]) denied-control'],
+  ]
+  for (const [c, name] of denyCtrl) {
+    const r = await gate(c)
+    assert.equal(r.deny, true, `B-F10 ${name} must DENY (got ${r.cat})`)
+  }
+  const allow: Array<[string, string]> = [
+    // read-only / benign shapes that must NOT flip
+    [H.replace('CODE', `const {spawnSync:ss}=require("child_process");ss.apply(null,["ls",["-la"]])`), 'inline renamed .apply readonly stays ALLOW'],
+  ]
+  for (const [c, name] of allow) {
+    const r = await gate(c)
+    assert.equal(r.deny, false, `B-F10 ${name} must stay ALLOW (got ${r.cat})`)
+  }
+})
