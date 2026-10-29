@@ -4467,6 +4467,37 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
         if (FIND_FIND_DESTRUCTIVE_RE.test(code)) return { kind: 'delete', signal: `${verb} inline delete/spawn` }
         if (FIND_INLINE_EGRESS_RE.test(code)) return { kind: 'egress', signal: `${verb} inline network` }
         if (FIND_SHELLOUT_RE.test(code)) return { kind: 'egress', signal: `${verb} subprocess shell-out` }
+        // f-round-4 B-N1-a: a literal-argv spawn/execFile whose argv[0] is a
+        // shell or interpreter with a -c/-e/-E/-r/--eval flag is a FULL RCE —
+        // the FIND_SHELLOUT_RE network-argv nets only catch curl/wget/… word
+        // literals, so `spawnSync("sh",["-c","echo X > /abs"])` rides through
+        // as read. argv[0] may be a bare name or an absolute path
+        // (/bin/sh, /usr/bin/python3). findInlineCode may hand back
+        // escaped-quote forms (`require(\"child_process\")`), so adjudicate
+        // on the unescaped code.
+        const literalCode = code.replace(/\\(["'\\])/g, '$1')
+        const argV0Rce = literalCode.match(
+          /(?:spawn|spawnSync|execFile|execFileSync)\s*\(\s*["'][^"']*\b(sh|bash|dash|zsh|ksh|python3?|python|node|nodejs|ruby|perl|php)\b[^"']*["']\s*,\s*\[?\s*["'][^"']*-[ceEr][^"']*["']/) ||
+          // f-round-4 B-N1-a (python): subprocess argv[0]-shell is the same RCE.
+          literalCode.match(
+            /\bsubprocess\s*\.\s*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)\s*\(\s*\[?\s*["'][^"']*\b(sh|bash|dash|zsh|ksh|python3?|python|node|nodejs|ruby|perl|php)\b[^"']*["']\s*,\s*["'][^"']*-[ceEr][^"']*["']/)
+        if (argV0Rce) return { kind: 'egress', signal: `${verb} shell/interpreter argv[0] RCE (${argV0Rce[1]})` }
+        // f-round-4 B-N1-b: an exec-family call that is not a direct literal
+        // `require/import("child_process").execX("binary",[literal argv])`
+        // cannot be proven safe (alias chains, .call/.apply, computed/template
+        // keys, variable module ids, createRequire/getBuiltinModule/
+        // require.resolve indirections) — fail closed. The literal shape keeps
+        // the B2 contract (`spawnSync("ls")`, `spawnSync("ls",["-la"])`).
+        const hasExecFamily =
+          /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*(?:\.\s*(?:call|apply)\s*)?\(/.test(literalCode) ||
+          /\[["'][^"']*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)[^"']*["']\s*(?:\+\s*["'][^"']*["']\s*)*\]\s*\(/.test(literalCode)
+        if (hasExecFamily) {
+          const literalExec =
+            /(?:require\s*\(\s*["'](?:node:)?child_process["']\s*\)|import\s*\(\s*["'](?:node:)?child_process["']\s*\))\s*\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*\(\s*["'][^"']*["']\s*(?:,\s*\[?\s*["'][^"']*["']\s*(?:,\s*["'][^"']*["'])*\]?\s*)?\)/
+          if (!literalExec.test(literalCode)) {
+            return { kind: 'egress', signal: `${verb} unverifiable child_process exec family` }
+          }
+        }
         if (!/^python/.test(verb)) {
           // H2/H3b/F1: ruby/perl/php launchers are opaque — any process
           // primitive fails closed; a benign literal is NOT statically trusted
@@ -4665,8 +4696,25 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
       // innerCls stays null for interpreter-inline bodies (skipped above),
       // so those keep the inline-interpreter adjudication only.
       const innerPaths = innerCls?.targetPaths ?? []
-      const writeEscapesCwd = innerPaths.some(
-        (p) => p.startsWith('/') || p.includes('..') || p === '~')
+      // f-round-4 M-N3-a: targetPaths are ALREADY absolutized against the
+      // session cwd (`echo X > out.txt` -> `/cwd/out.txt`), so a naive
+      // `startsWith('/')` marks every cwd-local write as escaping and hard-
+      // denies normal in-session writes (mkdir/touch/cp/tee) that should be
+      // snapshot-approved file_write. Escape means: outside the cwd prefix
+      // (absolute writes elsewhere, `..` already resolved by absolutization)
+      // or `~`. Writes inside cwd stay file_write for decide() to approve.
+      // f-round-4 M-N3-a: for copy/move verbs the FINAL operand is the write
+      // destination — earlier operands are read sources
+      // (`cp /etc/hostname local-copy.txt` must not count the source as an
+      // escaping write). Other verbs extract only their write targets.
+      const bodyVerb = body.trim().split(/\s+/)[0]?.toLowerCase().split('/').pop() ?? ''
+      const cwdRoot = process.cwd()
+      const cwdPrefix = cwdRoot.endsWith('/') ? cwdRoot : cwdRoot + '/'
+      const judged = ['cp', 'mv', 'install', 'ln'].includes(bodyVerb)
+        ? innerPaths.slice(-1)
+        : innerPaths
+      const writeEscapesCwd = judged.some(
+        (p) => p === '~' || (p.startsWith('/') && !p.startsWith(cwdPrefix)))
       if (
         innerCls &&
         (innerCls.forceDeny ||

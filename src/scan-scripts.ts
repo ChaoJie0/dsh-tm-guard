@@ -163,6 +163,10 @@ const RULES: Record<Lang, LangRules> = {
       // functions have no other source.
       /\b(?:spec_from_file_location|module_from_spec)\s*\(/,
       /\bos\s*\.\s*system\s*\(/,
+      // f-round-4 B-N1-a (python): subprocess argv whose argv[0] is a shell
+      // or interpreter with a -c/-e/-E/-r/--eval flag is a FULL RCE — the
+      // network-argv net only catches curl/wget/… literals.
+      /\bsubprocess\s*\.\s*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)\s*\(\s*\[?\s*["'][^"']*\b(sh|bash|dash|zsh|ksh|python3?|python|node|nodejs|ruby|perl|php)\b[^"']*["']\s*,\s*["'][^"']*-[ceEr][^"']*["']/,
     ],
   },
   node: {
@@ -190,6 +194,12 @@ const RULES: Record<Lang, LangRules> = {
       // take an argv/file and stay on the network-argv shellNet rule, so
       // benign `spawnSync('ls')` remains readable.
       /\b(?:require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.|child_process\s*\.)\s*(?:exec|execSync)\s*\(/,
+      // f-round-4 B-N1-a: literal-argv spawn/execFile whose argv[0] is a
+      // shell or interpreter with a -c/-e/-E/-r/--eval flag is a FULL RCE —
+      // the shellNet network-argv rule only catches curl/wget/… literals, so
+      // `spawnSync("sh",["-c","echo X > /abs"])` rides through as readable.
+      // argv[0] may be bare or an absolute path (/bin/sh, /usr/bin/python3).
+      /\b(?:spawn|spawnSync|execFile|execFileSync)\s*\(\s*["'][^"']*\b(sh|bash|dash|zsh|ksh|python3?|python|node|nodejs|ruby|perl|php)\b[^"']*["']\s*,\s*\[?\s*["'][^"']*-[ceEr][^"']*["']/,
     ],
   },
   shell: {
@@ -551,6 +561,17 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
   const nodeCpRefs = new Set<string>()
   const nodeRequireAliases = new Set<string>()
   const nodeBareExec = new Set<string>()
+  // f-round-4 B-N1-b: plain variable-to-variable assignments (`const q=cp;`
+  // `q=r;`) build alias chains that the direct `=require("child_process")`
+  // collection misses — a two/three-hop alias then calls exec through a name
+  // never seen by nodeCpRefs. Collect pairs here, close them transitively
+  // before the execThreat adjudication below.
+  const nodeAliasPairs: Array<[string, string]> = []
+  // f-round-4 N-N1-c: python `os`/`subprocess` module aliases (`o=os;
+  // o.system(…)`, `import subprocess as s; s.run(…)`) hide the risky
+  // literal `os.system(`/`subprocess.run(` regexes inside find bodies.
+  const pyOsAliases = new Set<string>()
+  const pySubprocAliases = new Set<string>()
   // f-round-3 F2: python sys.path can also be reached through an object
   // alias (`p=sys.path;p.insert(0,"./lib")`) or a method alias
   // (`ins=sys.path.insert;ins(0,"./lib")`) or getattr dispatch — the
@@ -608,6 +629,22 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
       for (const m of line.matchAll(/\b(\w+)\s*=\s*sys\s*\.\s*path\s*\.\s*(?:insert|append|extend|__setitem__)\b/g)) {
         if (!pySysPathMethodAlias.has(m[1])) pySysPathMethodAlias.add(m[1])
       }
+      // f-round-4 N-N1-c: `o=os` / `import subprocess as s` hide system(…)
+      // and subprocess.run(…) behind aliases the risky literal regexes miss.
+      for (const m of line.matchAll(/(?:import\s+os\s+as\s+(\w+)|(\w+)\s*=\s*os\b)/g)) {
+        if (m[1] && !pyOsAliases.has(m[1])) pyOsAliases.add(m[1])
+        if (m[2] && !pyOsAliases.has(m[2])) pyOsAliases.add(m[2])
+      }
+      for (const m of line.matchAll(/(?:import\s+subprocess\s+as\s+(\w+)|(\w+)\s*=\s*subprocess\b)/g)) {
+        if (m[1] && !pySubprocAliases.has(m[1])) pySubprocAliases.add(m[1])
+        if (m[2] && !pySubprocAliases.has(m[2])) pySubprocAliases.add(m[2])
+      }
+      // f-round-4 N-N1-c: `from subprocess import run as s; s.run? no —
+      // `s.run(...)` is a METHOD on the module; but `from subprocess import
+      // run` binds the function bare, so `run([...])` must fail closed too.
+      for (const m of line.matchAll(/\b(?:exec|run|call|Popen|check_output|getoutput|getstatusoutput)\s+as\s+(\w+)\b/g)) {
+        if (!pySubprocAliases.has(m[1])) pySubprocAliases.add(m[1])
+      }
     }
     // f-round-3 N1: collect every way `child_process` (or its exec/execSync
     // members) can be named on this line — later lines resolve through the
@@ -618,6 +655,11 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
       }
       for (const m of line.matchAll(/\b(?:const|let|var)\s+(\w+)\s*=\s*require\b/g)) {
         nodeRequireAliases.add(m[1])
+      }
+      // f-round-4 B-N1-b: variable-to-variable aliases (`const q=cp;` then
+      // `q.execSync(…)`) — collected here, closed transitively later.
+      for (const m of line.matchAll(/\b(?:const|let|var)?\s*(\w+)\s*=\s*(\w+)\b/g)) {
+        if (m[1] !== m[2]) nodeAliasPairs.push([m[1], m[2]])
       }
       for (const m of line.matchAll(/\b(?:const|let|var)\s+(\w+)\s*=\s*(\w+)\s*\(\s*["'](?:node:)?child_process["']\s*\)/g)) {
         if (nodeRequireAliases.has(m[2])) nodeCpRefs.add(m[1])
@@ -708,6 +750,15 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
       // though the risky literal regex cannot see the alias name.
       if (!rawHit && language === 'python' && specAlias &&
           new RegExp(`\\b${specAlias}\\s*\\(`).test(line)) rawHit = true
+      // f-round-4 N-N1-c: `o=os; o.system(…)` / `import subprocess as s;
+      // s.run(…)` hide the risky literal regexes — any call through a
+      // collected os/subprocess alias is a hard shell-out hit.
+      if (!rawHit && language === 'python') {
+        if (pyOsAliases.size > 0 &&
+            new RegExp(`\\b(?:${[...pyOsAliases].map(reEscape).join('|')})\\s*\\.\\s*(?:system|popen|spawn|execv\\w*)\\s*\\(`).test(line)) rawHit = true
+        if (pySubprocAliases.size > 0 &&
+            new RegExp(`\\b(?:${[...pySubprocAliases].map(reEscape).join('|')})\\s*(?:\\.\\s*(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)\\s*)?\\(`).test(line)) rawHit = true
+      }
       // FP-5: ruby process words (system/exec/spawn/fork) that occur only
       // inside inert string literals (`puts "operating system check"`) are
       // not call sites — re-test the line with inert strings masked. A
@@ -763,11 +814,25 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
     // execFile stay on the network-argv shellNet rule, so literal
     // `spawnSync("ls",["-la"])` remains readable.
     if (language === 'node') {
+      // f-round-4 B-N1-b: close alias chains transitively before judging
+      // (`const q=cp; const r=q; r.execSync(…)` — two/three hops). Fixpoint
+      // over the collected assignment pairs, bounded to 6 passes.
+      for (let pass = 0; pass < 6; pass++) {
+        let grew = false
+        for (const [alias, target] of nodeAliasPairs) {
+          if ((nodeCpRefs.has(target) || nodeRequireAliases.has(target) || nodeBareExec.has(target)) &&
+              !nodeCpRefs.has(alias) && !nodeBareExec.has(alias)) {
+            nodeCpRefs.add(alias)
+            grew = true
+          }
+        }
+        if (!grew) break
+      }
       let execThreat = false
       if (nodeCpRefs.size > 0) {
         const alt = [...nodeCpRefs].map(reEscape).join('|')
         execThreat =
-          new RegExp(`\\b(?:${alt})\\s*\\.\\s*(?:exec|execSync)\\s*\\(`).test(line) ||
+          new RegExp(`\\b(?:${alt})\\s*\\.\\s*(?:exec|execSync)\\s*(?:\\.\\s*(?:call|apply)\\s*)?\\(`).test(line) ||
           new RegExp(`\\b(?:${alt})\\s*\\[\\s*(?:["'][^"']*(?:exec|execSync)[^"']*["']|\\w+)\\s*\\]\\s*\\(`).test(line)
       }
       // `require("child_process")["execSync"](…)` / `[var](…` (no alias).
@@ -782,6 +847,19 @@ function scanCode(code: string, language: Lang, where: string, out: EgressHit[])
         /createRequire\s*\([^)]*\)\s*\([^)]*\)\s*\.\s*(?:exec|execSync)\s*\(/.test(line) ||
         /import\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.\s*then\s*\([^)]*(?:exec|execSync)/.test(line) ||
         /\bimport\s*\(\s*["'](?:node:)?child_process["']\s*\)[^;]*(?:exec|execSync)\s*\(/.test(line)
+      // f-round-4 B-N1-b: exec-family call present but NOT a directly proven
+      // literal `require/import("child_process").execX("bin",[literal argv])`
+      // (alias chains, .call/.apply, computed/template keys, variable module
+      // ids, createRequire two-line, getBuiltinModule, require.resolve
+      // indirections) fails closed. The literal shape keeps `spawnSync("ls")`
+      // readable (B2 contract); argv[0]-shell RCE is caught by the risky net.
+      if (!execThreat && (
+        /\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*(?:\.\s*(?:call|apply)\s*)?\(/.test(line) ||
+        /\[["'][^"']*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)[^"']*["']\s*(?:\+\s*["'][^"']*["']\s*)*\]\s*\(/.test(line))) {
+        const literalExec =
+          /(?:require\s*\(\s*["'](?:node:)?child_process["']\s*\)|import\s*\(\s*["'](?:node:)?child_process["']\s*\))\s*\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*\(\s*["'][^"']*["']\s*(?:,\s*\[?\s*["'][^"']*["']\s*(?:,\s*["'][^"']*["'])*\]?\s*)?\)/
+        if (!literalExec.test(line)) execThreat = true
+      }
       if (execThreat) unverifiable = true
     }
   }
