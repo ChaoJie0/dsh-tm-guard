@@ -5522,7 +5522,11 @@ function f6JsDanger(code: string): string | null {
         if (t.startsWith('...')) { const r = t.slice(3).trim(); if (/^[A-Za-z_$][\w$]*$/.test(r)) out.push(r); continue }
         let base = t
         const dq = t.indexOf('=')
-        if (dq !== -1) base = t.slice(0, dq).trim()
+        // f-round-16 B-F16-6: a `=` inside a destructure pattern is a DEFAULT
+        // value ({value:f=0}) — truncating the whole pattern at `=` loses the
+        // binding name AND, after `slice(1,-1)`, the name's last char. Only
+        // truncate plain identifiers; walk destructure patterns whole.
+        if (dq !== -1 && !t.startsWith('{') && !t.startsWith('[')) base = t.slice(0, dq).trim()
         if (base.startsWith('[') && base.includes(':')) {
           // computed key destructure — ["value"]:f — colon at depth 0 after
           // the bracketed key names the binding
@@ -5640,18 +5644,28 @@ function f6JsDanger(code: string): string | null {
   // catch parameter after it instead of requiring literal adjacency.
   const catchBind = new Map<string, string>()
   {
+    // f-round-16 B-F16-3: pair EVERY thrown expression with the next catch
+    // parameter after it. The source may be a variable (throw v), a subscript
+    // ([eval][0]), a ternary (true?eval:0), a computed member
+    // (globalThis["eval"] / globalThis[a+b]) — classify() later derives the
+    // source kind from the full expression.
     const throwSrcs: Array<{ idx: number; src: string }> = []
-    for (const m of stripped.matchAll(/\bthrow\s+((?:(?:globalThis|globalThis\s*\.\s*self)\s*\.\s*)?(?:eval|Function)\b|\brequire\s*\(\s*["'\x60](?:node:)?child_process["'\x60]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'\x60]child_process["'\x60]\s*\))/g)) {
-      throwSrcs.push({ idx: m.index, src: m[1].trim() })
+    for (const m of stripped.matchAll(/\bthrow\s+([\s\S]*?)(?=\s*[;)}\]]|$)/g)) {
+      const src = m[1].trim()
+      if (!src) continue
+      if (/\b(?:catch|try)\b/.test(src)) continue
+      throwSrcs.push({ idx: m.index, src })
     }
+    // f-round-16 B-F16-3: catch parameter patterns — arrays, objects, rest,
+    // elision, defaults, renaming — all feed patternNames (nested-capable).
     const catchParams: Array<{ idx: number; name: string }> = []
-    for (const m of stripped.matchAll(/\bcatch\s*\(\s*([A-Za-z_$][\w$]*|\[[\s\S]*?\])\s*\)/g)) {
+    for (const m of stripped.matchAll(/\bcatch\s*\(\s*(\[[\s\S]*?\]|\{[\s\S]*?\}|[A-Za-z_$][\w$]*)\s*\)/g)) {
       catchParams.push({ idx: m.index, name: m[1].trim() })
     }
     for (const t of throwSrcs) {
       const c = catchParams.find((cc) => cc.idx > t.idx)
       if (c) {
-        const names = c.name.startsWith('[') ? patternNames(c.name) : [c.name]
+        const names = patternNames(c.name)
         for (const nm of names) catchBind.set(nm, t.src)
       }
     }
@@ -5680,7 +5694,11 @@ function f6JsDanger(code: string): string | null {
   // f-round-14 B-F14-1: descriptor-of-source bindings — `var d=desc(SRC)` is a
   // descriptor container whose `.value` is the exec member value (descVal)
   const descBind = new Set<string>()
-  for (const m of stripped.matchAll(/\b(?:const|let|var)\s+(\{[^=;]*\}|\[[^\]]*\]|[A-Za-z_$][\w$]*)\s*=\s*(?:(?:Object\.)?getOwnPropertyDescriptor|Reflect\.getOwnPropertyDescriptor|(?:Object\.)?getOwnPropertyDescriptors)\s*\(/g)) {
+  // f-round-16 B-F16-6: descriptor destructure patterns may carry DEFAULT
+  // values ({value:f=0} / {value:f=null}) — `[^=;]*` cut the pattern at the
+  // first `=`, losing the binding (D2-28/N38). Match to the first `}` so the
+  // whole pattern participates; non-descriptor RHS classify to nothing.
+  for (const m of stripped.matchAll(/\b(?:const|let|var)\s+(\{[^}]*?\}|\[[^\]]*\]|[A-Za-z_$][\w$]*)\s*=\s*(?:(?:Object\.)?getOwnPropertyDescriptor|Reflect\.getOwnPropertyDescriptor|(?:Object\.)?getOwnPropertyDescriptors)\s*\(/g)) {
     for (const nm of patternNames(m[1])) descBind.add(nm)
   }
   // f-round-15 B-F15-3: nested destructure default values —
@@ -5779,6 +5797,30 @@ function f6JsDanger(code: string): string | null {
     // f-round-14 B-F14-3: Function (and its aliases/containers) tagged-template
     // is the ONLY executing form — eval tagged templates are lazy (no execute)
     if (/^Function$/.test(t) || new RegExp(`^${namesOf(fAlias)}$`).test(t)) res.add('fAlias')
+    // f-round-16 B-F16-3/4: subscript/member extraction chains off a container
+    // of a dynamic source — [eval][0], [eval].at(0), globalThis["eval"],
+    // globalThis[a+b] — the whole expression is a dynamic source value.
+    if (/^(?:\[[\s\S]*?\]|\{[^}]*\}|globalThis(?:\s*\.\s*self)?\s*\[[^\]]+\]|[A-Za-z_$][\w$]*\s*\[[^\]]+\])(?:\s*\.\s*[A-Za-z_$][\w$]*\s*(?:\([^)]*\)\s*)?|\[\s*[^\]]+\]\s*)*$/.test(t) &&
+        /\b(?:eval|Function)\b/.test(t)) res.add('dyn')
+    // f-round-16 B-F16-3: globalThis with a NON-LITERAL computed key — the key
+    // may assemble "eval"/"Function" at runtime — is a dynamic source.
+    if (/^globalThis(?:\s*\.\s*self)?\s*\[\s*[^"'`\d][^\]]*\s*\]$/.test(t)) res.add('dyn')
+    // f-round-16 B-F16-3/4: ternary / nullish / `||` heads carrying a taint
+    // BINDING (not just the literal `eval`) — true?f:0 / (f||g) — the value
+    // may be the tainted function; descVal/derived carry the stronger kind.
+    if (new RegExp(`\\?\\s*[^:;,]{0,40}?\\b(?:${namesOf(dyn)}|${namesOf(descVal)}|${namesOf(derived)}|${namesOf(fAlias)})\\b|(?:&&|\\|\\|)\\s*(?:${namesOf(dyn)}|${namesOf(descVal)}|${namesOf(derived)}|${namesOf(fAlias)})\\b`).test(t) &&
+        new RegExp(`\\b(?:${namesOf(dyn)}|${namesOf(descVal)}|${namesOf(derived)}|${namesOf(fAlias)})\\b`).test(t)) {
+      if (new RegExp(`\\b(?:${namesOf(descVal)}|${namesOf(derived)})\\b`).test(t)) res.add('derived')
+      else res.add('dyn')
+    }
+    // f-round-16 B-F16-6: bind/call/apply RETURN VALUES inherit the source
+    // taint — `var g=f.bind(null)` keeps g exec-capable (D3-20/N50). Only
+    // taint names inherit; literal exec members (cp.spawnSync.apply, R1-R3)
+    // are not bindings and keep their own read-only adjudication paths.
+    if (new RegExp(`^(?:${namesOf(descVal)}|${namesOf(derived)}|${namesOf(refGetMem)})\\s*\\.\\s*(?:bind|call|apply)\\s*\\(`).test(t)) {
+      if (new RegExp(`^${namesOf(descVal)}\\s*\\.`).test(t)) res.add('descVal')
+      else res.add('derived')
+    }
     if (/^(?:\[[\s\S]*\]|\{[\s\S]*\})$/.test(t)) {
       const inner = t.slice(1, -1)
       if (new RegExp(`(?:${CP_MOD})|(?:${namesOf(cp)})\\b|\\.\\.\\.(?:${namesOf(cp)})\\b`).test(inner) &&
@@ -5952,9 +5994,10 @@ function f6JsDanger(code: string): string | null {
   if (r) return r
   // B-F14-3: Function tagged-template invocation — Function`code` executes the
   // template body and returns the compiled function; Function aliases
-  // (F=Function / [F]=[Function]) included. eval tagged templates are lazy
-  // (no execution) and stay benign.
-  r = hit(new RegExp(`\\b(?:Function|(?:${namesOf(fAlias)}))\\s*(?:\\.\\s*bind\\s*\\([^)]*\\)\\s*)?\\x60[^\\x60]*\\x60`), 'Function tagged-template invocation', true)
+  // (F=Function / [F]=[Function]) included. f-round-16 B-F16-4: an aliased
+  // container member used as the tag (var a=[Function]; a[0]`...`()) also
+  // executes. eval tagged templates are lazy (no execution) and stay benign.
+  r = hit(new RegExp(`\\(?\\s*\\b(?:Function|(?:${namesOf(fAlias)}))\\s*\\)?\\s*(?:\\[\\s*[^\\]]*\\s*\\]\\s*|\\.\\s*bind\\s*\\([^)]*\\)\\s*)?\\x60[^\\x60]*\\x60`), 'Function tagged-template invocation', true)
   if (r) return r
   // ---- globalThis non-literal bracket call (nested arrays / joins included) ----
   {
@@ -6091,6 +6134,34 @@ function f6JsDanger(code: string): string | null {
         if (ro) continue
       }
       return `descriptor extraction from child_process source (${m[0].slice(0, 24)})`
+    }
+  }
+  // f-round-16 B-F16-5: exec-family member invoked directly on a
+  // child_process source (cp / derived binding, literal require/gbm source) —
+  // the find-inline face adjudicates argv read-only-ness; the heredoc semantic
+  // layer must apply the SAME rule. `cp.spawnSync("sh", varArray)` with a
+  // variable argv is NOT provably read-only → fail closed. Literal read-only
+  // argv (`["ls",["-la"]]`, `String("-la")`, `{shell:true}`) stays ALLOW
+  // (R1-R3 controls are unaffected — `.apply(`/`.call(`/`.bind(` do not match
+  // this verb-followed-by-open-paren shape). Stands outside the cp-set guard
+  // so a literal `require("child_process").spawnSync(...)` with no binding is
+  // also adjudicated.
+  {
+    const n5b = new RegExp(`\\b(?:${alt(cp)}|${alt(derived)}|require\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\))\\s*(?:\\.\\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)|\\[\\s*["'\x60](?:exec|execSync|spawn|spawnSync|execFile|execFileSync|fork)["'\x60]\\s*\\])\\s*\\(`, 'g')
+    for (const m of stripped.matchAll(n5b)) {
+      const open = stripped.indexOf('(', m.index + m[0].length - 1)
+      if (open === -1) continue
+      let depth = 0, e2 = -1
+      for (let i = open; i < stripped.length; i++) {
+        const ch = stripped[i]
+        if (ch === '(') depth++
+        else if (ch === ')') { depth--; if (depth === 0) { e2 = i; break } }
+      }
+      if (e2 > open) {
+        const elems = splitTopLevel(stripped.slice(open + 1, e2), ',')
+        const ro = elems.length > 0 && elems.every((e: string) => isROArg(e.trim()))
+        if (!ro) return `child_process exec verb with non-readonly argv (${m[0].slice(0, 24)})`
+      }
     }
   }
   // N9: module-source closure nets — createRequire aliases/module-require
@@ -6567,6 +6638,44 @@ function f6JsDanger(code: string): string | null {
     }
   }
 
+  // f-round-16 B-F16-1: value-flow positions that can hand a tainted function
+  // to a later call — extraction heads, ternary/nullish/|| heads,
+  // function-return heads, and container-injection forwarders. The taint NAME
+  // itself is the trigger: when it sits in these positions the value is
+  // reachable behind a shape the fixed nets cannot see. Literal eval/Function
+  // inside a paren/subscript call head is always executable (B-F16-4), even
+  // with no taint bindings in scope.
+  const flowTaint = new Set<string>([...dyn, ...dynC, ...descVal, ...derived, ...fAlias, ...refGetMem, ...refApply, ...container])
+  const litFtn = `eval|Function|(?:${flowTaint.size ? alt(flowTaint) : '(?!x)x'})`
+  // (a) value-flow call heads: (0||f)(…) / (function(){return f})()(…) /
+  // [f].pop()(…) / (1?eval:0)(…) — a paren/subscript head that contains a
+  // taint name or a literal eval/Function.
+  const headFlow = new RegExp(`(?:\\([^()]*\\b(?:${litFtn})\\b[^()]*\\)|\\[[^\\]]*\\b(?:${litFtn})\\b[^\\]]*\\]\\s*(?:\\.\\s*[A-Za-z_$][\\w$]*\\s*\\([^)]*\\)\\s*)*)\\s*(?:\\.\\s*(?:call|apply|bind)\\s*\\([^)]*\\)\\s*)?\\(`, 'g')
+  for (const m of stripped.matchAll(headFlow)) {
+    if (outside(m.index)) continue
+    return `tainted value in call head (${m[0].slice(0, 24)})`
+  }
+  // (a2) IIFE/arrow that RETURNS a taint name: (function(){return f})()(…)
+  // / (()=>f)()(…) — the returned value is called after the group.
+  const retFlow = new RegExp(`\\([\\s\\S]{0,160}?\\breturn\\s+\\b(?:${litFtn})\\b[\\s\\S]{0,160}?\\)\\s*(?:\\.\\s*(?:call|apply|bind)\\s*\\([^)]*\\)\\s*)?\\(|\\([\\s\\S]{0,80}?=>\\s*\\b(?:${litFtn})\\b[\\s\\S]{0,80}?\\)\\s*(?:\\.\\s*(?:call|apply|bind)\\s*\\([^)]*\\)\\s*)?\\(`, 'g')
+  for (const m of stripped.matchAll(retFlow)) {
+    if (outside(m.index)) continue
+    return `taint returned by IIFE invoked (${m[0].slice(0, 24)})`
+  }
+  if (flowTaint.size > 0) {
+    const ftn = alt(flowTaint)
+    // (b) container-injection forwarders: the taint name passed INTO a
+    // collection/promise/event forwarder reaches a later call through the
+    // container (Promise.resolve(f).then / new Map().set(7,f).get(7) /
+    // Array.from([f])[0] / emitter.emit). Read-only use stays guarded by the
+    // RO adjudication below.
+    const fwdRe = new RegExp(`\\.\\s*(?:resolve|then|catch|finally|all|race|from|of|set|push|unshift|splice|defineProperty|assign|setPrototypeOf|emit|on|once|addListener|setTimeout|setInterval|setImmediate|nextTick)\\s*\\([^()]*\\b(?:${ftn})\\b[^()]*\\)`, 'g')
+    for (const m of stripped.matchAll(fwdRe)) {
+      if (outside(m.index)) continue
+      return `tainted value into container forwarder (${m[0].slice(0, 24)})`
+    }
+  }
+
   // extractor/pass-through family whose receiver expression carries a source
   const extractorRe = /\.\s*(?:then|catch|finally|forEach|map|filter|reduce|flatMap|find|every|some|pop|shift|flat|get|next|values|entries)\s*\(/g
   for (const m of stripped.matchAll(extractorRe)) {
@@ -6575,6 +6684,11 @@ function f6JsDanger(code: string): string | null {
     const dot = prefix.lastIndexOf('.')
     const left = (dot === -1 ? prefix : prefix.slice(0, dot)).trim()
     if (left && hasSrcTok(left)) return `source container through extractor/pass (${m[0].slice(0, 24)})`
+    // f-round-16 B-F16-1: descVal/fAlias names are not in allSrcRe but are
+    // exec-capable values — a receiver that names them is a forwarder.
+    if (flowTaint.size > 0 && new RegExp(`\\b(?:${alt(flowTaint)})\\b`).test(left)) {
+      return `tainted binding through extractor/pass (${m[0].slice(0, 24)})`
+    }
   }
   // yield-of-source (O3/Q7 family)
   r = hit(/\byield\s+(?:eval\b|Function\b|require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\)|require\b|createRequire\b)/, 'yield of module source', true)
@@ -7463,7 +7577,8 @@ export function classifyBashCommand(
   command: string,
   denyReadPaths: string[] = [],
 ): ClassifyResult {
-  // Catastrophic patterns are checked on the WHOLE command before splitting —
+  try {
+    // Catastrophic patterns are checked on the WHOLE command before splitting —
   // fork bombs and similar span ; and | characters, so per-segment checks
   // would let them slip through. This also covers `rm -rf /` smuggled inside
   // a heredoc body.
@@ -7699,6 +7814,17 @@ export function classifyBashCommand(
     forceDeny: worst.forceDeny,
     mutates: results.some((r) => r.mutates),
   }
+  } catch (e) {
+    // f-round-16 B-F16-2: any internal classifier exception must fail CLOSED
+    // (DENY) rather than throw through to the caller — a crash in the gate
+    // previously let timer-forwarded descVal sources run unblocked.
+    return {
+      category: 'unknown',
+      reason: `classifier internal error; command cannot be proven safe (${(e as Error)?.message ?? 'unknown'})`,
+      targetPaths: [],
+      mutates: true,
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -7718,6 +7844,7 @@ export function classifyToolCall(
   args: Record<string, unknown>,
   denyReadPaths: string[] = [],
 ): ClassifyResult {
+  try {
   const name = toolName.toLowerCase()
 
   // --- Bash / shell tools ---
@@ -7857,6 +7984,15 @@ export function classifyToolCall(
     category: 'unknown',
     reason: `Unknown tool: ${toolName}`,
     targetPaths: [],
+  }
+  } catch (e) {
+    // f-round-16 B-F16-2: fail closed on any internal classifier exception.
+    return {
+      category: 'unknown',
+      reason: `classifier internal error; tool call cannot be proven safe (${(e as Error)?.message ?? 'unknown'})`,
+      targetPaths: [],
+      mutates: true,
+    }
   }
 }
 
