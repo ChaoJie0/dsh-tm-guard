@@ -5850,6 +5850,10 @@ function f6JsDanger(code: string): string | null {
     if (new RegExp(`^Reflect\\.\\s*get\\s*\\(\\s*(?:${namesOf(cp)}|${namesOf(container)}|${namesOf(derived)})\\b`).test(t) ||
         /^Object\.\s*getOwnPropertyDescriptor\s*\(\s*(?:require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\)|(?:[A-Za-z_$][\w$]*))(?=[\s,;)])/.test(t) && new RegExp(`^(?:require\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\)|process\\.\\s*getBuiltinModule\\s*\\(\\s*["'\x60]child_process["'\x60]\\s*\\)|${namesOf(cp)})`).test(t) ||
         new RegExp(`^(?:${namesOf(cp)}|${namesOf(container)})\\s*(?:\\.\\s*[A-Za-z_$][\w$]*|\\[\\s*["'\x60][^"'\x60]+["'\x60]\\s*\\])\\s*$`).test(t) ||
+        // f-round-17 J3: a member of a descriptor VALUE binding is itself an
+        // exec-member value — `var d=desc(...),f=d.value` seeds f as descVal,
+        // so bind/call/apply chains on f stay closed (B-F16-6 residual).
+        new RegExp(`^${namesOf(desc)}\\s*(?:\\.\\s*[A-Za-z_$][\\w$]*|\\[\\s*["'\x60][^"'\x60]+["'\x60]\\s*\\])\\s*$`).test(t) ||
         // f-round-13 B-F13-1: source-prefixed member extraction incl. optional
         // chain — `require("child_process")?.["sp"+"awnSync"]` (P12 family)
         /^(?:require\s*\(\s*["'`]child_process["'`]\s*\)|process\.\s*getBuiltinModule\s*\(\s*["'`]child_process["'`]\s*\))\s*(?:\?\.\s*)?(?:\.\s*[A-Za-z_$][\w$]*|\[\s*[^\]]+\s*\])/.test(t)) {
@@ -6325,6 +6329,76 @@ function f6JsDanger(code: string): string | null {
             if (root.startsWith('Reflect.')) elems = elems.slice(-1)
             const readOnlyArgs = elems.length > 0 && elems.every(isROArg)
             if (!readOnlyArgs) return `exec-capable binding invoked with non-readonly args (${head.slice(0, 24)})`
+          }
+        }
+      }
+    }
+    // f-round-17 J1: tainted property store/load edges. An exec-member VALUE
+    // (descVal/derived/dyn/…) stored onto an object property under a concrete
+    // key — Object.defineProperty value/getter, Object.assign, object spread,
+    // Reflect.set — then read back and invoked (o.x(...), Reflect.get(o,"x")(…))
+    // is an indirect exec call. Track only concrete literal keys (no string
+    // nets); the store of a real source under that key must be present.
+    {
+      const j1Src = new Set<string>([...descVal, ...derived, ...dyn, ...dynC, ...fAlias, ...refGetMem, ...refGet, ...refApply])
+      if (j1Src.size > 0) {
+        const j1SrcRe = `(?:${[...j1Src].map(esc).join('|')})`
+        const taintedKeys = new Set<string>()
+        const storeRe = new RegExp(`(?:Object\\.\\s*defineProperty\\s*\\([^,]+,\\s*["'\x60]([^"'\x60]+)["'\x60]\\s*,\\s*\\{[\\s\\S]*?${j1SrcRe}[\\s\\S]*?\\}|Object\\.\\s*assign\\s*\\([^,]+,\\s*\\{[^}]*["'\x60]?([A-Za-z_$][\\w$]*)["'\x60]?\\s*:\\s*${j1SrcRe}\\b|Reflect\\.\\s*set\\s*\\([^,]+,\\s*["'\x60]([^"'\x60]+)["'\x60]\\s*,\\s*${j1SrcRe}\\b|\\{\\s*\\.\\.\\.[^}]*,\\s*["'\x60]?([A-Za-z_$][\\w$]*)["'\x60]?\\s*:\\s*${j1SrcRe}\\b)`, 'g')
+        for (const m of stripped.matchAll(storeRe)) {
+          const key = m[1] ?? m[2] ?? m[3] ?? m[4]
+          if (key) taintedKeys.add(key)
+        }
+        if (taintedKeys.size > 0) {
+          const j1KeyRe = [...taintedKeys].map(esc).join('|')
+          const loadRe = new RegExp(`\\b(?:[A-Za-z_$][\\w$]*\\s*\\.\\s*(?:${j1KeyRe})|Reflect\\.\\s*get\\s*\\([^,]+,\\s*["'\x60](?:${j1KeyRe})["'\x60]\\s*\\)|(?:[A-Za-z_$][\\w$]*\\s*)?\\[\\s*["'\x60](?:${j1KeyRe})["'\x60]\\s*\\])\\s*(?:\\?\\.[A-Za-z_$][\\w$]*)?\\s*(?:\\?\\.\\s*)?\\(`, 'g')
+          for (const m of stripped.matchAll(loadRe)) {
+            if (outside(m.index)) continue
+            // preserve read-only controls: adjudicate the argv exactly like the
+            // capChain closure — destructive args deny, read-only args allow
+            const open = stripped.indexOf('(', m.index + m[0].length - 1)
+            let depth = 0, e2 = -1
+            for (let i = open; i < stripped.length; i++) {
+              const ch = stripped[i]
+              if (ch === '(') depth++
+              else if (ch === ')') { depth--; if (depth === 0) { e2 = i; break } }
+            }
+            if (e2 > open) {
+              const args = stripped.slice(open + 1, e2)
+              let elems = splitTopLevel(args, ',')
+              if (m[0].startsWith('Reflect.get')) elems = elems.slice(-1)
+              const readOnlyArgs = elems.length > 0 && elems.every(isROArg)
+              if (!readOnlyArgs) return `tainted property invoked (${m[0].slice(0, 24)})`
+            }
+          }
+        }
+      }
+    }
+    // f-round-17 J2: wrapper-function constructor escapes. A user function
+    // whose body calls/returns a tainted source (function S(a,b){return f(a,b)})
+    // is itself exec-capable; `new (S.bind(null))(...)` / `new S(...)` /
+    // Reflect.construct must be closed. Conservative: any fn body referencing
+    // a source call makes the name a wrapper sink until cross-procedure
+    // propagation exists.
+    {
+      const j2Src = new Set<string>([...descVal, ...derived, ...dyn, ...dynC, ...fAlias, ...refGetMem, ...refGet, ...refApply])
+      if (j2Src.size > 0) {
+        const j2SrcRe = `(?:${[...j2Src].map(esc).join('|')})`
+        const wrapperFns = new Set<string>()
+        const fnRe = new RegExp(`\\bfunction\\s+([A-Za-z_$][\\w$]*)\\s*\\([^)]*\\)\\s*\\{[\\s\\S]*?${j2SrcRe}[\\s\\S]*?\\}`, 'g')
+        for (const m of stripped.matchAll(fnRe)) {
+          if (!outside(m.index)) wrapperFns.add(m[1])
+        }
+        // arrow/expression wrappers: NAME = (...args) => { … f(...) … } or => f
+        const arrowRe = new RegExp(`\\b([A-Za-z_$][\\w$]*)\\s*=\\s*(?:\\s*\\([^)]*\\)|[A-Za-z_$][\\w$]*)\\s*=>\\s*(?:\\{[\\s\\S]*?${j2SrcRe}[\\s\\S]*?\\}|${j2SrcRe}\\s*(?:\\(|\\s*\\.\\s*(?:call|apply)))`, 'g')
+        for (const m of stripped.matchAll(arrowRe)) {
+          if (!outside(m.index)) wrapperFns.add(m[1])
+        }
+        if (wrapperFns.size > 0) {
+          const j2FnRe = [...wrapperFns].map(esc).join('|')
+          const callRe = new RegExp(`\\bnew\\s*(?:\\(\\s*)?(?:${j2FnRe})\\s*(?:\\.\\s*bind|\\b)|\\(0,\\s*(?:${j2FnRe})\\s*\\)\\s*\\(|\\b(?:${j2FnRe})\\s*\\(`, 'g')
+          for (const m of stripped.matchAll(callRe)) {
+            if (!outside(m.index)) return `wrapper function invoked (${m[0].slice(0, 24)})`
           }
         }
       }
