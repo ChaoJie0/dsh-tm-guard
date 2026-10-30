@@ -98,6 +98,17 @@ All notable changes to dsh-tm-guard will be documented in this file.
   constructor escapes (`new (S.bind(null))(...)`) are tracked through the
   call chain.
 
+- **Absolute-path verb prefixes no longer hide write targets (f-round-21).**
+  `FILE_WRITE_COMMANDS` verbs invoked through a path prefix (`/usr/bin/touch`,
+  `/bin/rm -rf`, `/usr/bin/tee`, `/opt/homebrew/bin/rm`, `./tools/tar`) lost
+  their target extraction: the verb-specific extractor compared the raw first
+  token against the bare-verb table, so `targetPaths` came back empty, the
+  command fell into the zero-target branch, and an out-of-workspace write
+  (`/bin/rm -rf /etc/...`) was vouchsafed by session-cwd coverage and allowed.
+  The extractor now normalizes the verb to its basename before dispatching, so
+  prefixed forms extract real targets and out-of-scope writes are denied while
+  in-cwd and temp-target forms keep their prior behavior.
+
 ### Security (unchanged boundaries)
 - The ancestor fallback happens only after the canonical inside-workspace
   check passes; targets outside the session cwd, `/`, home and system roots

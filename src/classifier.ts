@@ -692,7 +692,13 @@ function isReadOnlyArchiveOp(cmd: string, command: string): boolean {
 function extractWritePaths(command: string): string[] {
   const paths: string[] = []
   const tokens = tokenize(command)
-  const cmd = (tokens[0] ?? '').toLowerCase()
+  // B-F-abs-prefix: the verb may arrive with a path prefix (`/usr/bin/touch`,
+  // `/opt/homebrew/bin/rm`, `./tools/tar`) — normalize to the basename so the
+  // verb-specific target extraction below fires. Without this, an
+  // absolute-path verb fell into the implicit-target branch with an empty
+  // targetPaths and was vouchsafed by session-cwd coverage alone, allowing
+  // out-of-workspace writes (`/bin/rm -rf /etc/...` -> ALLOWED).
+  const cmd = ((tokens[0] ?? '').replace(/^['"]+|['"]+$/g, '')).split('/').pop().toLowerCase()
 
   // Redirection targets: > file, >> file, 1> file, &> file (and glued forms
   // like >file / 2>>file). The next token is the target.

