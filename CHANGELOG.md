@@ -76,6 +76,27 @@ All notable changes to dsh-tm-guard will be documented in this file.
   write target in every form (separate, glued `-Cdir`, reordered) regardless
   of mode, bare clusters (`xf`, `xpf`, …) are parsed like short-option
   clusters, and pure listing (`-t`) / stdout (`-O`) still write nothing.
+- **Literal shell bodies in read-only argv are adjudicated against the
+  authoritative write/network surfaces (f-round-17/18/19).** A read-only
+  argv literal (a `spawnSync("sh", ["-c", BODY])` reachable through a
+  tainted property load / bind chain) now goes through the same
+  `FILE_WRITE_COMMANDS` / `NETWORK_COMMANDS` adjudication as every other
+  command: literal `tar`/`zip`/`git clone`/`socat`/`aria2c`/script-launch
+  bodies fail closed instead of relying on a closed enum; `git` read-only
+  subcommands and plain read-only shells (`sh -c 'ls -la'`) stay allowed.
+- **Inline code extraction is now shell-quote-aware (f-round-18/19).** The
+  find-inline scanner consumes ANSI-C/locale quotes (`$'…'`/`$"…"`), the
+  `'\''` idiom, and duplicate code flags (`-e` x N keeps the last body),
+  and fails closed when a code flag is present but the body cannot be
+  extracted — `node -e $'…'` and `node -e 'ok' -e 'evil'` can no longer
+  hide the dangerous body.
+- **Container/value-flow and descriptor seeding for read-only argv are
+  closed (f-round-16/17).** Tainted sources propagated through
+  object-spread/`Object.assign`/`Reflect.set`/descriptor-value seeding,
+  catch/throw and eval/Function indirect heads, and default-value
+  destructure seeds are no longer treated as read-only; wrapper-function
+  constructor escapes (`new (S.bind(null))(...)`) are tracked through the
+  call chain.
 
 ### Security (unchanged boundaries)
 - The ancestor fallback happens only after the canonical inside-workspace
